@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+#
+# maze-enable-blackarch — add the BlackArch repository to a Maze Linux system by
+# running BlackArch's OWN upstream strap.sh, with only its final heavy pacman
+# steps removed.
+#
+# Why this way: instead of reimplementing the keyring setup (which would force us
+# to track a keyring version and a signing-key fingerprint that go stale — the
+# exact reason upstream ships its own signature check disabled), we fetch the
+# official strap.sh at run time and neutralise just the two heavy tail commands
+# it runs during a fresh install:
+#     pacman -Syy                                 (pulls the huge BlackArch pkg DB)
+#     pacman -S --noconfirm blackarch-mirrorlist  (installs a package)
+# Everything strap needs to REGISTER the repo — fetch + trust the keyring (via
+# pacman-key), write the mirrorlist, add [blackarch] to pacman.conf — is kept.
+# The package database then syncs on the user's next `pacman -Sy`. This keeps us
+# on BlackArch's own, always-current setup logic with NOTHING for us to maintain.
+#
+# Trust model: identical to an official BlackArch install — the keyring is fetched
+# over HTTPS from blackarch.org (upstream strap ships its GPG check commented out).
+#
+# Contexts (all converge on the same patched strap run):
+#   * Calamares (contextualprocess@blackarch) — runs INSIDE the target, no args.
+#   * By hand from a live/host env — pass the target mountpoint as $1 (arch-chroot).
+#   * On an already-installed Maze host — just `sudo maze-enable-blackarch`.
+#
+# Best-effort by design: NEVER exits non-zero (a failed BlackArch setup can never
+# abort a Calamares install). Idempotent: re-running is harmless.
+#
+set -uo pipefail
+
+TARGET="${1:-}"
+STRAP_URL="https://blackarch.org/strap.sh"
+
+log()  { printf '[maze-blackarch] %s\n' "$*"; }
+warn() { printf '[maze-blackarch] WARNING: %s\n' "$*" >&2; }
+
+# Decide whether we were handed a real, separate target mountpoint (host mode) or
+# are already inside the target / on a running system (chroot/native mode).
+chrooted=0
+if [[ -n "${TARGET}" && "${TARGET}" != "/" \
+      && -x /usr/bin/arch-chroot && -e "${TARGET}/etc/pacman.conf" ]]; then
+    chrooted=1
+fi
+
+# Run a command in the right place: arch-chroot into the target (host mode) or
+# directly (already inside the target / native). stdin from /dev/null so nothing
+# can block waiting on input that will never come.
+run() {
+    if [[ "${chrooted}" -eq 1 ]]; then
+        arch-chroot "${TARGET}" "$@" </dev/null
+    else
+        "$@" </dev/null
+    fi
+}
+
+# In host mode, make sure the target has working DNS. In chroot/native mode DNS
+# already works (installer copied resolv.conf; a running system has its own).
+if [[ "${chrooted}" -eq 1 ]]; then
+    cp -L /etc/resolv.conf "${TARGET}/etc/resolv.conf" 2>/dev/null || true
+fi
+
+# Idempotent: if [blackarch] is already configured, there is nothing to do.
+if run grep -q '^\[blackarch\]' /etc/pacman.conf 2>/dev/null; then
+    log "BlackArch repository already configured; nothing to do."
+    exit 0
+fi
+
+# strap.sh downloads with curl; make sure it is present (best-effort top-up).
+if ! run sh -c 'command -v curl >/dev/null 2>&1'; then
+    log "Installing curl (needed to fetch strap.sh)"
+    run pacman -Sy --noconfirm --needed curl >/dev/null 2>&1 || warn "could not install curl"
+fi
+
+# The whole setup runs as ONE program inside the target, so strap's temp dir,
+# downloads and pacman-key all share the same (target) context whether we are
+# chrooted or not.
+read -r -d '' PROG <<'PROGEOF' || true
+set -u
+export TERM="${TERM:-dumb}"   # quiet strap.sh's tput calls when there is no tty
+
+tmp="$(mktemp -d /tmp/maze-blackarch.XXXXXX)" || exit 1
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp" || exit 1
+
+if ! curl -fsSL "https://blackarch.org/strap.sh" -o strap.sh; then
+    echo "[maze-blackarch] could not download strap.sh" >&2
+    exit 1
+fi
+[ -s strap.sh ] || { echo "[maze-blackarch] strap.sh is empty" >&2; exit 1; }
+
+# Neutralise ONLY strap's actual heavy pacman COMMANDS — the DB sync
+# (`if pacman -Syy; then`) and the mirrorlist package install (a line-start
+# `pacman -S ...`) — with the no-op ':'. We anchor on command positions (line
+# start, or right after `if `) so strap's message/echo strings that merely MENTION
+# pacman stay intact (e.g. its final "sudo pacman -S --needed blackarch-officials"
+# hint). `pacman-key` — which strap needs to trust the keyring — has no space
+# before its dash, so it is never matched. ':' accepts arguments, so the rewritten
+# `if : ...; then` line stays syntactically valid.
+sed -i \
+    -e 's/^\([[:space:]]*\)pacman -/\1: skip-maze pacman -/' \
+    -e 's/^\([[:space:]]*\)sudo pacman -/\1: skip-maze sudo pacman -/' \
+    -e 's/^\([[:space:]]*\)if pacman -/\1if : skip-maze pacman -/' \
+    -e 's/^\([[:space:]]*\)if sudo pacman -/\1if : skip-maze sudo pacman -/' \
+    strap.sh
+
+# Run BlackArch's own (now DB-sync-free) setup. It installs + trusts the keyring,
+# writes the mirrorlist and adds [blackarch] to /etc/pacman.conf.
+sh strap.sh
+PROGEOF
+
+log "Registering the BlackArch repository via upstream strap.sh (no DB sync)"
+ok=0
+for _try in 1 2 3; do
+    # Trust the RESULT, not strap's exit code: only count it done once
+    # [blackarch] is actually present in pacman.conf.
+    run bash -c "${PROG}" || true
+    if run grep -q '^\[blackarch\]' /etc/pacman.conf 2>/dev/null; then
+        ok=1
+        break
+    fi
+    warn "BlackArch setup attempt ${_try}/3 did not complete; retrying in 5s"
+    sleep 5
+done
+
+if [[ "${ok}" -eq 1 ]]; then
+    log "BlackArch repository enabled. Sync + use it with:"
+    log "  sudo pacman -Sy"
+    log "  sudo pacman -S --needed blackarch-officials"
+else
+    warn "Could not enable BlackArch. Retry later with:  sudo maze-enable-blackarch"
+fi
+
+# Best-effort: never fail the install.
+exit 0

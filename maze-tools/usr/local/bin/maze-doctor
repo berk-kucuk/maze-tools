@@ -1,0 +1,1174 @@
+#!/usr/bin/env bash
+#
+# maze-doctor — full health check of an INSTALLED Maze Linux system.
+#
+# Read-only by design: it inspects, it never repairs. Every finding that needs
+# action prints the command that takes it, so the output can be acted on
+# directly or pasted somewhere for review.
+#
+# Runs as a normal user, but many checks need to read the ESP or the LUKS
+# metadata, so the useful mode is:
+#
+#     sudo maze-doctor
+#
+#   --deep      also verify every installed package's files against the
+#               database (pacman -Qkk over the whole system; slow, minutes)
+#   --no-color  plain output, for pasting into a bug report
+#
+# Exit: 0 = nothing wrong, 1 = at least one FAIL, 2 = only WARNs.
+set -u
+
+DEEP=0
+COLOR=1
+for a in "$@"; do
+    case "$a" in
+        --deep)     DEEP=1 ;;
+        --no-color) COLOR=0 ;;
+        -h|--help)  sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "maze-doctor: unknown option '$a'" >&2; exit 2 ;;
+    esac
+done
+
+if [ "$COLOR" = 1 ] && [ -t 1 ]; then
+    C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_FAIL=$'\033[31m'
+    C_HEAD=$'\033[1;36m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+    C_OK=""; C_WARN=""; C_FAIL=""; C_HEAD=""; C_DIM=""; C_OFF=""
+fi
+
+N_OK=0; N_WARN=0; N_FAIL=0; N_SKIP=0
+FAILS=""; WARNS=""
+
+section() { printf '\n%s== %s %s%s\n' "$C_HEAD" "$1" "$(printf '=%.0s' $(seq 1 $((60 - ${#1}))))" "$C_OFF"; }
+ok()    { printf '  %s[ OK ]%s  %s\n' "$C_OK" "$C_OFF" "$1"; N_OK=$((N_OK+1)); }
+warn()  { printf '  %s[WARN]%s  %s\n' "$C_WARN" "$C_OFF" "$1"; N_WARN=$((N_WARN+1)); WARNS="${WARNS}$1
+"; [ -n "${2:-}" ] && printf '          %s%s%s\n' "$C_DIM" "$2" "$C_OFF"; return 0; }
+fail()  { printf '  %s[FAIL]%s  %s\n' "$C_FAIL" "$C_OFF" "$1"; N_FAIL=$((N_FAIL+1)); FAILS="${FAILS}$1
+"; [ -n "${2:-}" ] && printf '          %s%s%s\n' "$C_DIM" "$2" "$C_OFF"; return 0; }
+skip()  { printf '  %s[ -- ]  %s%s\n' "$C_DIM" "$1" "$C_OFF"; N_SKIP=$((N_SKIP+1)); }
+detail() { printf '  %s        %s%s\n' "$C_DIM" "$1" "$C_OFF"; }
+
+IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
+have() { command -v "$1" >/dev/null 2>&1; }
+
+printf '%sMaze Linux — system health report%s\n' "$C_HEAD" "$C_OFF"
+printf '%s%s · %s%s\n' "$C_DIM" "$(date '+%Y-%m-%d %H:%M')" "$(uname -n)" "$C_OFF"
+[ "$IS_ROOT" = 0 ] && printf '%sRunning unprivileged — ESP, LUKS and SMART checks will be skipped.%s\n' "$C_WARN" "$C_OFF"
+
+# ---------------------------------------------------------------- 1. identity
+section "System"
+
+if [ -r /etc/os-release ]; then
+    . /etc/os-release
+    detail "${PRETTY_NAME:-unknown}"
+fi
+detail "kernel running: $(uname -r)"
+detail "uptime: $(uptime -p 2>/dev/null || true)"
+
+if [ -d /sys/firmware/efi ]; then
+    ok "Booted in UEFI mode"
+else
+    fail "Booted in BIOS/legacy mode" "Maze's boot chain is UEFI-only; Secure Boot cannot work here."
+fi
+
+# ------------------------------------------------------------- 2. boot chain
+section "Boot chain"
+
+if have maze-boot-check && [ "$IS_ROOT" = 1 ]; then
+    bc_out="$(maze-boot-check --no-flag 2>&1)"; bc_rc=$?
+    printf '%s\n' "$bc_out" | sed -n '3,$p' | sed '/^$/d;/^Result:/,$d' | while IFS= read -r l; do
+        printf '  %s\n' "$l"
+    done
+    if [ "$bc_rc" -eq 0 ]; then
+        ok "maze-boot-check: chain is sound"
+    else
+        fail "maze-boot-check reports the chain is NOT safe" "Run: sudo maze-boot-check"
+    fi
+elif ! have maze-boot-check; then
+    fail "maze-boot-check is not installed" "Install maze-secureboot."
+else
+    skip "maze-boot-check needs root"
+fi
+
+if [ "$IS_ROOT" = 1 ]; then
+    ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+    [ -n "${ESP:-}" ] && [ -d "$ESP" ] || { for c in /efi /boot; do [ -d "$c/EFI" ] && ESP="$c" && break; done; }
+    if [ -n "${ESP:-}" ]; then
+        G="$ESP/EFI/BOOT/grubx64.efi"
+        if [ -s "$G.maze-prev" ]; then
+            pk=""; [ -r "$G.maze-prev.kver" ] && pk="$(tr -d '[:space:]' < "$G.maze-prev.kver")"
+            ok "Rollback image present${pk:+ (kernel $pk)}"
+            detail "restore with: cp -f $G.maze-prev $G"
+        elif [ -s "$ESP/EFI/maze-recovery/grubx64.efi" ]; then
+            # A missing .maze-prev used to be a warning because it was the only
+            # way back to a previous kernel. It is not any more: the recovery
+            # entry boots the other installed kernel from the firmware menu, and
+            # it is a better fallback (its modules are on disk, which a rotated
+            # .maze-prev cannot promise). With that present this is information,
+            # not a problem — and on a fresh install it appeared under "worth a
+            # look" with nothing for the user to do, which is how a report
+            # teaches people to ignore it.
+            skip "No rollback image yet (grubx64.efi.maze-prev)"
+            detail "created at the first kernel change; the recovery entry already covers this"
+        else
+            warn "No rollback image and no recovery entry" \
+                 "There is no prepared way back to another kernel. Run: sudo maze-sb-sign"
+        fi
+        n_uki=$(ls -1 "$ESP"/EFI/Linux/*.efi 2>/dev/null | wc -l)
+        detail "UKIs on the ESP: $n_uki"
+        if have efibootmgr; then
+            if efibootmgr 2>/dev/null | grep -q "Maze Linux"; then
+                ok "NVRAM boot entry 'Maze Linux' present"
+                # Every reinstall used to add another entry without removing the
+                # old one, so a machine installed a few times shows a boot menu
+                # full of Maze lines pointing at partitions that are gone.
+                # Cosmetic, but it makes the menu useless in the one moment it
+                # matters — picking the recovery kernel.
+                _live_guids="$(lsblk -rno PARTUUID 2>/dev/null | tr 'A-Z' 'a-z' | grep . || true)"
+                _stale=0
+                if [ -n "$_live_guids" ]; then
+                    for _g in $(efibootmgr -v 2>/dev/null \
+                                  | grep -E '^Boot[0-9A-Fa-f]{4}\*? +Maze Linux' \
+                                  | sed -n 's/.*HD([0-9]*,GPT,\([0-9a-fA-F-]*\),.*/\1/p' \
+                                  | tr 'A-Z' 'a-z'); do
+                        printf '%s\n' "$_live_guids" | grep -Fxq "$_g" \
+                            || _stale=$((_stale + 1))
+                    done
+                fi
+                if [ "$_stale" -gt 0 ]; then
+                    warn "$_stale stale Maze boot entries from earlier installs" \
+                         "They point at partitions that no longer exist. Review with: maze-boot-entries"
+                fi
+            else
+                warn "No 'Maze Linux' NVRAM entry" "Boot relies on the removable \\EFI\\BOOT\\BOOTX64.EFI fallback."
+            fi
+            if efibootmgr -v 2>/dev/null | grep -qi 'systemd-bootx64\.efi'; then
+                fail "An NVRAM entry points straight at systemd-boot" \
+                     "It bypasses shim and fails under Secure Boot. Remove it with efibootmgr --delete-bootnum."
+            fi
+        fi
+    fi
+fi
+
+# ------------------------------------------------------- 3. kernels and DKMS
+section "Kernels and out-of-tree modules"
+
+kernels=""
+for d in /usr/lib/modules/*/; do
+    [ -f "${d}vmlinuz" ] || continue
+    k="${d%/}"; kernels="$kernels ${k##*/}"
+done
+kernels="${kernels# }"
+nk=0; for k in $kernels; do nk=$((nk+1)); done
+
+if [ "$nk" -ge 2 ]; then
+    ok "$nk kernels installed:$kernels"
+elif [ "$nk" -eq 1 ]; then
+    warn "Only one kernel installed ($kernels)" \
+         "A bad kernel update means live-USB recovery. Install linux-lts."
+else
+    fail "No kernel found under /usr/lib/modules"
+fi
+
+running="$(uname -r)"
+newest="$(printf '%s\n' $kernels | sort -V | tail -1)"
+if [ "$running" = "$newest" ]; then
+    ok "Running the newest installed kernel ($running)"
+else
+    warn "Running $running, newest installed is $newest" "A reboot is pending."
+fi
+
+if have dkms; then
+    dk="$(dkms status 2>/dev/null)"
+    if [ -z "$dk" ]; then
+        skip "No DKMS modules"
+    else
+        for k in $kernels; do
+            missing=""
+            for mod in $(printf '%s\n' "$dk" | sed -n 's#^\([a-z0-9_-]*\)/.*#\1#p' | sort -u); do
+                printf '%s\n' "$dk" | grep -q "$mod.*$k.*installed" || missing="$missing $mod"
+            done
+            if [ -n "$missing" ]; then
+                fail "DKMS modules not built for $k:$missing" \
+                     "That kernel boots without them (no graphics / no wifi). Run: sudo dkms autoinstall -k $k"
+            else
+                ok "DKMS modules built for $k"
+            fi
+        done
+    fi
+fi
+
+# The proprietary Broadcom `wl` module carries a wildcard PCI alias (any
+# class-0280 network controller), so udev loaded it on Intel-WiFi machines too:
+# an unsigned module tainting the kernel and tripping "Unpatched return thunk
+# in use", which switches the return-thunk mitigation off for the whole kernel.
+# maze-hardening >= 1.0.0-4 blacklists it and loads it by udev rule only when a
+# Broadcom (14e4) controller exists. Report the case where that is not in effect.
+if ! grep -qE '^wl ' /proc/modules 2>/dev/null; then
+    [ -f /usr/lib/modprobe.d/10-maze-broadcom-wl.conf ] \
+        && ok "Broadcom wl module not loaded (gated by maze-hardening; loads only for 14e4 hardware)"
+elif grep -qE '^wl ' /proc/modules 2>/dev/null; then
+    if lspci -n 2>/dev/null | grep -qE ' 14e4:'; then
+        ok "Broadcom wl driver loaded for a Broadcom controller"
+    else
+        fail "Proprietary Broadcom 'wl' module is loaded but there is no Broadcom hardware" \
+             "It taints the kernel and disables the return-thunk mitigation. Update maze-hardening (>= 1.0.0-4), then: sudo modprobe -r wl"
+    fi
+fi
+if [ "$IS_ROOT" = 1 ] && journalctl -b -k -q 2>/dev/null | grep -q 'Unpatched return thunk in use'; then
+    warn "Kernel logged 'Unpatched return thunk in use' this boot" \
+         "An out-of-tree module (usually wl) defeated the retbleed/SRSO mitigation. See the wl check above."
+fi
+
+for k in $kernels; do
+    [ -f "/usr/lib/modules/$k/modules.dep" ] \
+        && ok "Module index present for $k" \
+        || fail "modules.dep missing for $k" "Run: sudo depmod $k"
+done
+
+# ------------------------------------------------------------ 4. maze packages
+section "Maze packages"
+
+maze_pkgs="$(pacman -Qq 2>/dev/null | grep -E '^(maze-|mazelinux-|entropy-shield|qlam|haze|hazedrop|sentinai|linux-chan-ai|said360)' | sort)"
+if [ -z "$maze_pkgs" ]; then
+    fail "No Maze packages installed" "Is this a Maze Linux system?"
+else
+    n=0; for p in $maze_pkgs; do n=$((n+1)); done
+    ok "$n Maze packages installed"
+    for p in $maze_pkgs; do
+        detail "$(pacman -Q "$p" 2>/dev/null)"
+    done
+fi
+
+for p in maze-secureboot maze-snapshots maze-meta maze-tools; do
+    pacman -Qq "$p" >/dev/null 2>&1 \
+        && ok "$p installed" \
+        || fail "$p is NOT installed" "Run: sudo pacman -S $p"
+done
+
+# Files that override packaged ones. These belong to no package, so no update
+# can ever replace them — the exact failure this whole layer was built to end.
+shadow=""
+for f in /etc/pacman.d/hooks/85-maze-kernel-install.hook \
+         /etc/pacman.d/hooks/zz-maze-secureboot.hook \
+         /etc/pacman.d/hooks/zzz-maze-boot-verify.hook \
+         /etc/kernel/install.d/95-maze-sb-sign.install \
+         /etc/systemd/system/maze-sb-resign.service \
+         /etc/systemd/system/maze-sb-resign.path \
+         /etc/systemd/system/maze-boot-guard.service \
+         /etc/systemd/system/maze-boot-guard.path \
+         /etc/systemd/system/maze-boot-check.service \
+         /etc/systemd/system/maze-boot-check.timer \
+         /etc/systemd/system/emergency.service.d/10-maze-sulogin.conf \
+         /etc/systemd/system/rescue.service.d/10-maze-sulogin.conf \
+         /etc/systemd/system/systemd-boot-update.service.d/99-maze-resign.conf; do
+    # Kept in step with maze-boot-check's own #11 check by hand: it lists the
+    # same paths (see the note in that script for why this needs all of them,
+    # not just the signer's own units).
+    [ -e "$f" ] && shadow="$shadow $f"
+done
+if [ -n "$shadow" ]; then
+    fail "Unowned copies shadowing packaged files:$shadow" "Remove them: sudo rm$shadow"
+else
+    ok "No unowned copies shadowing packaged files"
+fi
+
+for s in /usr/local/bin/maze-sb-sign /usr/local/bin/maze-kernel-install-add; do
+    if [ -f "$s" ]; then
+        grep -qs 'maze-secureboot-compat-shim' "$s" \
+            && ok "$(basename "$s") is a compatibility shim (expected)" \
+            || fail "$s is a real script, not the packaged one" \
+                    "It overrides /usr/bin. Run: sudo pacman -S --needed maze-secureboot"
+    fi
+done
+
+# --------------------------------------------------- 4b. identity & branding
+section "Identity and branding"
+
+if [ -r /etc/os-release ]; then
+    grep -qi '^ID=maze' /etc/os-release && ok "os-release identifies as Maze" \
+        || fail "os-release does not identify as Maze" "The filesystem package may have overwritten it."
+    logo="$(sed -n 's/^LOGO=//p' /etc/os-release | tr -d '"')"
+    if [ -n "$logo" ]; then
+        find /usr/share/icons/hicolor -name "${logo}.png" 2>/dev/null | grep -q . \
+            && ok "Branded logo '$logo' resolves" \
+            || warn "LOGO=$logo but no matching icon" "'About this System' will show a generic logo."
+    fi
+fi
+
+if have plymouth-set-default-theme; then
+    th="$(plymouth-set-default-theme 2>/dev/null)"
+    [ "$th" = "maze" ] && ok "Plymouth theme: maze" \
+        || warn "Plymouth theme is '$th', expected 'maze'" "Run: sudo plymouth-set-default-theme -R maze"
+fi
+
+[ -d /usr/share/plasma/look-and-feel/com.mazelinux.oled ] \
+    && ok "Plasma look-and-feel com.mazelinux.oled installed" \
+    || warn "Maze OLED look-and-feel missing" "Run: sudo pacman -S maze-plasma-config"
+
+[ -d /usr/share/plasma/plasmoids/com.mazelinux.panic ] \
+    && ok "Panic plasmoid installed" \
+    || warn "Panic plasmoid missing"
+
+if [ -f /etc/sddm.conf.d/20-maze-theme.conf ]; then
+    ok "SDDM Maze theme configured"
+else
+    warn "No SDDM Maze theme config" "Login screen falls back to the stock theme."
+fi
+
+# The Plasma Welcome Center is a hard dependency of plasma-meta, so Maze
+# suppresses it by never extracting its kded plugin. If the plugin came back,
+# the stock welcome screen will pop up over Maze's own.
+if grep -q 'kded_plasma_welcome' /etc/pacman.conf 2>/dev/null; then
+    ok "plasma-welcome kded plugin is NoExtract'ed"
+elif [ -f /usr/lib/qt6/plugins/kf6/kded/kded_plasma_welcome.so ]; then
+    warn "Stock Plasma Welcome plugin is present" \
+         "Add NoExtract = usr/lib/qt6/plugins/kf6/kded/kded_plasma_welcome.so to /etc/pacman.conf, then reinstall plasma-welcome."
+else
+    ok "Stock Plasma Welcome plugin absent"
+fi
+
+# ------------------------------------------------ 4c. boot-time customisation
+section "Kernel command line and initramfs"
+
+CMDLINE=/etc/kernel/cmdline
+if [ ! -r "$CMDLINE" ]; then
+    fail "$CMDLINE missing" "The UKI is built from this file."
+else
+    cl="$(cat "$CMDLINE")"
+    for want in quiet splash apparmor=1 security=apparmor; do
+        case " $cl " in
+            *" $want "*) ok "cmdline has $want" ;;
+            *) warn "cmdline is missing '$want'" "Set by maze-hardening/branding; add it and run: sudo maze-boot-check --repair" ;;
+        esac
+    done
+    case "$cl" in
+        *lsm=*) ok "cmdline sets the LSM stack" ;;
+        *) warn "cmdline has no lsm= list" "AppArmor and lockdown may not load." ;;
+    esac
+    if lsblk -no TYPE 2>/dev/null | grep -q crypt; then
+        case "$cl" in
+            *cryptdevice=*|*rd.luks*) ok "cmdline unlocks the encrypted root" ;;
+            *) fail "Root is LUKS but cmdline has no cryptdevice=" "The machine will boot and never ask for the passphrase." ;;
+        esac
+    fi
+    if pacman -Qq 2>/dev/null | grep -q '^nvidia'; then
+        case "$cl" in
+            *nvidia-drm.modeset=1*) ok "cmdline enables NVIDIA KMS" ;;
+            *) warn "NVIDIA installed but nvidia-drm.modeset=1 not set" "Expect a flickering or blank Plymouth." ;;
+        esac
+    fi
+fi
+
+MKC=/etc/mkinitcpio.conf
+if [ -r "$MKC" ]; then
+    hooks="$(sed -n 's/^[[:space:]]*HOOKS=[(]\(.*\)[)].*/\1/p' "$MKC")"
+    for h in plymouth kms; do
+        case " $hooks " in
+            *" $h "*) ok "mkinitcpio HOOKS has $h" ;;
+            *) warn "mkinitcpio HOOKS is missing '$h'" "Boot splash / early KMS will not work." ;;
+        esac
+    done
+    if pacman -Qq 2>/dev/null | grep -q '^nvidia'; then
+        mods="$(sed -n 's/^[[:space:]]*MODULES=[(]\(.*\)[)].*/\1/p' "$MKC")"
+        case " $mods " in
+            *nvidia*) ok "mkinitcpio MODULES includes nvidia" ;;
+            *) warn "NVIDIA installed but not in mkinitcpio MODULES" "Early KMS falls back to the framebuffer." ;;
+        esac
+    fi
+fi
+
+# The live medium's archiso settings must not survive onto an installed system:
+# they rebuild the ISO image instead of this machine's initramfs.
+for leak in /etc/mkinitcpio.conf.d/archiso.conf /etc/mkinitcpio.d/archiso.preset; do
+    [ -e "$leak" ] && fail "Live-medium leftover: $leak" "Remove it: sudo rm $leak"
+done
+[ -e /etc/mkinitcpio.conf.d/archiso.conf ] || ok "No archiso initramfs settings leaked onto this system"
+
+# ------------------------------------------------------- 4d. pacman tuning
+section "Package manager configuration"
+
+if grep -q '^\[mazelinux\]' /etc/pacman.conf 2>/dev/null; then
+    ok "[mazelinux] repository configured"
+    grep -A2 '^\[mazelinux\]' /etc/pacman.conf | grep -qi 'SigLevel *= *Required' \
+        && ok "[mazelinux] requires signatures" \
+        || fail "[mazelinux] does not require signatures" "Unsigned packages would be accepted."
+else
+    fail "[mazelinux] repository is NOT configured" "Maze updates will never arrive."
+fi
+
+if grep -q '^\[maze-aur\]' /etc/pacman.conf 2>/dev/null; then
+    fail "[maze-aur] build-only repo leaked onto this system" \
+         "It points at a path that only exists during the ISO build. Remove that section from /etc/pacman.conf."
+else
+    ok "No build-only [maze-aur] repo"
+fi
+
+for opt in Color ILoveCandy VerbosePkgLists ParallelDownloads; do
+    grep -qE "^${opt}" /etc/pacman.conf 2>/dev/null \
+        && ok "pacman: $opt set" \
+        || warn "pacman: $opt not set" "Cosmetic drift from the Maze default."
+done
+
+if pacman-key --list-keys 2>/dev/null | grep -qi 'maze'; then
+    ok "Maze signing key present in the keyring"
+else
+    fail "Maze signing key NOT in the pacman keyring" "Run: sudo pacman-key --populate mazelinux"
+fi
+
+if grep -q 'blackarch' /etc/pacman.conf 2>/dev/null; then
+    if [ -r /etc/pacman.d/blackarch-mirrorlist ]; then
+        ok "BlackArch repo configured with its mirrorlist"
+    else
+        fail "BlackArch is in pacman.conf but its mirrorlist is missing" \
+             "Every pacman run will warn. Run: maze-enable-blackarch, or remove the section."
+    fi
+else
+    ok "BlackArch not enabled (optional)"
+fi
+
+# ------------------------------------- 4e. live-medium residue (SECURITY)
+section "Live-medium residue"
+
+# Anything here means an installed machine is still carrying the live ISO's
+# convenience settings — which exist precisely because the live session has no
+# security expectations. On a real install they are holes.
+res=0
+
+if pacman -Qq maze-installer >/dev/null 2>&1; then
+    fail "maze-installer is installed on this system" \
+         "It is the live-ISO-only Calamares installer and must never land on a desktop. Run: sudo pacman -Rns maze-installer"
+    res=1
+else
+    ok "Calamares installer not present"
+fi
+# packages.x86_64 lists calamares and xorg-xhost EXPLICITLY, so they are not
+# dependencies and `pacman -Rns maze-installer` never took them along; installs
+# made before maze-installer 2.0.0-22 kept calamares on the desktop.
+_livepk="$(pacman -Qq calamares xorg-xhost 2>/dev/null | tr '\n' ' ')"
+if [ -n "${_livepk}" ]; then
+    warn "Live-medium packages still installed: ${_livepk}" \
+         "Only the installer needs them. Remove: sudo pacman -Rns ${_livepk}"; res=1
+fi
+
+for f in /etc/sudoers.d/99-maze-build /etc/polkit-1/rules.d/49-maze-calamares.rules \
+         /etc/sddm.conf.d/10-maze-autologin.conf; do
+    if [ -e "$f" ]; then
+        fail "Live-medium file still present: $f" "Remove it: sudo rm $f"; res=1
+    fi
+done
+
+if [ "$IS_ROOT" = 1 ]; then
+    # Only ACTIVE rules count. Arch's stock /etc/sudoers ships a commented-out
+    # "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" example, and matching that would
+    # report every stock Arch install as insecure.
+    nopw="$(grep -rls '^[[:space:]]*[^#[:space:]].*NOPASSWD' /etc/sudoers /etc/sudoers.d 2>/dev/null | head -5)"
+    if [ -n "$nopw" ]; then
+        warn "Passwordless sudo configured in:" ""
+        printf '%s\n' "$nopw" | sed 's/^/          /'
+        res=1
+    else
+        ok "No passwordless sudo"
+    fi
+fi
+
+if id maze >/dev/null 2>&1; then
+    fail "The live user 'maze' still exists" "Remove it: sudo userdel -r maze"; res=1
+else
+    ok "Live user 'maze' removed"
+fi
+[ -d /home/maze ] && { fail "/home/maze left behind" "Remove it: sudo rm -rf /home/maze"; res=1; }
+
+for d in /usr/share/applications /etc/skel/.local/share/applications; do
+    [ -e "$d/maze-calamares.desktop" ] && { fail "Installer launcher present: $d/maze-calamares.desktop" "Remove it."; res=1; }
+done
+
+if systemctl list-unit-files 2>/dev/null | grep -qE 'pacman-init|reflector-init'; then
+    warn "archiso live-only units are still installed" "They are harmless but should have been purged at install."
+fi
+
+[ "$res" -eq 0 ] && ok "No live-medium residue found"
+
+# --------------------------------------------------------- 4f. Maze tooling
+section "Maze tooling"
+
+missing_tools=""
+for t in mazelinux maze-welcome maze-control-center maze-kernel maze-kernel-helper \
+         maze-hardware maze-gpu-driver maze-guardctl maze-guardd maze-sentinel \
+         maze-panic maze-killswitch maze-flatpak-setup maze-apply-wallpaper \
+         maze-audit maze-exercise; do
+    [ -x "/usr/local/bin/$t" ] || missing_tools="$missing_tools $t"
+done
+if [ -n "$missing_tools" ]; then
+    fail "Maze tools missing or not executable:$missing_tools" "Run: sudo pacman -S maze-tools"
+else
+    ok "All expected Maze tools present and executable"
+fi
+
+for b in maze-sb-sign maze-kernel-install-add maze-boot-check maze-boot-guard maze-boot-notify; do
+    [ -x "/usr/bin/$b" ] || fail "/usr/bin/$b missing" "Run: sudo pacman -S maze-secureboot"
+done
+ok "Secure Boot helpers present in /usr/bin"
+
+if [ -r /etc/sysctl.d/99-maze-hardening.conf ]; then
+    ok "maze-hardening sysctl profile installed"
+else
+    fail "maze-hardening sysctl profile missing" "Run: sudo pacman -S maze-hardening"
+fi
+
+# --------------------------------------------------------- 5. package system
+section "Package system"
+
+if [ "$DEEP" = 1 ]; then
+    detail "verifying every installed file against the database (slow)…"
+    bad="$(pacman -Qkk 2>&1 | grep -vE 'warning:.*(\.pacnew|No such file or directory.*(cache|log))' | grep -E '^(backup file|.*: .*(Size|Modification time|Permissions|Symlink) mismatch|.*: No such file)' | head -40)"
+else
+    bad="$(pacman -Qkk $maze_pkgs 2>&1 | grep -E 'mismatch|No such file' | head -40)"
+    detail "checked Maze packages only (use --deep for the whole system)"
+fi
+
+# Three /etc/skel files are edited by the installer on purpose, so pacman
+# reports them as altered on EVERY machine, forever. deploy-to-target.sh takes
+# the Calamares launcher out of the panel layout and points the default browser
+# at the installed system's choice — neither belongs in the image the live
+# medium ships, and both have to happen after unpackfs has copied it.
+#
+# Reporting a permanent, expected difference as a warning is worse than not
+# reporting it: a health check that always shows the same warning teaches the
+# reader to skip the warnings section, which is where the real ones appear.
+# They are filtered here and named below, so the fact is still visible without
+# being an alarm.
+_EXPECTED_SKEL='/etc/skel/.config/(plasma-org\.kde\.plasma\.desktop-appletsrc|mimeapps\.list|kdeglobals)'
+_expected_only=0
+if [ -n "$bad" ]; then
+    _rest="$(printf '%s\n' "$bad" | grep -vE "$_EXPECTED_SKEL" || true)"
+    if [ -z "$_rest" ]; then
+        _expected_only=1
+    else
+        bad="$_rest"
+    fi
+fi
+if [ "$_expected_only" = 1 ]; then
+    ok "Packaged files match, apart from the skel files the installer edits"
+    detail "expected: the Calamares launcher is removed from the panel and the"
+    detail "default browser is set, both after the live image is copied"
+    bad=""
+fi
+if [ -n "$bad" ]; then
+    warn "Files differ from what their package installed:" ""
+    printf '%s\n' "$bad" | sed 's/^/          /'
+else
+    ok "Installed files match their packages"
+fi
+
+# Packages Maze used to install by default and no longer does. They are left
+# on the machine on purpose — removing an app someone may be using is not
+# maze-meta's call — but pacman then reports them as orphans, which reads like
+# a fault when it is a deliberate change. Name them so the report says which.
+_EX_DEFAULT="linux-chan-ai sentinai"
+
+orphan_list="$(pacman -Qtdq 2>/dev/null)"
+orphans="$(printf '%s\n' "$orphan_list" | grep -c . || true)"
+if [ "$orphans" -eq 0 ]; then
+    ok "No orphaned packages"
+else
+    _ex=""; _other=0
+    for _o in $orphan_list; do
+        case " $_EX_DEFAULT " in
+            *" $_o "*) _ex="${_ex:+$_ex }$_o" ;;
+            *)         _other=$((_other + 1)) ;;
+        esac
+    done
+    if [ -n "$_ex" ] && [ "$_other" -eq 0 ]; then
+        ok "No orphaned packages (besides former Maze defaults)"
+        detail "no longer installed by default: $_ex"
+        detail "they still work — keep them, or: sudo pacman -Rns $_ex"
+    else
+        warn "$orphans orphaned packages" "Review with: pacman -Qtd"
+        [ -n "$_ex" ] && detail "of these, no longer Maze defaults: $_ex" || true
+    fi
+fi
+
+pacnew="$(find /etc -name '*.pacnew' -o -name '*.pacsave' 2>/dev/null | head -20)"
+if [ -n "$pacnew" ]; then
+    warn "Unmerged configuration files:" ""
+    printf '%s\n' "$pacnew" | sed 's/^/          /'
+else
+    ok "No .pacnew/.pacsave left to merge"
+fi
+
+if [ -e /var/lib/pacman/db.lck ]; then
+    fail "pacman database is locked" "If no pacman is running: sudo rm /var/lib/pacman/db.lck"
+else
+    ok "pacman database not locked"
+fi
+
+if pacman-key --list-keys >/dev/null 2>&1; then
+    ok "pacman keyring readable"
+else
+    fail "pacman keyring is broken" "Run: sudo pacman-key --init && sudo pacman-key --populate"
+fi
+
+for r in core extra multilib mazelinux; do
+    c=$(pacman -Sl "$r" 2>/dev/null | wc -l)
+    [ "$c" -gt 0 ] && ok "Repo [$r]: $c packages" || warn "Repo [$r] is empty or unreachable" "Run: sudo pacman -Syy"
+done
+
+# --------------------------------------------------------- 6. storage & space
+section "Storage"
+
+while read -r src size used avail pct target; do
+    case "$target" in
+        /|/boot|/home|/var) ;;
+        *) continue ;;
+    esac
+    num="${pct%\%}"
+    if [ "$num" -ge 95 ]; then
+        fail "$target is $pct full ($avail free)" "Package and kernel updates will fail."
+    elif [ "$num" -ge 85 ]; then
+        warn "$target is $pct full ($avail free)"
+    else
+        ok "$target: $avail free ($pct used)"
+    fi
+done <<EOF
+$(df -h --output=source,size,used,avail,pcent,target 2>/dev/null | tail -n +2)
+EOF
+
+if [ "$IS_ROOT" = 1 ] && [ -n "${ESP:-}" ]; then
+    esp_avail_k="$(df -Pk "$ESP" | awk 'NR==2{print $4}')"
+    biggest_k=0
+    for f in "$ESP"/EFI/Linux/*.efi; do
+        [ -f "$f" ] || continue
+        s=$(( $(wc -c < "$f") / 1024 )); [ "$s" -gt "$biggest_k" ] && biggest_k=$s
+    done
+    [ "$biggest_k" -eq 0 ] && biggest_k=102400
+    if [ "$esp_avail_k" -lt "$biggest_k" ]; then
+        fail "ESP has no room for the next kernel image ($((esp_avail_k/1024)) MB free)" \
+             "Run: sudo maze-sb-sign --force-bootloader"
+    else
+        ok "ESP headroom fine ($((esp_avail_k/1024)) MB free, image ~$((biggest_k/1024)) MB)"
+    fi
+fi
+
+# --------------------------------------------------- 7. filesystem integrity
+section "Filesystem integrity"
+
+for d in /sys/fs/ext4/*/; do
+    [ -r "$d/errors_count" ] || continue
+    dev="$(basename "$d")"; n="$(cat "$d/errors_count")"
+    if [ "$n" -gt 0 ]; then
+        fn="$(cat "$d/last_error_func" 2>/dev/null)"
+        fail "ext4 on $dev has recorded $n errors (last: $fn)" \
+             "Unmount it and run: sudo fsck.ext4 -f /dev/$dev"
+    else
+        ok "ext4 on $dev: no recorded errors"
+    fi
+done
+
+if have btrfs && [ "$IS_ROOT" = 1 ]; then
+    root_fs="$(findmnt -no FSTYPE / 2>/dev/null)"
+    if [ "$root_fs" = "btrfs" ]; then
+        st="$(btrfs device stats / 2>/dev/null | grep -v ' 0$' || true)"
+        if [ -n "$st" ]; then
+            fail "btrfs device errors on /:" ""
+            printf '%s\n' "$st" | sed 's/^/          /'
+        else
+            ok "btrfs on /: no device errors"
+        fi
+        detail "$(btrfs filesystem usage / 2>/dev/null | awk '/Free .estimated/{print "btrfs free (estimated):", $3}')"
+        sc="$(btrfs scrub status / 2>/dev/null | grep -E 'Status|Error summary' | tr '\n' ' ' || true)"
+        [ -n "$sc" ] && detail "scrub: $sc"
+    fi
+fi
+
+for m in $(findmnt -rno TARGET,OPTIONS 2>/dev/null | awk '$2 ~ /(^|,)ro(,|$)/ {print $1}'); do
+    case "$m" in
+        /run/*|/sys*|/proc*|/snap/*) continue ;;
+    esac
+    fail "$m is mounted READ-ONLY" "A filesystem error usually forced this. Check: journalctl -k | grep -i 'remount'"
+done
+
+# --------------------------------------------------------------- 8. snapshots
+section "Snapshots"
+
+if ! have snapper; then
+    warn "snapper is not installed" "Run: sudo pacman -S maze-snapshots"
+elif [ ! -e /etc/snapper/configs/root ]; then
+    fail "No snapper configuration for /" "Run: sudo maze-snapshots-setup"
+else
+    ok "snapper configured for /"
+    if [ "$IS_ROOT" = 1 ]; then
+        cnt="$(snapper -c root list 2>/dev/null | tail -n +3 | grep -c . || echo 0)"
+        if [ "$cnt" -ge 2 ]; then
+            ok "$cnt snapshots present"
+            detail "$(snapper -c root list 2>/dev/null | tail -2 | head -1 | cut -c1-90)"
+        else
+            warn "Only $cnt snapshots" "snap-pac creates them per pacman transaction; run an update to confirm."
+        fi
+    else
+        skip "snapshot list needs root"
+    fi
+    pacman -Qq snap-pac >/dev/null 2>&1 \
+        && ok "snap-pac installed (snapshots on every pacman transaction)" \
+        || fail "snap-pac is NOT installed" "Nothing snapshots your upgrades. Run: sudo pacman -S snap-pac"
+fi
+
+# ----------------------------------------------------------------- 9. systemd
+section "Services"
+
+failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')"
+if [ -n "$failed" ]; then
+    for u in $failed; do
+        fail "Failed unit: $u" "Inspect with: systemctl status $u"
+    done
+else
+    ok "No failed systemd units"
+fi
+
+state="$(systemctl is-system-running 2>/dev/null)"
+[ "$state" = "running" ] && ok "systemd state: running" || warn "systemd state: $state"
+
+for u in maze-sb-resign.path maze-boot-guard.path maze-boot-check.timer \
+         snapper-cleanup.timer maze-guardd.service; do
+    systemctl list-unit-files "$u" >/dev/null 2>&1 || continue
+    en="$(systemctl is-enabled "$u" 2>/dev/null)"
+    ac="$(systemctl is-active "$u" 2>/dev/null)"
+    if [ "$en" = "enabled" ] && { [ "$ac" = "active" ] || [ "$ac" = "waiting" ]; }; then
+        ok "$u ($en, $ac)"
+    elif [ "$en" = "enabled" ]; then
+        warn "$u is enabled but $ac" "It will only take effect after a reboot. Run: sudo systemctl start $u"
+    else
+        warn "$u is $en"
+    fi
+done
+
+if [ -e /var/lib/maze/boot-unsafe ]; then
+    fail "Boot chain flagged UNSAFE by maze-boot-check" "Details: cat /var/lib/maze/boot-unsafe"
+else
+    ok "No boot-unsafe flag"
+fi
+
+# ---------------------------------------------------------------- 10. security
+section "Security posture"
+
+if have mokutil; then
+    sb="$(mokutil --sb-state 2>/dev/null | head -1)"
+    if printf '%s' "$sb" | grep -qi enabled; then
+        ok "Secure Boot: enabled"
+        if [ "$IS_ROOT" = 1 ] && [ -r /var/lib/maze-secureboot/MOK.cer ]; then
+            mokutil --test-key /var/lib/maze-secureboot/MOK.cer 2>/dev/null | grep -qi 'already enrolled' \
+                && ok "Machine MOK key is enrolled" \
+                || fail "Machine MOK is NOT enrolled" "Run: sudo mokutil --import /var/lib/maze-secureboot/MOK.cer"
+        fi
+    else
+        warn "Secure Boot: disabled in firmware" "The signing chain is maintained but not enforced."
+    fi
+fi
+
+# LAN presence. resolved's compiled-in defaults answer mDNS and LLMNR queries
+# (announcing the hostname on every network), and fwupd's passim daemon
+# advertises a firmware cache through avahi. maze-hardening >= 1.0.0-4 turns
+# all of it off; an older package, a .pacnew left unmerged, or an admin
+# re-enabling something shows up here.
+if have resolvectl; then
+    _prot="$(resolvectl status 2>/dev/null | awk '/^Global/{g=1} g && /Protocols:/{print; exit}')"
+    case "$_prot" in
+        *+mDNS*|*+LLMNR*)
+            warn "systemd-resolved answers on the LAN:$(printf '%s' "$_prot" | grep -oE '\+(mDNS|LLMNR)' | tr '\n' ' ')" \
+                 "The hostname is announced to every network. Expected MulticastDNS=no, LLMNR=no from maze-hardening (check for a .pacnew in /etc/systemd/resolved.conf.d)." ;;
+        "") skip "systemd-resolved not running" ;;
+        *)  ok "systemd-resolved: mDNS and LLMNR off" ;;
+    esac
+fi
+_lan=""
+for _u in avahi-daemon.service avahi-daemon.socket passim.service; do
+    systemctl is-active --quiet "$_u" 2>/dev/null && _lan="$_lan $_u"
+done
+if [ -n "$_lan" ]; then
+    warn "LAN-advertising units active:$_lan" \
+         "avahi/passim broadcast this machine over mDNS. Silence them: sudo systemctl mask --now passim.service avahi-daemon.socket avahi-daemon.service"
+else
+    ok "No mDNS advertising daemon (avahi/passim) active"
+fi
+
+# The root account, and whether the emergency shell can still be reached.
+#
+# Two opposite failures live here. The live ISO carries root with an EMPTY
+# password so the live session works; if that survives onto the installed
+# system, anyone at a TTY becomes root by typing the name. And a locked root
+# with no SULOGIN_FORCE means `sulogin` refuses the emergency shell, so a
+# failed mount leaves the owner with a live USB as their only way in.
+# Maze wants root locked AND the emergency shell reachable; both are checked.
+if [ "$IS_ROOT" = 1 ] && [ -r /etc/shadow ]; then
+    _rf="$(awk -F: '$1=="root" {print $2}' /etc/shadow 2>/dev/null || true)"
+    case "$_rf" in
+        "")
+            fail "root has an EMPTY password - anyone at a TTY can log in as root" \
+                 "Run: sudo passwd -l root"
+            ;;
+        "!"|"*"|"!!"|"!"*)
+            ok "root account is locked (login is via sudo)"
+            _sul=0
+            for _d in /etc/systemd/system/emergency.service.d/*.conf \
+                      /usr/lib/systemd/system/emergency.service.d/*.conf; do
+                [ -r "$_d" ] || continue
+                grep -q 'SULOGIN_FORCE=1' "$_d" 2>/dev/null && _sul=1
+            done
+            if [ "$_sul" = 1 ]; then
+                ok "Emergency shell is reachable without a root password"
+            else
+                warn "Emergency shell would refuse to open" \
+                     "root is locked and sulogin needs a password, so a failed boot leaves no way in. Reinstall maze-secureboot."
+            fi
+            ;;
+        *)
+            ok "root has a password set"
+            ;;
+    esac
+fi
+
+if [ -d /sys/kernel/security/apparmor ]; then
+    n="$(find /sys/kernel/security/apparmor/policy/profiles -maxdepth 1 -type d 2>/dev/null | wc -l)"
+    ok "AppArmor active ($((n>0?n-1:0)) profiles loaded)"
+else
+    warn "AppArmor is not active" "maze-hardening sets lsm=…,apparmor in the kernel cmdline."
+fi
+
+if lsblk -no TYPE 2>/dev/null | grep -q crypt; then
+    ok "LUKS encryption in use"
+else
+    warn "No LUKS device found" "Root does not appear to be encrypted."
+fi
+
+for s in kernel.kptr_restrict kernel.dmesg_restrict kernel.yama.ptrace_scope; do
+    v="$(sysctl -n "$s" 2>/dev/null)"
+    [ -n "$v" ] && [ "$v" != "0" ] \
+        && ok "$s = $v" \
+        || warn "$s = ${v:-unset}" "maze-hardening should set this. Run: sudo sysctl --system"
+done
+
+if have ufw && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    ok "Firewall (ufw) active"
+elif have nft && [ -n "$(nft list ruleset 2>/dev/null)" ]; then
+    ok "Firewall (nftables) has rules"
+elif [ "$IS_ROOT" != 1 ] && systemctl is-active --quiet firewalld 2>/dev/null; then
+    # `nft list ruleset` is root-only; without root the empty answer above means
+    # "could not look", not "no firewall". firewalld being active is the best
+    # unprivileged signal.
+    ok "Firewall: firewalld active (rules not inspectable without root)"
+else
+    warn "No active firewall detected"
+fi
+
+# ------------------------------------------------------------- 11. journal
+section "Stability"
+
+# The question this section exists to answer is not "is anything broken" — the
+# rest of the report covers that. It is the question a user actually asks after
+# their machine misbehaves: **was that Maze, or was it the hardware?**
+#
+# Every crash this system has actually suffered was hardware: a USB WiFi adapter
+# that disconnected itself mid-flight, a display cable left unplugged after a
+# repair, an SSD loose in its enclosure. Each one cost hours of looking in the
+# wrong place, because nothing on the machine would say "this was not the
+# operating system". A distribution that cannot answer that question feels
+# fragile even when it is sound, and that feeling is worth fixing directly.
+#
+# So: name the last unclean shutdown, show the last thing the kernel said before
+# it, and say plainly which layer it points at. Where the evidence is not
+# conclusive this says so rather than guessing — a confident wrong answer here
+# is worse than no answer.
+
+if have journalctl; then
+    # ── did the last boots end cleanly ────────────────────────────────────
+    #
+    # A clean shutdown ends with systemd taking the system apart in order:
+    # stopping units, unmounting filesystems. A freeze, a hard reset or a power
+    # cut simply stops writing mid-sentence, so the absence of that teardown is
+    # the signal.
+    #
+    # NOT looked for: "Reached target Power-Off". It never reaches the journal —
+    # journald is itself stopped before systemd gets that far, so every clean
+    # shutdown would be misread as a crash. Found the hard way: the first
+    # version of this check reported 5 of 5 boots as unclean on a machine that
+    # had been rebooted normally all week.
+    #
+    # Also NOT looked for: "Deactivated successfully" or a bare "Stopping". Both
+    # appear constantly during normal operation — a login session ending emits
+    # one — so they marked a genuinely frozen boot as clean. Only filesystem
+    # teardown and target shutdown are specific to a real shutdown.
+    _boot_ended_cleanly() {   # $1 = boot offset (-1, -2, …)
+        journalctl -b "$1" -n 40 --no-pager 2>/dev/null \
+            | grep -qE 'Unmounting |Unmounted |Stopped target |Reached target (Shutdown|Unmount|Final|Power-Off|Reboot)|systemd-shutdown|Powering off|Rebooting'
+    }
+
+    # What the kernel said last before it stopped — the strongest single clue.
+    _boot_last_kernel_line() {
+        journalctl -b "$1" -k -n 1 --no-pager -o short 2>/dev/null \
+            | tail -n 1 | cut -c1-150
+    }
+
+    # Turn that line into a layer. Deliberately conservative: anything that does
+    # not clearly match stays "unknown".
+    _classify_crash() {
+        case "$1" in
+            *"USB disconnect"*|*"usb "*"disconnect"*|*rt2x00*|*"device descriptor read"*)
+                echo "HARDWARE - a USB device vanished while in use" ;;
+            *"I/O error"*|*"ata"*"failed command"*|*nvme*"I/O"*|*"Buffer I/O"*|*"medium error"*)
+                echo "HARDWARE - the disk stopped answering" ;;
+            # Globs, not regexes: "CPU.*throttled" was here once and matched
+            # nothing, because `.` and `*` are literals to `case`.
+            *thermal*|*"temperature above threshold"*|*throttl*)
+                echo "HARDWARE - overheating" ;;
+            *"Out of memory"*|*"oom-kill"*)
+                echo "SOFTWARE - the machine ran out of memory" ;;
+            *nvidia*|*amdgpu*|*i915*|*"GPU hang"*|*"drm:"*)
+                echo "GRAPHICS DRIVER - not the Maze layer" ;;
+            *"Kernel panic"*|*"BUG:"*|*Oops*|*"hard LOCKUP"*|*"soft lockup"*)
+                echo "KERNEL - a real kernel fault" ;;
+            *) echo "" ;;
+        esac
+    }
+
+    _checked=0
+    _unclean=0
+    _first_unclean=""
+    for _off in -1 -2 -3 -4 -5; do
+        journalctl -b "$_off" -n 1 --no-pager >/dev/null 2>&1 || continue
+        _checked=$((_checked + 1))
+        if ! _boot_ended_cleanly "$_off"; then
+            _unclean=$((_unclean + 1))
+            [ -z "$_first_unclean" ] && _first_unclean="$_off"
+        fi
+    done
+
+    if [ "$_checked" -eq 0 ]; then
+        skip "No earlier boots recorded yet"
+    elif [ "$_unclean" -eq 0 ]; then
+        ok "Last $_checked boots all ended with a clean shutdown"
+    else
+        _line="$(_boot_last_kernel_line "$_first_unclean")"
+        _cause="$(_classify_crash "$_line")"
+        warn "$_unclean of the last $_checked boots ended without a clean shutdown" \
+             "The machine froze, lost power, or was reset."
+        [ -n "$_line" ] && detail "last kernel message before it: $_line"
+        if [ -n "$_cause" ]; then
+            detail "looks like $_cause"
+            case "$_cause" in
+                HARDWARE*|GRAPHICS*) detail "nothing in Maze causes this" ;;
+            esac
+        else
+            detail "the log gives no clear cause - if it repeats, note what you"
+            detail "were doing and check: journalctl -b -1 -k -n 40"
+        fi
+    fi
+
+    # ── USB surprise removals ─────────────────────────────────────────────
+    # Repeated ones mean a loose port or a dying device, and they are a very
+    # common cause of a hang that looks like an OS fault.
+    _usbdrop="$(journalctl -k --no-pager --since '-7 days' 2>/dev/null \
+                | grep -c 'USB disconnect' || true)"
+    if [ "${_usbdrop:-0}" -gt 3 ]; then
+        warn "$_usbdrop USB disconnects in the last 7 days" \
+             "Unplugging counts too, but repeated drops of a device you left in place mean a loose port or a failing device."
+    else
+        ok "No unusual USB disconnects"
+    fi
+
+    # ── thermal ───────────────────────────────────────────────────────────
+    _therm="$(journalctl -k --no-pager --since '-7 days' 2>/dev/null \
+              | grep -ciE 'temperature above threshold|thermal throttl|critical temperature' || true)"
+    [ "${_therm:-0}" -gt 0 ] \
+        && warn "$_therm thermal events in the last 7 days" "The machine is overheating - check fans and dust." \
+        || ok "No overheating"
+fi
+
+section "Recent problems in the journal"
+
+if have journalctl; then
+    kerr="$(journalctl -k -p err --no-pager --since '-7 days' 2>/dev/null | grep -viE 'qat_6xxx|consolefont|ACPI BIOS Error|thermal|virt/tdx' | tail -8)"
+    if [ -n "$kerr" ]; then
+        warn "Kernel errors in the last 7 days:" ""
+        printf '%s\n' "$kerr" | sed 's/^/          /' | cut -c1-120
+    else
+        ok "No notable kernel errors in the last 7 days"
+    fi
+
+    # I/O errors, split by WHICH DEVICE they happened on.
+    #
+    # This used to count every matching line and fail if the count was non-zero,
+    # which put "you pulled a USB stick out before its writes finished" at the
+    # same severity as "the disk holding / is dying". Those are not the same
+    # event and they do not deserve the same word. Observed in the field: yanking
+    # a mounted btrfs USB stick produces a burst of BTRFS critical/error lines and
+    # an "emergency shutdown", the report said [FAIL] ... Needs attention, and the
+    # obvious reading was that the machine was failing — while the root filesystem
+    # was clean, scrub included, three lines further up in the same report.
+    #
+    # This section exists to answer "was that Maze, or was it the hardware?" (see
+    # the Stability block above). Naming the device is what makes that answerable.
+    _iolines="$(journalctl -k --no-pager --since '-7 days' 2>/dev/null \
+                | grep -iE 'I/O error|EXT4-fs error|BTRFS error|BTRFS critical|Buffer I/O' || true)"
+    io="$(printf '%s' "$_iolines" | grep -c . || true)"
+    if [ "${io:-0}" -gt 0 ]; then
+        # Every kernel device name that carries a system mount, ancestors included
+        # (`lsblk -s` walks luks-xxx -> nvme0n1p2 -> nvme0n1), so an error naming
+        # any layer of the stack under / still counts as a system error.
+        _sysdev=""
+        if have findmnt && have lsblk; then
+            for _mp in / /home /boot; do
+                _src="$(findmnt -no SOURCE "$_mp" 2>/dev/null | sed 's/\[.*\]//')"
+                [ -n "$_src" ] || continue
+                _sysdev="${_sysdev}
+$(lsblk -sno KNAME "$_src" 2>/dev/null || true)"
+            done
+        fi
+        # Devices the errors actually name. Two shapes, because the kernel has two:
+        #   "(device sda)" / "dev sdb1," / "on dev sdb1"   ext4, btrfs, blk layer
+        #   "XFS (sda1):" / "FAT-fs (sda1):"               fs-name-then-bare-device
+        # The second pattern is deliberately restricted to real block-device names
+        # rather than "anything in parentheses", so it cannot pick a word out of
+        # prose and mistake it for a disk.
+        _iodev="$( { printf '%s\n' "$_iolines" \
+                       | grep -oE '\(device [a-zA-Z0-9_-]+|dev [a-zA-Z0-9_-]+' \
+                       | sed -E 's/^\(device //; s/^dev //'
+                     printf '%s\n' "$_iolines" \
+                       | grep -oE '\((sd[a-z]+[0-9]*|nvme[0-9]+n[0-9]+(p[0-9]+)?|mmcblk[0-9]+(p[0-9]+)?|vd[a-z]+[0-9]*|hd[a-z]+[0-9]*|dm-[0-9]+)\)' \
+                       | tr -d '()'
+                   } | sort -u )"
+        _sys_hit=0; _other=""
+        for _d in $_iodev; do
+            if printf '%s\n' "$_sysdev" | grep -qx "$_d"; then
+                _sys_hit=1
+            else
+                _other="${_other:+$_other }$_d"
+            fi
+        done
+
+        if [ "$_sys_hit" -eq 1 ]; then
+            fail "$io filesystem/IO error lines in the last 7 days, on a SYSTEM disk" \
+                 "Inspect: journalctl -k | grep -iE 'I/O error|fs error'"
+        elif [ -n "$_other" ]; then
+            # Not the system's problem. Say so plainly, and say what it usually is:
+            # "gone missing" / "<missing disk>" is the signature of a device that
+            # vanished mid-write, which for a removable drive means it was
+            # unplugged (or its cable/enclosure dropped off the bus).
+            if printf '%s' "$_iolines" | grep -qiE 'gone missing|<missing disk>'; then
+                warn "$io I/O error lines on non-system device(s): $_other" \
+                     "The device disappeared while it was still being written to - usually a removable drive unplugged before its writes finished. Your system disks are clean. Eject with the file manager (or 'udisksctl unmount') and re-check that device's filesystem."
+            else
+                warn "$io I/O error lines on non-system device(s): $_other" \
+                     "Your system disks are clean. Check that device separately."
+            fi
+        else
+            # Errors matched but no device could be parsed out of them. Stay at
+            # FAIL — the original severity. Downgrading is only justified by
+            # POSITIVE evidence that every affected device is outside the system;
+            # "we could not tell" is not that evidence, and a filesystem format
+            # this parser does not know must not become a quieter report than it
+            # used to be.
+            fail "$io filesystem/IO error lines in the last 7 days (device not identified)" \
+                 "Inspect: journalctl -k | grep -iE 'I/O error|fs error'"
+        fi
+    else
+        ok "No filesystem/IO errors in the last 7 days"
+    fi
+
+    seg="$(journalctl -p err --no-pager --since '-7 days' 2>/dev/null | grep -ci 'segfault' || true)"
+    [ "${seg:-0}" -gt 0 ] && warn "$seg segfaults in the last 7 days" "Inspect: journalctl | grep segfault" \
+        || ok "No segfaults in the last 7 days"
+
+    oom="$(journalctl -k --no-pager --since '-7 days' 2>/dev/null | grep -ci 'Out of memory' || true)"
+    [ "${oom:-0}" -gt 0 ] && warn "$oom out-of-memory kills in the last 7 days" || ok "No OOM kills in the last 7 days"
+fi
+
+# ------------------------------------------------------------- 12. hardware
+section "Hardware"
+
+# Devices Maze itself has switched off.
+#
+# maze-killswitch can disable the camera (a modprobe.d blacklist plus unloading
+# uvcvideo) and mute the microphone. Both are deliberate features, and both look
+# exactly like a broken laptop to whoever finds them later — especially a second
+# user of the machine, or the same user months on. A tool that reports on the
+# health of the system has to say when the system is fine and Maze is the reason
+# something does not work.
+_cam_bl=/etc/modprobe.d/maze-killswitch-camera.conf
+if [ -e "$_cam_bl" ]; then
+    warn "Camera is disabled by the Maze killswitch" \
+         "Not a fault. Turn it back on in Maze Hardware, or: sudo rm $_cam_bl && sudo modprobe uvcvideo"
+elif [ -d /sys/class/video4linux ] && [ -n "$(ls -A /sys/class/video4linux 2>/dev/null)" ]; then
+    ok "Camera present ($(ls -1 /sys/class/video4linux 2>/dev/null | tr '\n' ' ' | sed 's/ $//'))"
+else
+    # No blacklist and no device: nothing Maze did. Could be a physical shutter,
+    # a BIOS setting or missing firmware — say so rather than implying a fault.
+    skip "No camera device found"
+    detail "Nothing in Maze is blocking it - check the BIOS, a physical shutter, or firmware"
+fi
+
+if have amixer; then
+    _mic_muted=""
+    for _c in $(awk '/^ *[0-9]+ / {print $1}' /proc/asound/cards 2>/dev/null); do
+        for _ctl in Capture "Internal Mic" Mic; do
+            amixer -c "$_c" get "$_ctl" 2>/dev/null | grep -q '\[off\]' \
+                && _mic_muted="${_mic_muted:+$_mic_muted }card$_c/$_ctl"
+        done
+    done
+    if [ -n "$_mic_muted" ]; then
+        # Deliberately does NOT say Maze did this. Unlike the camera, muting a
+        # microphone leaves no marker on disk, so there is nothing to read back:
+        # ALSA's own default, the laptop's Fn mute key and Maze Hardware all
+        # produce the identical state. Saying "Maze Hardware can mute it" read
+        # as "Maze muted it" and sent people to the wrong place — on the machine
+        # this was first seen on, the microphone was not muted at all, it was
+        # physically unplugged after a screen repair. Report the fact, name the
+        # candidates, and let the user look.
+        warn "Microphone capture is muted: $_mic_muted" \
+             "Could be the Fn mute key, an ALSA default, or Maze Hardware - Maze leaves no record either way. Unmute with: amixer -c 0 set Capture cap unmute"
+    else
+        ok "Microphone capture is not muted"
+    fi
+fi
+
+if have smartctl && [ "$IS_ROOT" = 1 ]; then
+    for disk in $(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
+        h="$(smartctl -H "/dev/$disk" 2>/dev/null | grep -iE 'overall-health|SMART Health' | head -1)"
+        if [ -z "$h" ]; then
+            skip "/dev/$disk: no SMART data"
+        elif printf '%s' "$h" | grep -qiE 'PASSED|OK'; then
+            ok "/dev/$disk SMART: passed"
+            re="$(smartctl -A "/dev/$disk" 2>/dev/null | awk '/Reallocated_Sector_Ct|Current_Pending_Sector|Media_and_Data_Integrity_Errors/{print $2"="$NF}' | tr '\n' ' ')"
+            [ -n "$re" ] && detail "/dev/$disk: $re"
+        else
+            fail "/dev/$disk SMART: $h" "Back up this disk now."
+        fi
+    done
+elif ! have smartctl; then
+    skip "smartctl not installed (pacman -S smartmontools)"
+else
+    skip "SMART needs root"
+fi
+
+if [ -r /sys/devices/system/edac/mc/mc0/ce_count ]; then
+    ce="$(cat /sys/devices/system/edac/mc/mc0/ce_count 2>/dev/null)"
+    [ "${ce:-0}" -gt 0 ] && warn "$ce correctable memory errors (EDAC)" || ok "No correctable memory errors"
+fi
+
+# ------------------------------------------------------------------ summary
+section "Summary"
+printf '  %s%d passed%s · %s%d warnings%s · %s%d failures%s · %d skipped\n' \
+    "$C_OK" "$N_OK" "$C_OFF" "$C_WARN" "$N_WARN" "$C_OFF" "$C_FAIL" "$N_FAIL" "$C_OFF" "$N_SKIP"
+
+if [ "$N_FAIL" -gt 0 ]; then
+    printf '\n  %sNeeds attention:%s\n' "$C_FAIL" "$C_OFF"
+    printf '%s' "$FAILS" | sed '/^$/d;s/^/    · /'
+fi
+if [ "$N_WARN" -gt 0 ]; then
+    printf '\n  %sWorth a look:%s\n' "$C_WARN" "$C_OFF"
+    printf '%s' "$WARNS" | sed '/^$/d;s/^/    · /'
+fi
+echo
+
+[ "$N_FAIL" -gt 0 ] && exit 1
+[ "$N_WARN" -gt 0 ] && exit 2
+exit 0

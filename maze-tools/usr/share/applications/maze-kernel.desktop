@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Maze Kernel Switcher
+GenericName=Kernel Switcher
+Comment=Install, remove and choose which Linux kernel boots
+Exec=/usr/local/bin/maze-kernel
+Icon=/usr/share/pixmaps/maze-kernel.svg
+Terminal=false
+Categories=System;Settings;
+Keywords=kernel;linux;switch;boot;lts;zen;hardened;grub;systemd-boot;maze;
+StartupNotify=true
+StartupWMClass=maze-kernel

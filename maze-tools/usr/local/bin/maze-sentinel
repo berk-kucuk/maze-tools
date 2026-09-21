@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# maze-sentinel — Maze Linux host security anomaly monitor.
+#
+# Replaces the old honeypot/deception layer. Instead of planting fake "canary"
+# files (which legitimate tools — file managers, indexers, editors, dev tools —
+# kept reading, producing constant false alarms), Sentinel watches for REAL
+# security-relevant changes and, when one happens, shows a clear, plain-language
+# desktop notification explaining what changed and what the user should do.
+#
+# What it reports (all rare on a normal desktop, so low false-positive):
+#   * user/account changes      — writes to /etc/passwd, /etc/shadow, /etc/group…
+#   * sudo/privilege changes     — writes to /etc/sudoers, /etc/sudoers.d/
+#   * new SSH remote-access keys — writes to ~/.ssh/authorized_keys
+#   * SSH server config changes  — writes to /etc/ssh/sshd_config[.d]
+#   * a new root-privileged program — a new SUID/SGID-root binary appears
+#   * a new administrator account   — a new UID 0 account appears
+#
+# The file-change events come from the kernel audit log (auditd): the identity/
+# sudoers watches ship in the Maze baseline (/etc/audit/rules.d/maze.rules); the
+# SSH ones are added by maze-sentinel-setup. The SUID/account anomalies come from
+# a light periodic scan. Changes made by the package manager you ran
+# (pacman/paru/makepkg) are treated as expected and only logged, not alerted.
+#
+set -uo pipefail
+
+AUDIT_LOG="/var/log/audit/audit.log"
+ALERT_LOG="/var/log/maze-sentinel.log"
+TRIGGER_DIR="/run/maze"
+STATE_DIR="/var/lib/maze/sentinel"
+CONF="/etc/maze/sentinel.conf"
+
+# Defaults (overridable in $CONF).
+NOTIFY=1
+SCAN_INTERVAL=600
+DEBOUNCE=15
+BENIGN_WRITERS="pacman paru makepkg yay pikaur systemd-sysuser systemd-tmpfile"
+SUID_SCAN_DIRS="/usr/bin /usr/local/bin /usr/sbin /bin /sbin"
+# shellcheck source=/dev/null
+[[ -r "${CONF}" ]] && . "${CONF}"
+
+mkdir -p "${TRIGGER_DIR}" "${STATE_DIR}" 2>/dev/null || true
+touch "${ALERT_LOG}" 2>/dev/null || true
+
+log() {
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${ALERT_LOG}" 2>/dev/null || true
+}
+
+# Send a desktop notification to every active user session (same /run/user bus
+# trick as the other Maze notifiers).
+notify_all() {
+    local title="$1" body="$2" urgency="${3:-normal}"
+    [[ "${NOTIFY}" = "1" ]] || return 0
+    local d uid user addr
+    for d in /run/user/*; do
+        [[ -S "${d}/bus" ]] || continue
+        uid="${d##*/}"
+        user="$(id -nu "${uid}" 2>/dev/null)" || continue
+        addr="unix:path=/run/user/${uid}/bus"
+        sudo -u "${user}" env DBUS_SESSION_BUS_ADDRESS="${addr}" \
+            notify-send -a "Maze Sentinel" -u "${urgency}" -i dialog-warning-symbolic \
+            "${title}" "${body}" >/dev/null 2>&1 || true
+    done
+}
+
+record_trigger() {
+    {
+        echo "time=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "kind=$1"
+        echo "detail=$2"
+    } > "${TRIGGER_DIR}/sentinel-triggered" 2>/dev/null || true
+}
+
+# Collapse a burst of identical events (one action = several write syscalls) into
+# a single notification, per change-type, within $DEBOUNCE seconds.
+debounced() {
+    local key="$1" stamp="${TRIGGER_DIR}/.sentinel-last.$1" now age
+    now="$(date +%s)"
+    if [[ -f "${stamp}" ]]; then
+        age=$(( now - $(stat -c %Y "${stamp}" 2>/dev/null || echo 0) ))
+        (( age < DEBOUNCE )) && return 0   # too soon -> debounce (skip)
+    fi
+    : > "${stamp}" 2>/dev/null || true
+    return 1
+}
+
+# React to a file-change audit SYSCALL record for one of our watched keys.
+react_audit() {
+    local raw="$1" key="$2"
+    local exe comm uid user prog
+    exe="$(sed -n 's/.* exe="\([^"]*\)".*/\1/p'   <<<"${raw}")"
+    comm="$(sed -n 's/.* comm="\([^"]*\)".*/\1/p' <<<"${raw}")"
+    uid="$(sed -n 's/.* uid=\([0-9]*\).*/\1/p'    <<<"${raw}" | head -1)"
+    user="$(id -nu "${uid}" 2>/dev/null || echo "uid ${uid:-?}")"
+    prog="${exe##*/}"; [[ -n "${prog}" ]] || prog="${comm:-a program}"
+
+    # Expected admin tooling (you ran it)? Log, do not alert.
+    case " ${BENIGN_WRITERS} " in
+        *" ${comm} "*)
+            log "expected change [${key}] by ${comm} (${user}) — no alert"
+            return 0 ;;
+    esac
+
+    # One notification per change-type per burst.
+    debounced "${key}" && { log "debounced [${key}] by ${prog} (${user})"; return 0; }
+
+    local title body urg
+    case "${key}" in
+        identity)
+            title="Maze Sentinel: a user account changed"
+            body="A system account file (users/passwords) was just modified by “${prog}” as ${user}. If you added/removed a user or changed a password, this is expected — ignore it. If you did NOT, an account may have been created without your knowledge; check: sudo tail /var/log/maze-sentinel.log"
+            urg="normal" ;;
+        sudoers)
+            title="Maze Sentinel: admin (sudo) rights changed"
+            body="The sudo permission files were just modified by “${prog}” as ${user}. These decide who can run commands as root. If you did not change sudo rights (or install software that did), investigate this now."
+            urg="critical" ;;
+        maze_ssh_authkeys)
+            title="Maze Sentinel: a new SSH remote-access key was added"
+            body="An SSH login key was added or changed by “${prog}” as ${user}. Such a key can let someone log into this computer over the network. If this was not you, remove the key and change your passwords."
+            urg="critical" ;;
+        maze_sshd)
+            title="Maze Sentinel: SSH server settings changed"
+            body="The SSH server configuration was just modified by “${prog}” as ${user}. If you did not change SSH settings, someone may be trying to enable remote access — investigate."
+            urg="normal" ;;
+        *)
+            title="Maze Sentinel: a security-sensitive file changed"
+            body="A monitored security file was modified by “${prog}” as ${user}. Details: sudo tail /var/log/maze-sentinel.log"
+            urg="normal" ;;
+    esac
+    log "ALERT [${key}] by ${prog} (uid ${uid:-?}/${user}) :: ${raw}"
+    record_trigger "${key}" "${prog}/${user}"
+    notify_all "${title}" "${body}" "${urg}"
+}
+
+# ---- periodic baseline scan: new SUID/SGID-root binaries and root accounts ----
+scan_suid()          { find ${SUID_SCAN_DIRS} -xdev -type f -perm /6000 2>/dev/null | sort -u; }
+scan_root_accounts() { awk -F: '$3==0 {print $1}' /etc/passwd 2>/dev/null | sort -u; }
+
+# Emit an alert for every line that is in $2 (current) but not in the baseline
+# file $1, then adopt the current set as the new baseline (so each item alerts
+# once). $3=kind, $4=title, $5=body-prefix, $6=urgency.
+diff_and_alert() {
+    local base="$1" current="$2" kind="$3" title="$4" prefix="$5" urg="$6"
+    [[ -f "${base}" ]] || { printf '%s\n' "${current}" > "${base}"; return 0; }
+    local new line
+    new="$(comm -13 "${base}" <(printf '%s\n' "${current}") 2>/dev/null)"
+    [[ -n "${new}" ]] || return 0
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        log "ALERT [${kind}] ${line}"
+        record_trigger "${kind}" "${line}"
+        notify_all "${title}" "${prefix}${line}" "${urg}"
+    done <<< "${new}"
+    printf '%s\n' "${current}" > "${base}"
+}
+
+baseline_loop() {
+    local suid_base="${STATE_DIR}/suid.list"
+    local acct_base="${STATE_DIR}/root-accounts.list"
+    # Seed baselines on first run (silently — this is the trusted initial state).
+    [[ -f "${suid_base}" ]] || scan_suid          > "${suid_base}" 2>/dev/null || true
+    [[ -f "${acct_base}" ]] || scan_root_accounts > "${acct_base}" 2>/dev/null || true
+    while sleep "${SCAN_INTERVAL}"; do
+        diff_and_alert "${suid_base}" "$(scan_suid)" "new-suid" \
+            "Maze Sentinel: a new root-privileged program appeared" \
+            "A new program that always runs with root privileges was found: " "normal"
+        diff_and_alert "${acct_base}" "$(scan_root_accounts)" "new-root-account" \
+            "Maze Sentinel: a new administrator account was created" \
+            "A new account with full root privileges now exists: " "critical"
+    done
+}
+
+# Wait for the audit log to appear (auditd may start just after us).
+for _ in $(seq 1 30); do [[ -e "${AUDIT_LOG}" ]] && break; sleep 2; done
+
+# Start the periodic SUID/account scanner in the background.
+baseline_loop &
+
+log "Maze Sentinel started (account/sudo/ssh change watch + SUID/root-account scan)"
+[[ -e "${AUDIT_LOG}" ]] || echo "maze-sentinel: no audit log; is auditd running?" >&2
+
+# React to auditd events for our security-relevant keys. Only SYSCALL records
+# carry exe/comm/uid; classify by the audit key (the watched file's category).
+tail -Fn0 "${AUDIT_LOG}" 2>/dev/null | while IFS= read -r line; do
+    case "${line}" in
+        *type=SYSCALL*)
+            case "${line}" in
+                *'key="identity"'*)          react_audit "${line}" identity ;;
+                *'key="sudoers"'*)           react_audit "${line}" sudoers ;;
+                *'key="maze_ssh_authkeys"'*) react_audit "${line}" maze_ssh_authkeys ;;
+                *'key="maze_sshd"'*)         react_audit "${line}" maze_sshd ;;
+            esac ;;
+    esac
+done

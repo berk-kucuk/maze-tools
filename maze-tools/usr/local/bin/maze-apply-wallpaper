@@ -1,0 +1,57 @@
+#!/bin/sh
+# maze-apply-wallpaper — force the Maze active-blur (a2n.blur) wallpaper on EVERY
+# desktop (every screen), on every login.
+#
+# WHY: the skel sets wallpaperplugin=a2n.blur for a single desktop, but Plasma
+# falls back to a plain org.kde.image desktop when the skel's screen mapping
+# doesn't match the actual hardware (a VM, different monitors than the build
+# host, or — most importantly — a monitor plugged in AFTER first login). In those
+# cases only the primary screen gets Active Blur and the others get the plain
+# "Image" wallpaper. Re-applying through Plasma scripting on each login, AFTER the
+# desktops exist, guarantees blur on ALL screens, including hot-plugged ones.
+#
+# Idempotent: a desktop that is already on a2n.blur is left untouched, so manual
+# per-desktop blur tweaks survive; only non-blur desktops are converted.
+set -u
+
+QDBUS=""
+for c in qdbus6 qdbus qdbus-qt6; do command -v "$c" >/dev/null 2>&1 && { QDBUS="$c"; break; }; done
+[ -n "${QDBUS}" ] || exit 0
+
+# Wait for plasmashell's scripting interface to be ready.
+i=0
+while [ "$i" -lt 30 ]; do
+    "${QDBUS}" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript 'print(1)' >/dev/null 2>&1 && break
+    i=$((i + 1)); sleep 2
+done
+
+SCRIPT='
+var ds = desktops();
+for (var i = 0; i < ds.length; i++) {
+    var d = ds[i];
+    if (d.wallpaperPlugin == "a2n.blur") {
+        // Already blurred — leave it, except for one migration: older Maze wrote
+        // the raw PNG inside the package as Image. Plasma then lists that file as
+        // a second wallpaper named after its resolution ("3344x1882") next to
+        // "Maze". Pointing at the package directory instead lets MediaProxy pick
+        // the best-fit image and the chooser shows a single "Maze" entry.
+        d.currentConfigGroup = ["Wallpaper", "a2n.blur", "General"];
+        var img = d.readConfig("Image", "");
+        if (String(img).indexOf("/usr/share/wallpapers/Maze/contents/images/") != -1) {
+            d.writeConfig("Image", "file:///usr/share/wallpapers/Maze/");
+            d.reloadConfig();
+        }
+        continue;
+    }
+    d.wallpaperPlugin = "a2n.blur";
+    d.currentConfigGroup = ["Wallpaper", "a2n.blur", "General"];
+    d.writeConfig("ActiveBlur", true);
+    d.writeConfig("Image", "file:///usr/share/wallpapers/Maze/");
+    d.writeConfig("BlurRadius", 50);
+    d.writeConfig("AnimationDuration", 250);
+    d.writeConfig("SlidePaths", "/usr/share/wallpapers/");
+    d.reloadConfig();
+}'
+
+"${QDBUS}" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${SCRIPT}" >/dev/null 2>&1 || true
+exit 0

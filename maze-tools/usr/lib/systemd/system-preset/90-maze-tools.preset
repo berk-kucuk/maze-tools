@@ -1,0 +1,11 @@
+# Maze Linux — default-enabled services shipped by the maze-tools package.
+#
+# Applied by `systemctl preset-all` at image-build / first boot, and by the
+# package's own .install scriptlet on live installs. Keeps Maze "ready out of
+# the box" without asking the user to enable anything.
+#
+
+enable maze-guardd.service
+enable maze-flatpak-setup.service
+enable maze-sentinel.service
+enable maze-sentinel-setup.service

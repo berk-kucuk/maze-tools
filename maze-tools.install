@@ -1,0 +1,59 @@
+# maze-tools.install — make the shipped services "ready out of the box".
+#
+# A pacman package may not enable services from PKGBUILD, so enablement lives
+# here. On install we apply the package's systemd preset for the shipped units.
+# (MAC randomisation is NOT handled here anymore — it is owned exclusively by
+# maze-guard; the old mac-changer service/udev rule was removed.)
+#
+# `systemctl enable` works offline (in the mkarchiso chroot it just creates the
+# wants symlinks); `systemctl start` is guarded so it is skipped when no live
+# systemd is running (image build).
+
+_units="maze-guardd.service maze-flatpak-setup.service maze-sentinel.service maze-sentinel-setup.service"
+
+# Services safe to start immediately on a live install (no network flap).
+_start_now="maze-guardd.service maze-sentinel-setup.service maze-sentinel.service"
+
+_reload_udev() {
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >/dev/null 2>&1 || true
+    fi
+}
+
+post_install() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    # Honour the shipped preset (90-maze-tools.preset) for our units.
+    systemctl preset $_units >/dev/null 2>&1 || \
+        systemctl enable $_units >/dev/null 2>&1 || true
+    _reload_udev
+    # Start the safe services now if a real system is up (no netdrop).
+    if [ -d /run/systemd/system ]; then
+        systemctl start $_start_now >/dev/null 2>&1 || true
+    fi
+    echo ">> maze-tools: services enabled."
+}
+
+post_upgrade() {
+    # Pick up unit/rule changes, but do NOT re-enable — respect the admin's
+    # choices across upgrades.
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    _reload_udev
+}
+
+post_remove() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    _reload_udev
+
+    # Re-enable the camera if the killswitch had disabled it.
+    #
+    # The switch works by blacklisting uvcvideo in modprobe.d, which survives a
+    # reboot on purpose. Removing this package takes away the only tool that can
+    # undo it, so leaving the file behind means a camera that is dead for good
+    # with nothing left to explain why. maze-secureboot clears its own
+    # boot-unsafe flag on removal for the same reason.
+    if [ -e /etc/modprobe.d/maze-killswitch-camera.conf ]; then
+        rm -f /etc/modprobe.d/maze-killswitch-camera.conf
+        modprobe uvcvideo >/dev/null 2>&1 || true
+        echo ">> maze-tools: camera killswitch removed - the camera works again."
+    fi
+}

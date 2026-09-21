@@ -1,0 +1,1562 @@
+#!/usr/bin/env bash
+#
+# maze-power-saver
+# ----------------------------------------------------------------------------
+# Power-saving / battery-life optimiser for Arch Linux based distributions.
+#
+# DETAILS:
+#   * FULLY compatible with power-profiles-daemon (PPD). PPD is never stopped
+#     or disabled. This touches only the areas PPD does not manage (NVIDIA,
+#     i915/xe module options, udev Runtime PM, sysctl, audio codec, Wi-Fi
+#     power_save). CPU governor / EPP / platform profiles are left to PPD.
+#   * Idempotent: safe to run more than once.
+#   * Fully reversible with --uninstall (backups included).
+#
+# USAGE:
+#   sudo maze-power-saver                 # apply every step
+#   sudo maze-power-saver --check         # report only, change nothing
+#   sudo maze-power-saver --uninstall     # revert every change made
+#   sudo maze-power-saver --no-install    # do not install packages, only configure
+#   sudo maze-power-saver --help          # this help
+#
+# AREAS HANDLED HERE (PPD-compatible):
+#   - NVIDIA DynamicPowerManagement + Runtime PM
+#   - thermald installation (coexists with PPD, no conflict)
+#   - i915 / xe module parameters (PSR, FBC, DC, GuC)
+#   - PCI / USB / Audio Runtime PM (udev rules)
+#   - sysctl: NMI watchdog, vm writeback, workqueue power_efficient
+#   - snd_hda_intel power_save
+#   - Wi-Fi power_save
+#
+# AREAS LEFT TO PPD (this script does NOT touch them):
+#   - CPU scaling_governor (managed by PPD)
+#   - energy_performance_preference / EPP (managed by PPD)
+#   - Platform profiles (balanced/power-saver/performance)
+#
+# Author: Berk Kucukk
+# ============================================================================
+
+set -Eeu
+# pipefail is deliberately NOT set: the verify_* helpers can return 1 from a
+# pipeline and we want that counted as "verification failed" rather than having
+# it abort the script. -e is still wanted for the genuinely fatal checks.
+
+# --- Colours ---
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; BOLD=''; NC=''
+fi
+
+# --- Constants ---
+SCRIPT_NAME="power-saver"
+TAG="# MANAGED BY $SCRIPT_NAME - this block is generated automatically"
+BACKUP_ROOT="/var/backups/$SCRIPT_NAME"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+
+# Managed files (recorded so --uninstall can undo them)
+MANIFEST_DIR="/var/lib/$SCRIPT_NAME"
+MANIFEST="$MANIFEST_DIR/manifest.txt"
+
+# --- Arguments ---
+ACTION="apply"
+NO_INSTALL=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check)      ACTION="check"; shift ;;
+        --uninstall)  ACTION="uninstall"; shift ;;
+        --no-install) NO_INSTALL=true; shift ;;
+        -h|--help)
+            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) echo "Unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+# --- Shorthands ---
+log()  { echo -e "${BLUE}[*]${NC} $1"; }
+ok()   { echo -e "${GREEN}[+]${NC} $1"; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+err()  { echo -e "${RED}[-]${NC} $1"; }
+section() { echo -e "\n${BOLD}${BLUE}=== $1 ===${NC}"; }
+
+# --- Root check ---
+if [[ $EUID -ne 0 ]]; then
+    err "Root required. Run it with 'sudo $0'."
+    exit 1
+fi
+
+# --- Distro check ---
+if ! command -v pacman >/dev/null 2>&1; then
+    err "pacman not found. This script targets Arch Linux based distributions."
+    exit 1
+fi
+
+mkdir -p "$MANIFEST_DIR"
+: > "$MANIFEST.tmp"
+
+# ASPMS is needed in both uninstall and apply mode (uninstall runs first), so it
+# is defined globally here.
+ASPMS="pcie_aspm.policy=powersupersave"
+
+# ---------------------------------------------------------------------------
+# Helper: track a file in the manifest
+# ---------------------------------------------------------------------------
+managed_file() {
+    echo "$1" >> "$MANIFEST.tmp"
+}
+backup_file() {
+    local f="$1"
+    [[ -e "$f" ]] || return 0
+    mkdir -p "$BACKUP_ROOT"
+    local bk="$BACKUP_ROOT/$(echo "$f" | tr '/' '_').$TIMESTAMP.bak"
+    cp -a "$f" "$bk" && echo "  (backup: $bk)"
+}
+write_managed() {
+    # write_managed <path> <content>
+    # Idempotent: if the content is already identical, do not rewrite (keeps mtime)
+    local path="$1" content="$2"
+    local dir
+    dir="$(dirname "$path")"
+    mkdir -p "$dir"
+    if [[ -e "$path" ]] && ! grep -q "$TAG" "$path" 2>/dev/null; then
+        backup_file "$path"
+    fi
+    # Skip the write when the file already holds exactly this content
+    local expected
+    expected="$(printf '%s\n%s\n' "$TAG" "$content")"
+    if [[ -f "$path" ]] && [[ "$(cat "$path" 2>/dev/null)" == "$expected" ]]; then
+        ok "  $path already up to date (idempotent skip)"
+        managed_file "$path"
+        return 0
+    fi
+    printf '%s\n%s\n' "$TAG" "$content" > "$path"
+    managed_file "$path"
+}
+
+# write_managed_verify <path> <content> <verify_pattern> [description]
+# write_managed followed immediately by a grep verification.
+# Note: called under set -e, so the verify failure must be swallowed to continue.
+write_managed_verify() {
+    local path="$1" content="$2" pattern="$3" desc="${4:-}"
+    write_managed "$path" "$content"
+    verify_file_contains "$path" "$pattern" "$desc" || true
+}
+
+# ---------------------------------------------------------------------------
+# Read the kernel command line embedded in a Unified Kernel Image, as TEXT.
+#
+# This exists because the obvious way to do it is wrong, and was wrong here for
+# a long time. The previous code ran
+#
+#     objdump -s -j .cmdline "$uki" | strings | grep -qi pcie_aspm
+#
+# and `objdump -s` is a HEX DUMP: its ASCII column is hard-wrapped every 16
+# bytes, so a needle that straddles a boundary simply is not there to be found.
+# On a real Maze cmdline it lands as "... nomux=1 pcie_asp" / "m.policy=powersu"
+# and the grep misses it every time. The script then announced that the freshly
+# built UKI did not contain the parameter it had just put there — the classic
+# shape of a false alarm: the system was fine, the check was broken.
+#
+# `objcopy -O binary --only-section=.cmdline` is the usual replacement, but it
+# honours section flags and silently emits ZERO bytes for a section it decides
+# not to load — i.e. it can fail in exactly the same silent, wrong-answer way.
+# So it is used only as a fast path, and the authoritative method is decoding
+# objdump's HEX column (not its ASCII column), which is flag-independent and
+# reassembles the string whole.
+#
+# Prints the cmdline on success. Returns 1 when it could not read the section at
+# all, so callers can say "could not verify" instead of "the parameter is
+# missing" — those are different statements and only one of them is alarming.
+# ---------------------------------------------------------------------------
+uki_cmdline() {
+    local f="$1" out="" tmp
+    [[ -f "$f" ]] || return 1
+
+    # Fast path: a plain binary extraction of the section.
+    if command -v objcopy >/dev/null 2>&1; then
+        tmp="$(mktemp)" || tmp=""
+        if [[ -n "$tmp" ]]; then
+            objcopy -O binary --only-section=.cmdline "$f" "$tmp" 2>/dev/null || true
+            if [[ -s "$tmp" ]]; then
+                out="$(tr -d '\000' < "$tmp")"
+            fi
+            rm -f "$tmp"
+        fi
+    fi
+
+    # Authoritative path: decode the hex column of objdump's section dump.
+    if [[ -z "$out" ]] && command -v objdump >/dev/null 2>&1 && command -v xxd >/dev/null 2>&1; then
+        out="$(objdump -s -j .cmdline "$f" 2>/dev/null \
+               | awk 'NR>2 && $1 ~ /^[0-9a-f]+$/ {
+                        for (i=2; i<=NF; i++)
+                            if ($i ~ /^[0-9a-f]+$/ && length($i) <= 8) printf "%s", $i
+                      }' \
+               | xxd -r -p 2>/dev/null | tr -d '\000')"
+    fi
+
+    [[ -n "$out" ]] || return 1
+    printf '%s' "$out"
+}
+
+# --- Verification helpers ---
+# Overall verification counters (must be defined before the functions use them)
+VERIFY_PASS=0
+VERIFY_FAIL=0
+
+# verify_file_contains <path> <grep_pattern> [description]
+#   Checks whether the file contains the pattern. Designed to be called right
+#   after a write when CHECK_ONLY is false.
+verify_file_contains() {
+    local path="$1" pattern="$2" desc="${3:-}"
+    if [[ ! -f "$path" ]]; then
+        err "  VERIFICATION FAILED: file missing: $path"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+    if grep -q -- "$pattern" "$path" 2>/dev/null; then
+        ok "  VERIFIED: ${desc:-$path contains: $pattern}"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+        return 0
+    else
+        err "  VERIFICATION FAILED: '$pattern' not found in $path"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+}
+
+# verify_file_exact_line <path> <expected_line> [description]
+#   Checks whether the file carries the exact line we wrote.
+verify_file_exact_line() {
+    local path="$1" expected="$2" desc="${3:-}"
+    if [[ ! -f "$path" ]]; then
+        err "  VERIFICATION FAILED: file missing: $path"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+    if grep -Fxq -- "$expected" "$path" 2>/dev/null; then
+        ok "  VERIFIED: ${desc:-$path contains the line: $expected}"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+        return 0
+    else
+        err "  VERIFICATION FAILED: exact line '$expected' not found in $path"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+}
+
+# verify_sysval <path> <expected> [description]
+#   Checks whether a sysfs value file holds the expected value.
+verify_sysval() {
+    local path="$1" expected="$2" desc="${3:-}"
+    if [[ ! -f "$path" ]]; then
+        err "  VERIFICATION FAILED: sysfs value missing: $path"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+    local actual
+    actual="$(cat "$path" 2>/dev/null)"
+    if [[ "$actual" == "$expected" ]]; then
+        ok "  VERIFIED: ${desc:-$path = $expected}"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+        return 0
+    else
+        err "  VERIFICATION FAILED: $path = '$actual' (expected: '$expected')"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+}
+
+# verify_sysval_contains <path> <substr> [description]
+#   Checks whether a sysfs value contains a given substring.
+verify_sysval_contains() {
+    local path="$1" substr="$2" desc="${3:-}"
+    if [[ ! -f "$path" ]]; then
+        err "  VERIFICATION FAILED: sysfs value missing: $path"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+    local actual
+    actual="$(cat "$path" 2>/dev/null)"
+    if [[ "$actual" == *"$substr"* ]]; then
+        ok "  VERIFIED: ${desc:-$path == *$substr*}"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+        return 0
+    else
+        err "  VERIFICATION FAILED: $path = '$actual' (should contain: '$substr')"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+}
+
+# verify_service <service_name> [description]
+#   Checks whether a systemd service is active.
+verify_service() {
+    local svc="$1" desc="${2:-}"
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        ok "  VERIFIED: ${desc:-$svc active}"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+        return 0
+    else
+        err "  VERIFICATION FAILED: $svc is not active"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+}
+
+# verify_pkg <package_name> [description]
+#   Checks with pacman whether a package is installed.
+verify_pkg() {
+    local pkg="$1" desc="${2:-}"
+    if pacman -Qi "$pkg" >/dev/null 2>&1; then
+        ok "  VERIFIED: ${desc:-$pkg installed}"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+        return 0
+    else
+        err "  VERIFICATION FAILED: $pkg is not installed"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+}
+
+# verify_file_exists <path> [description]
+verify_file_exists() {
+    local path="$1" desc="${2:-}"
+    if [[ -e "$path" ]]; then
+        ok "  VERIFIED: ${desc:-$path present}"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+        return 0
+    else
+        err "  VERIFICATION FAILED: $path is not present"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+}
+
+# verify_signature <efi_path> <cert> [description]
+#   Verify a PE signature with sbverify
+verify_signature() {
+    local efi="$1" crt="$2" desc="${3:-}"
+    if ! command -v sbverify >/dev/null 2>&1; then
+        warn "  sbverify missing - could not check the signature of $efi"
+        return 1
+    fi
+    if [[ ! -f "$efi" ]]; then
+        err "  VERIFICATION FAILED: $efi missing"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+    if sbverify --cert "$crt" "$efi" >/dev/null 2>&1; then
+        ok "  VERIFIED: ${desc:-signature of $efi is valid}"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+        return 0
+    else
+        err "  VERIFICATION FAILED: ${desc:-signature of $efi is invalid}"
+        VERIFY_FAIL=$((VERIFY_FAIL+1))
+        return 1
+    fi
+}
+
+# ===========================================================================
+# Preparation: hardware detection
+# ===========================================================================
+section "Hardware detection"
+
+CPU_MODEL="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+echo "  CPU: $CPU_MODEL"
+
+# Intel or AMD?
+HAS_INTEL_CPU=false; HAS_AMD_CPU=false
+if grep -qi 'GenuineIntel' /proc/cpuinfo; then HAS_INTEL_CPU=true; fi
+if grep -qi 'AuthenticAMD' /proc/cpuinfo;  then HAS_AMD_CPU=true;  fi
+
+# Intel iGPU
+INTEL_IGPU_PCI=""
+if [[ "$HAS_INTEL_CPU" == true ]] && [[ -d /sys/bus/pci/devices/0000:00:02.0 ]]; then
+    INTEL_IGPU_PCI="0000:00:02.0"
+fi
+
+# i915 or xe?
+HAS_I915=false; HAS_XE=false
+lsmod | grep -q '^i915 ' && HAS_I915=true
+lsmod | grep -q '^xe '    && HAS_XE=true
+
+echo "  Intel iGPU: ${INTEL_IGPU_PCI:-none}"
+echo "  i915 driver: $HAS_I915   xe driver: $HAS_XE"
+
+# AMD iGPU (detected for future use)
+AMD_IGPU_PCI=""
+if [[ "$HAS_AMD_CPU" == true ]]; then
+    AMD_IGPU_PCI=$(lspci -D | grep -iE 'VGA|Display' | grep -i 'AMD' | awk '{print $1}' | head -1)
+fi
+
+# NVIDIA dGPU
+NVIDIA_PCI=""
+if lspci -D | grep -qi 'NVIDIA'; then
+    NVIDIA_PCI=$(lspci -D | grep -i 'NVIDIA' | grep -iE 'VGA|3D|Display' | awk '{print $1}' | head -1)
+fi
+echo "  NVIDIA dGPU: ${NVIDIA_PCI:-none}"
+
+# ThinkPad ACPI?
+HAS_THINKPAD_ACPI=false
+lsmod | grep -q '^thinkpad_acpi ' && HAS_THINKPAD_ACPI=true
+echo "  ThinkPad ACPI: $HAS_THINKPAD_ACPI"
+
+# PPD check
+PPD_ACTIVE=false
+if systemctl is-active --quiet power-profiles-daemon 2>/dev/null; then
+    PPD_ACTIVE=true
+    ok "power-profiles-daemon is ACTIVE (it will stay that way)"
+else
+    warn "power-profiles-daemon is not running. This script does not REQUIRE PPD,"
+    warn "but running alongside it is recommended. (pacman -S power-profiles-daemon)"
+fi
+
+# Battery present?
+HAS_BATTERY=false
+[[ -d /sys/class/power_supply/BAT0 ]] && HAS_BATTERY=true
+echo "  Battery: $HAS_BATTERY"
+
+# ===========================================================================
+# --uninstall mode
+# ===========================================================================
+if [[ "$ACTION" == "uninstall" ]]; then
+    section "REVERTING CHANGES"
+    if [[ ! -f "$MANIFEST" ]]; then
+        warn "Manifest not found ($MANIFEST). Was the script ever applied?"
+        exit 0
+    fi
+    log "Reverting the recorded files..."
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        if [[ -e "$f" ]] && grep -q "$TAG" "$f" 2>/dev/null; then
+            rm -f "$f"
+            ok "Removed: $f"
+        elif [[ -e "$f" ]] && [[ "$f" == *.conf ]] && [[ "$f" == /boot/loader/entries/* || "$f" == /boot/efi/loader/entries/* || "$f" == /efi/loader/entries/* ]]; then
+            # systemd-boot type1 entry: no TAG, so only strip the ASPM parameter
+            if grep -q -- "$ASPMS" "$f" 2>/dev/null; then
+                sed -i "s| $ASPMS||g" "$f"
+                ok "ASPM parameter removed: $f"
+            fi
+        elif [[ -e "$f" ]] && [[ "$f" == "/etc/kernel/cmdline" ]]; then
+            # UKI mode: strip ASPM from /etc/kernel/cmdline
+            if grep -q -- "$ASPMS" "$f" 2>/dev/null; then
+                sed -i "s| $ASPMS||g" "$f"
+                ok "ASPM parameter removed: $f"
+                warn "  Rebuild + re-sign the UKIs with: sudo maze-initramfs-rebuild"
+            fi
+        fi
+    done < "$MANIFEST"
+
+    # Removing installed packages is the user's call - only inform
+    log "Packages installed by this script (removing them manually is suggested): thermald powertop"
+    echo "   pacman -Rs thermald powertop"
+    rm -f "$MANIFEST"
+    ok "Revert complete. A reboot is recommended."
+    exit 0
+fi
+
+CHECK_ONLY=false
+[[ "$ACTION" == "check" ]] && CHECK_ONLY=true && section "CHECK MODE (no changes)"
+
+# ===========================================================================
+# Step 1: thermald (Intel DPTF) - PPD compatible
+# ===========================================================================
+section "1. thermald (Intel Dynamic Platform Thermal Framework)"
+
+install_pkg() {
+    local pkg="$1"
+    if pacman -Qi "$pkg" >/dev/null 2>&1; then
+        ok "$pkg is already installed"
+        return 0
+    fi
+    if $NO_INSTALL; then
+        warn "$pkg is not installed (--no-install)"
+        return 1
+    fi
+    if $CHECK_ONLY; then
+        warn "$pkg is not installed"
+        return 1
+    fi
+    log "Installing $pkg..."
+    if pacman -S --needed --noconfirm "$pkg" >/dev/null 2>&1; then
+        ok "$pkg installed"
+        return 0
+    else
+        err "Installing $pkg failed"
+        return 1
+    fi
+}
+
+# Recorded so the post-run advice can describe what this machine actually did,
+# instead of telling the user to expect a service the script just switched off.
+THERMALD_DISABLED=false
+
+if [[ "$HAS_INTEL_CPU" == true ]]; then
+    install_pkg thermald || true
+
+    # ThinkPad DYTC detection: on these platforms thermald reports "Unsupported"
+    # and shuts itself down. If /sys/devices/platform/thinkpad_acpi/dytc_lapmode
+    # exists we already know thermald cannot work here - disable it rather than
+    # leaving it to fail on every boot.
+    DYTC_PRESENT=false
+    if [[ -f /sys/devices/platform/thinkpad_acpi/dytc_lapmode ]]; then
+        DYTC_PRESENT=true
+    fi
+
+    if [[ "$DYTC_PRESENT" == true ]]; then
+        warn "ThinkPad DYTC detected - thermald does not work on this platform"
+        warn "  thermald itself reports 'Unsupported cpu model or platform'"
+        warn "  PPD + thinkpad_acpi already handle thermals. Disabling thermald."
+        if ! $CHECK_ONLY; then
+            systemctl disable --now thermald >/dev/null 2>&1 && \
+                ok "  thermald disabled (PPD is in charge)" || true
+        else
+            warn "  --check: thermald not disabled"
+        fi
+        THERMALD_DISABLED=true
+        # Verification: thermald must be inactive on a DYTC platform
+        if systemctl is-active --quiet thermald 2>/dev/null; then
+            warn "  thermald is still active (unexpected)"
+            VERIFY_FAIL=$((VERIFY_FAIL+1))
+        else
+            ok "  VERIFIED: thermald inactive (DYTC platform, PPD in charge)"
+            VERIFY_PASS=$((VERIFY_PASS+1))
+        fi
+        verify_pkg thermald "thermald package installed (inactive)" || true
+    elif [[ -f /usr/sbin/thermald ]] || systemctl list-unit-files thermald >/dev/null 2>&1; then
+        if systemctl is-active --quiet thermald 2>/dev/null; then
+            ok "thermald is running"
+        else
+            if $CHECK_ONLY; then
+                warn "thermald is not running"
+            else
+                if systemctl enable --now thermald >/dev/null 2>&1; then
+                    ok "thermald started and enabled"
+                else
+                    warn "thermald could not be started (try 'systemctl status thermald')"
+                    warn "  On a ThinkPad, DYTC firmware may be in charge instead"
+                fi
+            fi
+        fi
+        verify_service thermald "thermald active" || true
+        verify_pkg thermald "thermald package installed" || true
+    else
+        warn "thermald is not installed (apply mode will install it)"
+    fi
+else
+    warn "No Intel CPU, thermald skipped"
+fi
+
+# ===========================================================================
+# Step 2: powertop (for observation) - optional
+# ===========================================================================
+section "2. powertop (summary report)"
+install_pkg powertop || true
+if pacman -Qi powertop >/dev/null 2>&1; then
+    ok "You can watch consumers continuously with 'sudo powertop'."
+    ok "NOTE: do not use powertop --auto-tune (it can conflict with PPD)."
+    verify_pkg powertop "powertop installed" || true
+else
+    warn "powertop could not be installed / is not installed (optional, skipped)"
+fi
+
+# ===========================================================================
+# Step 3: NVIDIA Dynamic Power Management + Runtime PM
+# ===========================================================================
+section "3. NVIDIA Optimus dGPU power management"
+
+if [[ -n "$NVIDIA_PCI" ]]; then
+    echo "  NVIDIA PCI address: $NVIDIA_PCI"
+
+    # 3a. modprobe.d: DynamicPowerManagement=0x02 (fine-grained)
+    MODPROBE_NVIDIA="/etc/modprobe.d/${SCRIPT_NAME}-nvidia.conf"
+    NVIDIA_CONF_BODY='
+# Fine-grained dynamic power management (RPM + GC6 idle power-down)
+# 0x00 = disabled, 0x01 = coarse, 0x02 = fine-grained (BEST for battery)
+options nvidia "NVreg_DynamicPowerManagement=0x02"
+# Runtime PM only works properly together with DPM=0x02
+options nvidia "NVreg_PreserveVideoMemoryAllocations=1"
+'
+
+    CUR_DPM="$(cat /sys/module/nvidia/parameters/nvidia_NVreg_DynamicPowerManagement 2>/dev/null || echo 'unknown')"
+    echo "  Current NVreg_DynamicPowerManagement: ${CUR_DPM} (target: 0x02)"
+
+    if $CHECK_ONLY; then
+        warn "  --check: $MODPROBE_NVIDIA was not created"
+    else
+        write_managed "$MODPROBE_NVIDIA" "$NVIDIA_CONF_BODY"
+        ok "  $MODPROBE_NVIDIA written (active after reboot)"
+        verify_file_contains "$MODPROBE_NVIDIA" "NVreg_DynamicPowerManagement=0x02" \
+            "NVIDIA modprobe.conf contains 0x02" || true
+        verify_file_contains "$MODPROBE_NVIDIA" "NVreg_PreserveVideoMemoryAllocations=1" \
+            "NVIDIA modprobe.conf contains PreserveVM" || true
+    fi
+    managed_file "$MODPROBE_NVIDIA"
+
+    # 3b. udev rule: let the NVIDIA dGPU suspend itself when idle
+    UDEV_NVIDIA="/etc/udev/rules.d/50-${SCRIPT_NAME}-nvidia-pm.rules"
+    NVIDIA_UDEV_BODY="
+
+# NVIDIA dGPU Runtime PM (PRIME/Optimus)
+# -- not managed by PPD, safe to set here --
+SUBSYSTEM==\"pci\", KERNEL==\"$NVIDIA_PCI\", TEST==\"power/control\", \\
+    ATTR{power/control}=\"auto\"
+# Apply at boot as well
+ACTION==\"add\", SUBSYSTEM==\"pci\", KERNEL==\"$NVIDIA_PCI\", \\
+    TEST==\"power/control\", ATTR{power/control}=\"auto\"
+"
+
+    if $CHECK_ONLY; then
+        warn "  --check: $UDEV_NVIDIA was not created"
+    else
+        write_managed "$UDEV_NVIDIA" "$NVIDIA_UDEV_BODY"
+        ok "  $UDEV_NVIDIA written"
+        verify_file_contains "$UDEV_NVIDIA" "KERNEL==\"$NVIDIA_PCI\"" \
+            "NVIDIA udev rule contains the PCI address" || true
+        verify_file_contains "$UDEV_NVIDIA" 'ATTR{power/control}="auto"' \
+            "NVIDIA udev rule contains power/control=auto" || true
+    fi
+    managed_file "$UDEV_NVIDIA"
+
+    # 3c. Apply Runtime PM immediately (unless --check)
+    if ! $CHECK_ONLY; then
+        CTRL="/sys/bus/pci/devices/$NVIDIA_PCI/power/control"
+        if [[ -f "$CTRL" ]] && [[ "$(cat $CTRL)" != "auto" ]]; then
+            echo auto > "$CTRL" 2>/dev/null && \
+                ok "  Live: NVIDIA Runtime PM -> auto" || \
+                warn "  Live change failed (udev/reboot will apply it)"
+        else
+            ok "  Live: NVIDIA Runtime PM is already auto"
+        fi
+        # Verification: read the value back
+        verify_sysval "$CTRL" "auto" "NVIDIA Runtime PM sysfs=auto" || true
+    fi
+
+    # 3d. Is something running nvidia-smi dmon continuously?
+    #   Usually started by ksystemstats (KDE Plasma): its nvidia backend plugin
+    #   calls `nvidia-smi dmon -d 2`. Killing the process is not enough because
+    #   ksystemstats restarts it. The durable fix is disabling that plugin.
+    PIDS="$(pgrep -f 'nvidia-smi dmon' || true)"
+    if [[ -n "$PIDS" ]]; then
+        warn "  nvidia-smi dmon is running continuously (PIDs: $PIDS)"
+        warn "  This process keeps the GPU awake - it comes back after a reboot."
+
+        # Who started it? (parent process)
+        if ! $CHECK_ONLY; then
+            PARENT_PID=""
+            PARENT_CMD=""
+            for p in $PIDS; do
+                ppid_="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+                [[ -n "$ppid_" ]] && PARENT_PID="$ppid_" && break
+            done
+            if [[ -n "$PARENT_PID" ]]; then
+                PARENT_CMD="$(ps -o cmd= -p "$PARENT_PID" 2>/dev/null)"
+                echo "  Parent process: $PARENT_CMD (PID $PARENT_PID)"
+            fi
+
+            # KDE Plasma: ksystemstats -> nvidia backend
+            if echo "$PARENT_CMD" | grep -q 'ksystemstats'; then
+                log "  KDE ksystemstats detected - disabling its nvidia plugin"
+                # User config (usually ~/.config/ksystemstatsrc)
+                USER_CONFIG="$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)/.config/ksystemstatsrc"
+                # System-wide
+                SYSTEM_CONFIG="/etc/xdg/ksystemstatsrc"
+
+                for cfg in "$USER_CONFIG" "$SYSTEM_CONFIG"; do
+                    cfg_dir="$(dirname "$cfg")"
+                    mkdir -p "$cfg_dir" 2>/dev/null
+                    # Idempotent: is nvidia=false already in the [plugins] section?
+                    if [[ -f "$cfg" ]] && grep -A1 '^\[plugins\]' "$cfg" 2>/dev/null | grep -q 'nvidia=false'; then
+                        ok "  $cfg: nvidia plugin already disabled"
+                    else
+                        # Add the [plugins] section if missing, otherwise set the key
+                        if ! grep -q '^\[plugins\]' "$cfg" 2>/dev/null; then
+                            printf '\n[plugins]\nnvidia=false\n' >> "$cfg"
+                        else
+                            # [plugins] exists; add the nvidia line if absent
+                            if ! grep -A100 '^\[plugins\]' "$cfg" 2>/dev/null | grep -q '^nvidia='; then
+                                sed -i '/^\[plugins\]/a nvidia=false' "$cfg"
+                            else
+                                sed -i 's/^nvidia=.*/nvidia=false/' "$cfg"
+                            fi
+                        fi
+                        ok "  $cfg: nvidia plugin disabled (persistent)"
+                        managed_file "$cfg"
+                    fi
+                done
+
+                # Restart ksystemstats (nvidia-smi stops on its own)
+                if [[ -n "$SUDO_USER" ]]; then
+                    log "  Restarting ksystemstats (user: $SUDO_USER)..."
+                    if command -v systemctl >/dev/null 2>&1; then
+                        sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \
+                            systemctl --user restart ksystemstats 2>/dev/null && \
+                            ok "  ksystemstats restarted" || true
+                    fi
+                fi
+                sleep 2
+            fi
+
+            # Kill any remaining nvidia-smi dmon processes
+            for p in $PIDS; do kill "$p" 2>/dev/null && ok "  PID $p stopped"; done
+            sleep 1
+            if pgrep -f 'nvidia-smi dmon' >/dev/null 2>&1; then
+                err "  VERIFICATION FAILED: nvidia-smi dmon is still running"
+                warn "  Turn off GPU monitoring in the KDE Plasma widget / system monitor"
+                VERIFY_FAIL=$((VERIFY_FAIL+1))
+            else
+                ok "  VERIFIED: nvidia-smi dmon stopped"
+                VERIFY_PASS=$((VERIFY_PASS+1))
+            fi
+        fi
+    else
+        ok "  nvidia-smi dmon is not running continuously"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+    fi
+else
+    warn "  No NVIDIA dGPU found, step skipped"
+fi
+
+# ===========================================================================
+# Step 4: Intel iGPU module parameters (i915 / xe)
+#   - PSR, FBC, DC, GuC ... not managed by PPD -> safe
+# ===========================================================================
+section "4. Intel iGPU power saving (i915 / xe)"
+
+if [[ "$HAS_I915" == true ]]; then
+    MODPROBE_I915="/etc/modprobe.d/${SCRIPT_NAME}-i915.conf"
+    I915_BODY='
+# Panel Self Refresh (stop refreshing a static screen -> battery)
+options i915 enable_psr=1
+# Framebuffer compression
+options i915 enable_fbc=1
+# Display C-states (deepest)
+options i915 enable_dc=2
+# Idle residency (RC6) - usually automatic, set explicitly for safety
+options i915 enable_rc6=1
+'
+    if $CHECK_ONLY; then
+        warn "--check: $MODPROBE_I915 was not created"
+        echo "  Suggested content: enable_psr=1 enable_fbc=1 enable_dc=2"
+    else
+        write_managed "$MODPROBE_I915" "$I915_BODY"
+        ok "$MODPROBE_I915 written (active after reboot)"
+        verify_file_contains "$MODPROBE_I915" "enable_psr=1" "i915 PSR" || true
+        verify_file_contains "$MODPROBE_I915" "enable_fbc=1" "i915 FBC" || true
+        verify_file_contains "$MODPROBE_I915" "enable_dc=2"  "i915 DC"  || true
+        verify_file_contains "$MODPROBE_I915" "enable_rc6=1" "i915 RC6" || true
+    fi
+    managed_file "$MODPROBE_I915"
+fi
+
+if [[ "$HAS_XE" == true ]]; then
+    # The newer xe driver (seen on Raptor Lake and later)
+    MODPROBE_XE="/etc/modprobe.d/${SCRIPT_NAME}-xe.conf"
+    XE_BODY='
+# Power saving for the xe driver
+options xe force_probe=0
+'
+    if $CHECK_ONLY; then
+        warn "--check: $MODPROBE_XE was not created"
+    else
+        write_managed "$MODPROBE_XE" "$XE_BODY"
+        ok "$MODPROBE_XE written (optional)"
+        verify_file_contains "$MODPROBE_XE" "force_probe" "xe force_probe" || true
+    fi
+    managed_file "$MODPROBE_XE"
+
+    # Are i915 and xe loaded at the same time?
+    if [[ "$HAS_I915" == true ]]; then
+        warn "i915 AND xe are BOTH loaded!"
+        warn "That is usually a driver overlap. force_probe makes xe bind only to"
+        warn "specific devices. If you run into trouble:"
+        warn "   rmmod xe ; echo 'blacklist xe' > /etc/modprobe.d/blacklist-xe.conf"
+    fi
+fi
+
+[[ "$HAS_I915" == false && "$HAS_XE" == false ]] && \
+    warn "Neither i915 nor xe is loaded. Step skipped."
+
+# ===========================================================================
+# Step 5: General PCI / USB Runtime PM (udev)
+#   Not managed by PPD -> safe
+#   Host bridges (0x060000) are skipped.
+# ===========================================================================
+section "5. PCI / USB / NVMe Runtime PM (udev)"
+
+UDEV_RUNTIME="/etc/udev/rules.d/50-${SCRIPT_NAME}-runtime-pm.rules"
+UDEV_RUNTIME_BODY='
+# Let every PCI device suspend when idle (host bridges excluded)
+ACTION=="add", SUBSYSTEM=="pci", \\
+    TEST=="power/control", \\
+    ATTR{power/control}!="on", \\
+    ATTR{class}!="0x060000", \\
+    ATTR{power/control}="auto"
+
+# USB autosuspend (after 2 s).
+#
+# This applies to EVERY USB device, input devices included. If a keyboard or
+# mouse ever starts "cutting out" on this machine, suspect this rule first: a
+# port that autosuspends and whose remote-wakeup does not fire looks exactly
+# like failing hardware. Excluding HID here is not as simple as it looks -
+# bInterfaceClass lives on the usb_interface while power/control lives on the
+# parent usb_device, so the obvious filter would only half-work - so it is left
+# alone deliberately rather than half-fixed. Note this does NOT affect the
+# initramfs (the LUKS passphrase prompt): rules in /etc/udev/rules.d are not
+# part of the initramfs image.
+ACTION=="add", SUBSYSTEM=="usb", TEST=="power/control", \\
+    ATTR{power/control}="auto"
+ACTION=="add", SUBSYSTEM=="usb", TEST=="power/autosuspend_delay_ms", \\
+    ATTR{power/autosuspend_delay_ms}="2000"
+ACTION=="add", SUBSYSTEM=="usb_device", TEST=="power/control", \\
+    ATTR{power/control}="auto"
+
+# NVMe APST (already the default, set explicitly for safety)
+ACTION=="add", SUBSYSTEM=="pci", ATTR{class}=="0x010802", \\
+    TEST=="power/control", ATTR{power/control}="auto"
+
+# SATA link power management (where supported)
+ACTION=="add", SUBSYSTEM=="scsi_host", KERNEL=="host*", \\
+    TEST=="link_power_management_policy", \\
+    ATTR{link_power_management_policy}="min_power"
+
+# Audio codec auto suspend
+ACTION=="add", SUBSYSTEM=="sound", TEST=="power/control", \\
+    ATTR{power/control}="auto"
+
+# Wi-Fi power_save (when the interface appears)
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="wlan*", \\
+    RUN+="/usr/sbin/iw dev $name set power_save on 2>/dev/null"
+'
+
+if $CHECK_ONLY; then
+    warn "--check: $UDEV_RUNTIME was not created"
+else
+    write_managed "$UDEV_RUNTIME" "$UDEV_RUNTIME_BODY"
+    ok "$UDEV_RUNTIME written"
+    verify_file_contains "$UDEV_RUNTIME" 'SUBSYSTEM=="pci"' "udev PCI rule" || true
+    verify_file_contains "$UDEV_RUNTIME" 'SUBSYSTEM=="usb"' "udev USB rule" || true
+    verify_file_contains "$UDEV_RUNTIME" 'autosuspend_delay_ms' "USB autosuspend" || true
+    verify_file_contains "$UDEV_RUNTIME" 'link_power_management_policy' "SATA LPM" || true
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --action=add --subsystem-match=pci --subsystem-match=usb --subsystem-match=net >/dev/null 2>&1 || true
+    ok "udev rules reloaded and triggered"
+fi
+managed_file "$UDEV_RUNTIME"
+
+# Apply immediately (PCI only; NVMe is safe because APST handles it)
+if ! $CHECK_ONLY; then
+    COUNT_CHANGED=0
+    while IFS= read -r dev; do
+        [[ -z "$dev" ]] && continue
+        class_path="/sys/bus/pci/devices/$dev/class"
+        [[ -f "$class_path" ]] || continue
+        cls="$(cat "$class_path")"
+        [[ "$cls" == "0x060000" ]] && continue
+        ctrl="/sys/bus/pci/devices/$dev/power/control"
+        [[ -f "$ctrl" ]] || continue
+        if [[ "$(cat "$ctrl")" == "on" ]]; then
+            echo auto > "$ctrl" 2>/dev/null && COUNT_CHANGED=$((COUNT_CHANGED+1))
+        fi
+    done < <(ls /sys/bus/pci/devices/)
+    ok "Live: $COUNT_CHANGED PCI devices set to control=auto"
+
+    # Verification: how many are still 'on' (host bridges excluded)
+    REMAIN_ON=0
+    while IFS= read -r dev; do
+        [[ -z "$dev" ]] && continue
+        cls_path="/sys/bus/pci/devices/$dev/class"
+        [[ -f "$cls_path" ]] || continue
+        [[ "$(cat "$cls_path")" == "0x060000" ]] && continue
+        ctrl="/sys/bus/pci/devices/$dev/power/control"
+        [[ -f "$ctrl" ]] || continue
+        [[ "$(cat "$ctrl")" == "on" ]] && REMAIN_ON=$((REMAIN_ON+1))
+    done < <(ls /sys/bus/pci/devices/)
+    echo "  Check: still on 'on' (host bridges excluded): $REMAIN_ON devices"
+    if [[ "$REMAIN_ON" -eq 0 ]]; then
+        ok "  VERIFIED: every PCI device is auto (host bridges excluded)"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+    else
+        warn "  $REMAIN_ON devices are still 'on' (some require it for correctness)"
+        VERIFY_PASS=$((VERIFY_PASS+1))
+    fi
+fi
+
+# ===========================================================================
+# Step 6: sysctl settings (NMI watchdog, vm writeback, workqueue)
+#   Not managed by PPD -> safe
+# ===========================================================================
+section "6. sysctl: NMI watchdog / vm writeback / workqueue"
+
+SYSCTL_FILE="/etc/sysctl.d/99-${SCRIPT_NAME}.conf"
+SYSCTL_BODY='
+# Turn off the NMI watchdog (a 500Hz interrupt costing power for nothing here)
+kernel.nmi_watchdog=0
+
+# Reduce dirty page writeback frequency (lets the disk stay asleep longer)
+vm.dirty_writeback_centisecs=6000
+
+# Kernel workqueue power-efficient mode
+kernel.workqueue.on_power_efficient=1
+'
+
+if $CHECK_ONLY; then
+    warn "--check: $SYSCTL_FILE was not created"
+else
+    write_managed "$SYSCTL_FILE" "$SYSCTL_BODY"
+    ok "$SYSCTL_FILE written"
+    verify_file_contains "$SYSCTL_FILE" "kernel.nmi_watchdog=0" "sysctl NMI watchdog" || true
+    verify_file_contains "$SYSCTL_FILE" "vm.dirty_writeback_centisecs=6000" "sysctl writeback" || true
+    verify_file_contains "$SYSCTL_FILE" "kernel.workqueue.on_power_efficient=1" "sysctl workqueue" || true
+    sysctl --system >/dev/null 2>&1 || true
+    ok "sysctl reloaded"
+    # Verify the value on the running system
+    verify_sysval "/proc/sys/kernel/nmi_watchdog" "0" "nmi_watchdog=0 (live)" || true
+fi
+managed_file "$SYSCTL_FILE"
+
+# ===========================================================================
+# Step 7: Audio codec power save (snd_hda_intel)
+# ===========================================================================
+section "7. Audio codec power save"
+
+if [[ -d /sys/module/snd_hda_intel ]] || $CHECK_ONLY; then
+    MODPROBE_AUDIO="/etc/modprobe.d/${SCRIPT_NAME}-audio.conf"
+    AUDIO_BODY='
+# Suspend the audio codec 1s after it goes idle
+options snd_hda_intel power_save=1 power_save_controller=Y
+'
+    if $CHECK_ONLY; then
+        warn "--check: $MODPROBE_AUDIO was not created"
+    else
+        write_managed "$MODPROBE_AUDIO" "$AUDIO_BODY"
+        ok "$MODPROBE_AUDIO written"
+        verify_file_contains "$MODPROBE_AUDIO" "power_save=1" "audio power_save=1" || true
+        verify_file_contains "$MODPROBE_AUDIO" "power_save_controller=Y" "audio ctrl=Y" || true
+        # Apply live as well
+        echo 1 > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null && \
+            ok "Live: snd_hda_intel power_save=1"
+        # Verification:
+        verify_sysval "/sys/module/snd_hda_intel/parameters/power_save" "1" \
+            "snd_hda_intel power_save=1 (live)" || true
+    fi
+    managed_file "$MODPROBE_AUDIO"
+else
+    warn "snd_hda_intel module not present, step skipped"
+fi
+
+# ===========================================================================
+# Step 8: Wi-Fi power_save (live + udev)
+# ===========================================================================
+section "8. Wi-Fi power_save"
+
+if command -v iw >/dev/null 2>&1; then
+    for dev in /sys/class/net/wlan*; do
+        [[ -e "$dev" ]] || continue
+        iface="$(basename "$dev")"
+        if $CHECK_ONLY; then
+            echo "  $iface: (check) not set via iw"
+        else
+            iw dev "$iface" set power_save on 2>/dev/null && \
+                ok "  $iface: power_save ON" || \
+                warn "  $iface: iw error"
+            # Verification: read it back
+            sleep 1
+            if iw dev "$iface" get power_save 2>/dev/null | grep -q "on"; then
+                ok "  VERIFIED: $iface power_save ON"
+                VERIFY_PASS=$((VERIFY_PASS+1))
+            else
+                err "  VERIFICATION FAILED: $iface power_save is not ON"
+                VERIFY_FAIL=$((VERIFY_FAIL+1))
+            fi
+        fi
+    done
+    [[ ! -e /sys/class/net/wlan0 ]] && warn "  No wlan* interface found"
+else
+    warn "  'iw' is not installed. pacman -S iw"
+fi
+
+# ===========================================================================
+# Step 9: Kernel cmdline (GRUB / systemd-boot / rEFInd)
+#   - ONLY pcie_aspm.policy=powersupersave is added (PPD does not manage it)
+#   - i915 settings go through modprobe.d, so they need no cmdline entry
+# ===========================================================================
+section "9. Kernel cmdline: pcie_aspm.policy"
+
+# ASPMS is defined globally in the constants section above
+
+if [[ -d /etc/default/grub.d ]] && [[ -f /etc/default/grub ]]; then
+    GRUB_DROPIN="/etc/default/grub.d/${SCRIPT_NAME}.cfg"
+    GRUB_BODY="
+# Laptop power saving: most aggressive PCIe ASPM
+GRUB_CMDLINE_LINUX_DEFAULT=\"\$GRUB_CMDLINE_LINUX_DEFAULT $ASPMS\"
+"
+    if $CHECK_ONLY; then
+        warn "--check: $GRUB_DROPIN was not created"
+    else
+        write_managed "$GRUB_DROPIN" "$GRUB_BODY"
+        ok "$GRUB_DROPIN written"
+        verify_file_contains "$GRUB_DROPIN" "$ASPMS" "grub.d drop-in contains ASPM" || true
+        # If grub.d is not honoured, add it to /etc/default/grub directly.
+        # Idempotent: skip when ASPM is already on the GRUB_CMDLINE_LINUX_DEFAULT line
+        if grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub 2>/dev/null && \
+           ! grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=.*$ASPMS" /etc/default/grub 2>/dev/null; then
+            backup_file /etc/default/grub
+            sed -i "/^GRUB_CMDLINE_LINUX_DEFAULT=/ s|\"$| $ASPMS\"|" /etc/default/grub
+            ok "parameter appended to /etc/default/grub (backup taken)"
+        else
+            ok "/etc/default/grub already contains ASPM (or has no suitable line)"
+        fi
+        verify_file_contains "/etc/default/grub" "$ASPMS" "/etc/default/grub contains ASPM" || true
+        if command -v grub-mkconfig >/dev/null 2>&1; then
+            log "Running grub-mkconfig..."
+            grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 && \
+                ok "/boot/grub/grub.cfg regenerated" || \
+                warn "grub-mkconfig may have failed"
+            # Did the parameter really land in /boot/grub/grub.cfg?
+            verify_file_contains "/boot/grub/grub.cfg" "$ASPMS" \
+                "generated grub.cfg kernel cmdline contains ASPM" || true
+        fi
+    fi
+    managed_file "$GRUB_DROPIN"
+elif [[ -d /boot/loader/entries ]] || [[ -d /boot/efi/loader/entries ]] || [[ -d /efi/loader/entries ]]; then
+    # Find the bootloader entries directory
+    ENTRIES_DIR="/boot/loader/entries"
+    if [[ ! -d "$ENTRIES_DIR" ]] || [[ -z "$(ls -A "$ENTRIES_DIR" 2>/dev/null)" ]]; then
+        if [[ -d /boot/efi/loader/entries ]]; then ENTRIES_DIR="/boot/efi/loader/entries"
+        elif [[ -d /efi/loader/entries ]];     then ENTRIES_DIR="/efi/loader/entries"
+        fi
+    fi
+    warn "systemd-boot detected ($ENTRIES_DIR)"
+
+    # UKI (Unified Kernel Image) detection: any .efi under /EFI/Linux/?
+    UKI_FOUND=false
+    for uki_dir in /EFI/Linux /boot/EFI/Linux /efi/EFI/Linux /boot/efi/EFI/Linux; do
+        if ls "$uki_dir"/*.efi >/dev/null 2>&1; then
+            UKI_FOUND=true
+            echo "  UKI detected: $uki_dir/*.efi"
+            break
+        fi
+    done
+
+    # Process type1 entries (.conf files)
+    CHANGED_ENTRIES=0
+    FOUND_ENTRIES=0
+    for entry in "$ENTRIES_DIR"/*.conf; do
+        [[ -e "$entry" ]] || continue
+        FOUND_ENTRIES=$((FOUND_ENTRIES+1))
+        if grep -q -- "$ASPMS" "$entry" 2>/dev/null; then
+            ok "  $(basename "$entry"): ASPM already present"
+            managed_file "$entry"
+            continue
+        fi
+        if $CHECK_ONLY; then
+            echo "  $(basename "$entry"): $ASPMS would be added to the 'options' line (--check)"
+        else
+            # Idempotent: back up and append only when ASPM is absent
+            if grep -q "^options.*$ASPMS" "$entry" 2>/dev/null; then
+                ok "  $(basename "$entry"): ASPM already present (skip)"
+                managed_file "$entry"
+            elif grep -q '^options' "$entry"; then
+                backup_file "$entry"
+                sed -i "/^options/ s|$| $ASPMS|" "$entry"
+                ok "  $(basename "$entry"): ASPM added"
+                CHANGED_ENTRIES=$((CHANGED_ENTRIES+1))
+                managed_file "$entry"
+                verify_file_contains "$entry" "$ASPMS" \
+                    "$(basename "$entry") contains ASPM" || true
+            else
+                warn "  $(basename "$entry"): no 'options' line, skipped"
+            fi
+        fi
+    done
+    if ! $CHECK_ONLY && [[ "$CHANGED_ENTRIES" -gt 0 ]]; then
+        ok "  $CHANGED_ENTRIES type1 boot entries updated in total"
+    fi
+
+    # For UKI mode, /etc/kernel/cmdline is the source kernel-install reads, so
+    # future kernel updates keep producing UKIs that carry ASPM.
+    if [[ "$FOUND_ENTRIES" -eq 0 ]] || [[ "$UKI_FOUND" == true ]]; then
+        warn "  UKI mode: the kernel cmdline is generated from /etc/kernel/cmdline"
+        KERNEL_CMDLINE_FILE="/etc/kernel/cmdline"
+        if $CHECK_ONLY; then
+            if [[ -f "$KERNEL_CMDLINE_FILE" ]]; then
+                if grep -q -- "$ASPMS" "$KERNEL_CMDLINE_FILE" 2>/dev/null; then
+                    ok "  $KERNEL_CMDLINE_FILE: ASPM already present"
+                else
+                    echo "  $KERNEL_CMDLINE_FILE: $ASPMS would be added (--check)"
+                    echo "    Current content: $(cat "$KERNEL_CMDLINE_FILE" 2>/dev/null)"
+                fi
+            else
+                echo "  $KERNEL_CMDLINE_FILE: would be created (it does not exist yet)"
+            fi
+        else
+            mkdir -p /etc/kernel
+            if [[ -f "$KERNEL_CMDLINE_FILE" ]]; then
+                backup_file "$KERNEL_CMDLINE_FILE"
+                if grep -q -- "$ASPMS" "$KERNEL_CMDLINE_FILE" 2>/dev/null; then
+                    ok "  $KERNEL_CMDLINE_FILE: ASPM already present"
+                else
+                    # Strip trailing whitespace/newline, then append ASPM
+                    sed -i "s|[[:space:]]*$| $ASPMS|" "$KERNEL_CMDLINE_FILE"
+                    ok "  $KERNEL_CMDLINE_FILE: ASPM added"
+                fi
+            else
+                # No /etc/kernel/cmdline: seed it from /proc/cmdline and append ASPM
+                warn "  /etc/kernel/cmdline missing - seeding it from /proc/cmdline"
+                tr -d '\n' < /proc/cmdline > "$KERNEL_CMDLINE_FILE"
+                echo " $ASPMS" >> "$KERNEL_CMDLINE_FILE"
+                ok "  $KERNEL_CMDLINE_FILE created (/proc/cmdline + ASPM)"
+            fi
+            managed_file "$KERNEL_CMDLINE_FILE"
+            verify_file_contains "$KERNEL_CMDLINE_FILE" "$ASPMS" \
+                "/etc/kernel/cmdline contains ASPM" || true
+            warn "  Rebuild + re-sign the UKIs with: sudo maze-initramfs-rebuild"
+            warn "  (step 13 below does this for the running kernel already)"
+        fi
+    fi
+else
+    warn "Bootloader could not be detected. Add this to the kernel cmdline by hand:"
+    echo "  $ASPMS"
+fi
+
+# ===========================================================================
+# Step 10: ThinkPad specifics: fan profile and charge threshold
+# ===========================================================================
+section "10. ThinkPad ACPI (optional)"
+
+if [[ "$HAS_THINKPAD_ACPI" == true ]]; then
+    # Read the charge threshold
+    CE="$(cat /sys/class/power_supply/BAT0/charge_control_end_threshold 2>/dev/null || cat /sys/class/power_supply/BAT0/charge_end_threshold 2>/dev/null || echo 'unknown')"
+    echo "  Charge stop threshold: ${CE}%"
+    if [[ "$CE" =~ ^[0-9]+$ ]] && [[ "$CE" -ge 80 ]] && [[ "$CE" -le 90 ]]; then
+        ok "  Charge threshold is good ($CE%) - no change needed"
+    else
+        warn "  Suggestion: an 80% upper limit is better for battery longevity."
+        warn "  By hand: echo 80 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold"
+        warn "  To persist it: /etc/tmpfiles.d/charge-threshold.conf"
+    fi
+
+    # ThinkPad fan control (thinkfan etc.) - not changed, informational only
+    echo "  For manual fan control the 'thinkfan' package is recommended."
+    echo "  (This script does not manage the fan, it only reports)"
+else
+    warn "ThinkPad ACPI is not loaded, step skipped"
+fi
+
+# ===========================================================================
+# Step 11: PPD profile (informational)
+# ===========================================================================
+section "11. Active PPD profile (info)"
+
+if [[ "$PPD_ACTIVE" == true ]]; then
+    PROF="$(powerprofilesctl get 2>/dev/null || echo 'unknown')"
+    echo "  Current profile: $PROF"
+    ok "  This script does not touch PPD. Choose it yourself with:"
+    echo "    powerprofilesctl set power-saver   # best battery"
+    echo "    powerprofilesctl set balanced       # balanced (default)"
+    echo "    powerprofilesctl set performance    # performance"
+else
+    warn "PPD is not running, no profile information"
+fi
+
+# ===========================================================================
+# Step 12: Summary report - power draw, temperature, battery estimate
+# ===========================================================================
+section "12. Summary - current state"
+
+# Power
+if [[ -f /sys/class/power_supply/BAT0/power_now ]]; then
+    P="$(cat /sys/class/power_supply/BAT0/power_now)"
+    # power_now is most likely in microwatts. Convert to W.
+    POWER_W="$(awk -v p="$P" 'BEGIN{
+        if (p > 1000000)      printf "%.2f", p/1000000
+        else if (p > 1000)    printf "%.2f", p/1000
+        else                  printf "%.2f", p
+    }')"
+    echo "  Current draw: ${POWER_W}W"
+
+    EF="$(cat /sys/class/power_supply/BAT0/energy_full 2>/dev/null || echo 0)"
+    # energy_full is most likely in microwatt-hours. Convert to Wh.
+    EF_WH="$(awk -v e="$EF" 'BEGIN{
+        if (e > 1000000)      printf "%.2f", e/1000000
+        else if (e > 1000)    printf "%.2f", e/1000
+        else                  printf "%.2f", e
+    }')"
+    if awk -v e="$EF_WH" 'BEGIN{exit (e > 0) ? 0 : 1}'; then
+        H="$(awk -v w="$POWER_W" -v e="$EF_WH" 'BEGIN{printf "%.1f", e/w}')"
+        echo "  Estimated battery life (at the current draw): ~${H} hours"
+        echo "  (This figure should improve after a reboot)"
+    fi
+fi
+
+# Temperature
+echo "  Temperature readings:"
+if command -v sensors >/dev/null 2>&1; then
+    sensors 2>/dev/null | grep -iE 'Package|Core|temp|ACPI' | head -15 | sed 's/^/    /'
+else
+    for z in /sys/class/thermal/thermal_zone*/temp; do
+        [[ -e "$z" ]] || continue
+        t="$(awk -v v="$(cat $z)" 'BEGIN{printf "%.1f", v/1000}')"
+        echo "    $z: ${t}C"
+    done
+fi
+
+# ===========================================================================
+# Step 13: Rebuild + sign the Secure Boot UKI
+#   - When /etc/kernel/cmdline changes the UKI must be rebuilt, and signed with
+#     the MOK if Secure Boot is on.
+#   - kernel-install add -> produces the UKI (layout=uki)
+#   - maze-sb-sign (Maze Linux) or sbsign+sbverify (generic) signs it
+#   - Idempotent: skipped when the UKI already carries ASPM and a valid signature
+# ===========================================================================
+section "13. Rebuild + sign the Secure Boot UKI"
+
+# --- 13a. Is Secure Boot on? ---
+SB_ENABLED=false
+if command -v mokutil >/dev/null 2>&1; then
+    if mokutil --sb-state 2>/dev/null | grep -qiE 'secureboot[[:space:]]+enabled'; then
+        SB_ENABLED=true
+    fi
+elif command -v bootctl >/dev/null 2>&1; then
+    if bootctl status 2>/dev/null | grep -qiE 'secure boot:[[:space:]]*enabled'; then
+        SB_ENABLED=true
+    fi
+else
+    SB_BYTE="$(od -An -tu1 /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | tail -c1 | tr -d ' ')"
+    [[ "$SB_BYTE" == "1" ]] && SB_ENABLED=true
+fi
+
+if $SB_ENABLED; then
+    ok "Secure Boot: ENABLED"
+else
+    warn "Secure Boot: disabled (the UKI rebuild is still attempted)"
+fi
+
+# --- 13b. Locate the ESP ---
+ESP=""
+if command -v bootctl >/dev/null 2>&1; then
+    ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+fi
+[[ -z "$ESP" || ! -d "$ESP" ]] && ESP="/efi"
+[[ ! -d "$ESP" ]] && ESP="/boot/efi"
+[[ ! -d "$ESP" ]] && ESP="/boot"
+
+if [[ ! -d "$ESP" ]]; then
+    err "  ESP not found. UKI step skipped."
+else
+    echo "  ESP: $ESP"
+
+    # --- 13c. UKI directory ---
+    UKI_DIR="$ESP/EFI/Linux"
+    UKI_COUNT=0
+    if [[ -d "$UKI_DIR" ]]; then
+        UKI_COUNT="$(find "$UKI_DIR" -maxdepth 1 -name '*.efi' -type f 2>/dev/null | wc -l)"
+    fi
+    echo "  UKI directory: $UKI_DIR ($UKI_COUNT files)"
+
+    # --- 13d. Tools ---
+    HAS_KERNEL_INSTALL=false
+    HAS_MAZE_SB_SIGN=false
+    HAS_SBSIGN=false
+    HAS_SBVERIFY=false
+    command -v kernel-install >/dev/null 2>&1 && HAS_KERNEL_INSTALL=true
+    # command -v, not a hardcoded path: the packaged binary lives at
+    # /usr/bin/maze-sb-sign (maze-secureboot), not /usr/local/bin. The old
+    # check looked in the wrong directory and so was ALWAYS false on every
+    # real Maze Linux install — which also gated the MOK key lookup below
+    # (13f only tries /var/lib/maze-secureboot/MOK.key when this is true), so
+    # the failure compounded: no maze-sb-sign found -> no Maze key found
+    # either -> Secure Boot signing silently skipped -> "no signing tool/key"
+    # on every single run on the OS this script ships with.
+    command -v maze-sb-sign >/dev/null 2>&1 && HAS_MAZE_SB_SIGN=true
+    command -v sbsign  >/dev/null 2>&1 && HAS_SBSIGN=true
+    command -v sbverify >/dev/null 2>&1 && HAS_SBVERIFY=true
+    echo "  Tools: kernel-install=$HAS_KERNEL_INSTALL maze-sb-sign=$HAS_MAZE_SB_SIGN sbsign=$HAS_SBSIGN sbverify=$HAS_SBVERIFY"
+
+    # --- 13e. Is this layout=uki? ---
+    LAYOUT="bls"
+    if [[ -f /etc/kernel/install.conf ]] && grep -Eq '^layout=.*uki' /etc/kernel/install.conf 2>/dev/null; then
+        LAYOUT="uki"
+    fi
+    [[ "$UKI_COUNT" -eq 0 ]] && LAYOUT="bls"
+    echo "  Boot layout: $LAYOUT"
+
+    if [[ "$LAYOUT" != "uki" ]]; then
+        warn "  Not a UKI layout ($LAYOUT). The GRUB path was handled in step 9, skipping."
+    elif [[ "$HAS_KERNEL_INSTALL" == false ]]; then
+        err "  kernel-install missing - cannot build a UKI. Do it manually."
+    else
+        # --- 13f. Locate the signing keys ---
+        SIGN_KEY=""
+        SIGN_CRT=""
+        if [[ "$HAS_MAZE_SB_SIGN" == true ]] && [[ -r /var/lib/maze-secureboot/MOK.key ]] && [[ -r /var/lib/maze-secureboot/MOK.crt ]]; then
+            SIGN_KEY="/var/lib/maze-secureboot/MOK.key"
+            SIGN_CRT="/var/lib/maze-secureboot/MOK.crt"
+            ok "  Signing key (Maze MOK): $SIGN_KEY"
+        elif [[ -r /etc/secureboot/MOK.key ]] && [[ -r /etc/secureboot/MOK.crt ]]; then
+            SIGN_KEY="/etc/secureboot/MOK.key"
+            SIGN_CRT="/etc/secureboot/MOK.crt"
+            ok "  Signing key (/etc/secureboot MOK): $SIGN_KEY"
+        elif [[ -r /etc/sbctl/db.key ]] && [[ -r /etc/sbctl/db.crt ]]; then
+            SIGN_KEY="/etc/sbctl/db.key"
+            SIGN_CRT="/etc/sbctl/db.crt"
+            ok "  Signing key (sbctl): $SIGN_KEY"
+        else
+            warn "  No MOK key found automatically (sign manually with maze-sb-sign or sbsign)"
+        fi
+
+        # --- 13g. --check mode ---
+        if $CHECK_ONLY; then
+            warn "--check: the UKI is not rebuilt"
+            echo "  Process: kernel-install add -> (hooks sign it automatically)"
+            echo "  Idempotency: SKIPPED when the current UKI carries ASPM and is signed"
+        else
+            # --- 13h. KVER and vmlinuz ---
+            KVER="$(uname -r)"
+            VMLINUZ="/usr/lib/modules/$KVER/vmlinuz"
+            if [[ ! -f "$VMLINUZ" ]]; then
+                for pb in /usr/lib/modules/*/pkgbase; do
+                    [[ -r "$pb" ]] || continue
+                    if [[ "$(cat "$pb")" == "linux" ]]; then
+                        kdir="${pb%/pkgbase}"
+                        KVER="${kdir##*/}"
+                        VMLINUZ="/usr/lib/modules/$KVER/vmlinuz"
+                        break
+                    fi
+                done
+            fi
+
+            if [[ ! -f "$VMLINUZ" ]]; then
+                err "  /usr/lib/modules/$KVER/vmlinuz missing - cannot build a UKI"
+            else
+                # --- 13i. Idempotency: does the current UKI carry ASPM + a signature? ---
+                # Selected by KVER, NOT by mtime. maze-sb-sign's own header describes
+                # the "newest mtime = the booted kernel" pattern as plainly wrong:
+                # pacman DELETES the old kernel's modules but does not delete the old
+                # UKI from the ESP, and if that file was re-signed later its mtime can
+                # be newer than the running kernel's. Keying on mtime would then read
+                # the ASPM+signature state of that stale UKI instead of the running
+                # one, decide to SKIP, and the ASPM change would never reach the image
+                # that actually boots.
+                UKI_CURRENT="$(ls -t "$UKI_DIR"/*-"$KVER".efi 2>/dev/null | head -1)"
+                [[ -z "$UKI_CURRENT" ]] && UKI_CURRENT="$(ls -t "$UKI_DIR"/*.efi 2>/dev/null | head -1)"
+                UKI_SKIP=false
+                UKI_HAS_ASPM=false
+                if [[ -n "$UKI_CURRENT" ]] && [[ -f "$UKI_CURRENT" ]]; then
+                    if CUR_CMDLINE="$(uki_cmdline "$UKI_CURRENT")"; then
+                        case "$CUR_CMDLINE" in
+                            *pcie_aspm*|*powersupersave*) UKI_HAS_ASPM=true ;;
+                        esac
+                    fi
+                fi
+
+                if [[ "$UKI_HAS_ASPM" == true ]]; then
+                    ok "  The current UKI already carries ASPM"
+                    if [[ -n "$SIGN_CRT" ]] && command -v sbverify >/dev/null 2>&1 && \
+                       sbverify --cert "$SIGN_CRT" "$UKI_CURRENT" >/dev/null 2>&1; then
+                        ok "  The current UKI signature is valid - SKIPPING the rebuild"
+                        UKI_SKIP=true
+                        VERIFY_PASS=$((VERIFY_PASS+1))
+                    else
+                        warn "  UKI carries ASPM but is unsigned/invalid - it will be re-signed"
+                    fi
+                else
+                    echo "  The current UKI does not carry ASPM (or no UKI) - rebuilding"
+                fi
+
+                if [[ "$UKI_SKIP" == true ]]; then
+                    # Is the shim's second stage current too?
+                    GRUB="$ESP/EFI/BOOT/grubx64.efi"
+                    if [[ -f "$GRUB" ]] && [[ -n "$SIGN_CRT" ]] && \
+                       command -v sbverify >/dev/null 2>&1; then
+                        if sbverify --cert "$SIGN_CRT" "$GRUB" >/dev/null 2>&1; then
+                            ok "  grubx64.efi signature is valid"
+                            VERIFY_PASS=$((VERIFY_PASS+1))
+                        else
+                            warn "  grubx64.efi signature is invalid - re-signing"
+                            if command -v maze-sb-sign >/dev/null 2>&1; then
+                                maze-sb-sign --force-bootloader >/dev/null 2>&1 && \
+                                    ok "  maze-sb-sign: grubx64.efi re-signed"
+                            fi
+                        fi
+                    fi
+                else
+                    # --- 13j. Rebuild the UKI ---
+                    # `kernel-install add` OVERWRITES the existing UKI, so there is no
+                    # reason to delete it first. The old code ran `kernel-install
+                    # remove` immediately before this, which opens a window in which
+                    # the machine has no bootable UKI at all: lose power there — or
+                    # have the add fail for any reason — and it does not come up.
+                    # Nothing was gained for that risk.
+                    log "  Rebuilding the UKI (kernel-install add $KVER)..."
+                    if kernel-install add "$KVER" "$VMLINUZ" 2>&1; then
+                        ok "  kernel-install add succeeded"
+                        VERIFY_PASS=$((VERIFY_PASS+1))
+
+                        # --- 13k. Verify the UKI ---
+                        # Address it by KVER, for the same reason as 13i: "newest
+                        # mtime" can name a different kernel's image entirely, and
+                        # the re-sign that runs on write is enough to make that
+                        # happen.
+                        UKI_NEW="$(ls -t "$UKI_DIR"/*-"$KVER".efi 2>/dev/null | head -1)"
+                        [[ -z "$UKI_NEW" ]] && UKI_NEW="$(ls -t "$UKI_DIR"/*.efi 2>/dev/null | head -1)"
+                        if [[ -n "$UKI_NEW" ]] && [[ -f "$UKI_NEW" ]]; then
+                            ok "  UKI: $UKI_NEW"
+                            verify_file_exists "$UKI_NEW" "UKI written" || true
+                            if NEW_CMDLINE="$(uki_cmdline "$UKI_NEW")"; then
+                                case "$NEW_CMDLINE" in
+                                    *pcie_aspm*|*powersupersave*)
+                                        ok "  VERIFIED: UKI .cmdline carries the ASPM parameter"
+                                        VERIFY_PASS=$((VERIFY_PASS+1))
+                                        ;;
+                                    *)
+                                        err "  VERIFICATION FAILED: the rebuilt UKI does not carry ASPM"
+                                        VERIFY_FAIL=$((VERIFY_FAIL+1))
+                                        if [[ -f /etc/kernel/cmdline ]] && grep -q -- "$ASPMS" /etc/kernel/cmdline 2>/dev/null; then
+                                            warn "  /etc/kernel/cmdline DOES contain it, so the source is fine -"
+                                            warn "  something dropped it while building. Try: sudo maze-initramfs-rebuild"
+                                        else
+                                            err "  /etc/kernel/cmdline does not contain ASPM either!"
+                                        fi
+                                        ;;
+                                esac
+                            else
+                                # Could not read the section. Say exactly that: it is
+                                # not the same statement as "the parameter is missing",
+                                # and reporting the alarming one for an unreadable
+                                # section is how a healthy machine gets called broken.
+                                warn "  Could not read the UKI's .cmdline section - ASPM not verified"
+                                warn "  (needs objcopy or objdump+xxd; the UKI itself was written fine)"
+                            fi
+                        else
+                            err "  VERIFICATION FAILED: no UKI was produced"
+                            VERIFY_FAIL=$((VERIFY_FAIL+1))
+                        fi
+
+                        # --- 13l. Sign ---
+                        if [[ "$SB_ENABLED" == true ]]; then
+                            if [[ "$HAS_MAZE_SB_SIGN" == true ]]; then
+                                log "  Signing: maze-sb-sign --force-bootloader"
+                                if maze-sb-sign --force-bootloader 2>&1; then
+                                    ok "  maze-sb-sign succeeded"
+                                    VERIFY_PASS=$((VERIFY_PASS+1))
+                                else
+                                    err "  maze-sb-sign failed"
+                                    VERIFY_FAIL=$((VERIFY_FAIL+1))
+                                fi
+                            elif [[ -n "$SIGN_KEY" ]] && [[ -n "$SIGN_CRT" ]] && \
+                                 [[ "$HAS_SBSIGN" == true ]] && [[ "$HAS_SBVERIFY" == true ]]; then
+                                log "  Signing (sbsign): UKI + grubx64.efi"
+                                if [[ -n "$UKI_NEW" ]]; then
+                                    if ! sbverify --cert "$SIGN_CRT" "$UKI_NEW" >/dev/null 2>&1; then
+                                        if sbsign --key "$SIGN_KEY" --cert "$SIGN_CRT" \
+                                                  --output "$UKI_NEW.maze-signed" "$UKI_NEW" 2>/dev/null; then
+                                            mv -f "$UKI_NEW.maze-signed" "$UKI_NEW"
+                                            ok "  UKI signed"
+                                        else
+                                            rm -f "$UKI_NEW.maze-signed" 2>/dev/null
+                                            err "  Signing the UKI failed"
+                                            VERIFY_FAIL=$((VERIFY_FAIL+1))
+                                        fi
+                                    else
+                                        ok "  UKI is already signed"
+                                    fi
+                                    verify_signature "$UKI_NEW" "$SIGN_CRT" "UKI signature" || true
+                                fi
+                                GRUB="$ESP/EFI/BOOT/grubx64.efi"
+                                if [[ -f "$GRUB" ]]; then
+                                    if ! sbverify --cert "$SIGN_CRT" "$GRUB" >/dev/null 2>&1; then
+                                        if sbsign --key "$SIGN_KEY" --cert "$SIGN_CRT" \
+                                                  --output "$GRUB.new-sign" "$UKI_NEW" 2>/dev/null; then
+                                            mv -f "$GRUB.new-sign" "$GRUB"
+                                            ok "  grubx64.efi signed"
+                                        else
+                                            rm -f "$GRUB.new-sign"
+                                            warn "  Signing grubx64.efi failed"
+                                        fi
+                                    else
+                                        ok "  grubx64.efi is already signed"
+                                    fi
+                                    verify_signature "$GRUB" "$SIGN_CRT" "grubx64.efi signature" || true
+                                else
+                                    warn "  $GRUB not found (not a shim chain?)"
+                                fi
+                            else
+                                warn "  Secure Boot is on but no signing tool/key is available"
+                                warn "  The UKI was NOT signed - Secure Boot may refuse to boot it!"
+                                VERIFY_FAIL=$((VERIFY_FAIL+1))
+                            fi
+                        else
+                            ok "  Secure Boot is off - signing is not required"
+                            if command -v maze-sb-sign >/dev/null 2>&1; then
+                                log "  Best-effort signing: maze-sb-sign --force-bootloader"
+                                maze-sb-sign --force-bootloader >/dev/null 2>&1 || true
+                            fi
+                        fi
+                    else
+                        err "  VERIFICATION FAILED: kernel-install add failed"
+                        VERIFY_FAIL=$((VERIFY_FAIL+1))
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
+
+# Save the manifest
+if ! $CHECK_ONLY; then
+    sort -u "$MANIFEST.tmp" -o "$MANIFEST"
+fi
+rm -f "$MANIFEST.tmp"
+
+# Result
+echo ""
+section "DONE"
+
+# Overall verification summary
+echo -e "  Verification summary: ${GREEN}$VERIFY_PASS passed${NC}, ${RED}$VERIFY_FAIL failed${NC}"
+if [[ "$VERIFY_FAIL" -gt 0 ]]; then
+    warn "  $VERIFY_FAIL steps failed. See the 'VERIFICATION FAILED' lines above."
+fi
+
+if $CHECK_ONLY; then
+    echo "  NOTHING was changed in --check mode."
+    echo "  Assessment: the steps above are applicable on this machine"
+    echo "  Run 'sudo $0' to apply them for real"
+else
+    echo "  Changes recorded. Manifest: $MANIFEST"
+    echo "  To revert: sudo $0 --uninstall"
+    echo ""
+    echo -e "${YELLOW}!! REBOOT REQUIRED !!${NC}"
+    echo "  because:"
+    echo "    - NVIDIA module parameters (NVreg_DynamicPowerManagement)"
+    echo "    - i915 module parameters (PSR/FBC/DC)"
+    echo "    - Kernel cmdline (pcie_aspm)"
+    echo "  only take effect once the modules are reloaded, i.e. after a reboot."
+    echo ""
+    echo "  After the reboot, verify with:"
+    if [[ -n "$NVIDIA_PCI" ]]; then
+        echo "    cat /sys/bus/pci/devices/$NVIDIA_PCI/power/runtime_status  # should be suspended"
+        echo "    cat /sys/module/nvidia/parameters/nvidia_NVreg_DynamicPowerManagement  # 0x02"
+    fi
+    # Describe what this machine is actually set up to do. On a ThinkPad DYTC
+    # platform thermald was deliberately disabled above, so telling the user to
+    # expect it active would report a correct system as broken.
+    if [[ "$THERMALD_DISABLED" == true ]]; then
+        echo "    systemctl is-active power-profiles-daemon  # active"
+        echo "    systemctl is-active thermald               # inactive is CORRECT here (DYTC platform)"
+    else
+        echo "    systemctl is-active thermald power-profiles-daemon  # both active"
+    fi
+    echo "    grep pcie_aspm /proc/cmdline                # ASPM present"
+    echo "    sudo powertop   # no 'Bad' left on the 'Tunables' tab"
+fi
+echo ""
+ok "$SCRIPT_NAME finished."

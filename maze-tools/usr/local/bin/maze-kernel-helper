@@ -1,0 +1,248 @@
+#!/bin/bash
+#
+# maze-kernel-helper — privileged backend for the Maze Kernel Switcher GUI.
+#
+# SECURITY MODEL
+# --------------
+# The GUI (maze-kernel) never touches the system directly: it invokes this
+# helper through pkexec, so the graphical polkit prompt is the single point of
+# authorisation. We ship NO polkit .policy for it — pkexec therefore applies its
+# default org.freedesktop.policykit.exec action (auth_admin), i.e. an
+# administrator password is always required. There is deliberately no
+# passwordless / allow_active rule, so this is never a silent privilege-
+# escalation path.
+#
+# Because it runs as root, the input surface is kept minimal and fully
+# constrained:
+#   * exactly one verb (matched by a case statement) and one operand;
+#   * the operand must be one of a fixed CATALOG of kernel package bases — an
+#     attacker cannot coax this into touching an arbitrary package;
+#   * a fixed interpreter (/bin/bash) and a fixed, minimal PATH, so neither the
+#     shebang lookup nor any called tool can be hijacked via the environment
+#     (pkexec already scrubs the environment; this is defence in depth);
+#   * every expansion is quoted and nothing is eval'd or sourced.
+#
+# Maze installs kernels as signed UKIs via systemd's kernel-install (layout=uki)
+# plus a pacman hook, so a freshly installed kernel is built and
+# Secure-Boot-signed automatically by the existing hooks — this helper only
+# drives pacman and the boot default.
+set -euo pipefail
+export PATH=/usr/bin
+IFS=$' \t\n'
+umask 022
+
+# The kernels the switcher offers. Kept in lockstep with maze-kernel's catalog.
+readonly -a CATALOG=(linux linux-lts linux-zen linux-hardened)
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+is_known() {
+    local k
+    for k in "${CATALOG[@]}"; do [ "$k" = "$1" ] && return 0; done
+    return 1
+}
+
+running_pkgbase() {
+    cat "/usr/lib/modules/$(uname -r)/pkgbase" 2>/dev/null || true
+}
+
+# The uname-style version directory for an installed pkgbase (empty if absent).
+# This is exactly the string kernel-install embeds in the UKI file name, so it
+# is what we match boot entries against.
+kver_for() {
+    local f d
+    for f in /usr/lib/modules/*/pkgbase; do
+        [ -r "$f" ] || continue
+        if [ "$(cat "$f")" = "$1" ]; then
+            d="${f%/pkgbase}"
+            printf '%s\n' "${d##*/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Is UEFI Secure Boot currently ENFORCING? Prefer mokutil (what Maze installs),
+# then bootctl, then the raw EFI variable (last data byte: 1 = on). Returns 0
+# (true) only when Secure Boot is definitely enabled.
+secure_boot_enabled() {
+    if command -v mokutil >/dev/null 2>&1; then
+        mokutil --sb-state 2>/dev/null | grep -qiE 'secureboot[[:space:]]+enabled'
+        return
+    fi
+    if command -v bootctl >/dev/null 2>&1 \
+       && bootctl status 2>/dev/null | grep -qiE 'secure boot:[[:space:]]*enabled'; then
+        return 0
+    fi
+    local b
+    b="$(cat /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | tail -c1 \
+         | od -An -tu1 2>/dev/null | tr -d ' ')"
+    [ "$b" = "1" ]
+}
+
+[ "$(id -u)" -eq 0 ] || die "maze-kernel-helper must run as root (via pkexec)."
+[ "$#" -eq 2 ]       || die "usage: maze-kernel-helper {install|remove|set-default} <pkgbase>"
+
+cmd="$1"
+pkg="$2"
+is_known "$pkg" || die "unknown kernel '$pkg'."
+
+case "$cmd" in
+    install)
+        echo ">> Updating the system and installing ${pkg} + ${pkg}-headers"
+        echo ">> (a full sync avoids partial-upgrade breakage; the kernel-install"
+        echo ">>  hook then builds and Secure-Boot-signs the boot image for you)"
+        echo
+        # -Syu (not -Sy): installing a kernel onto a partially-updated rolling
+        # system is the classic way to break it, so we upgrade first, atomically.
+        # stdbuf -oL: pacman block-buffers stdout when it is a pipe (not a tty),
+        # so force line buffering or the GUI log would only update in chunks.
+        stdbuf -oL -eL pacman -Syu --needed --noconfirm -- "$pkg" "${pkg}-headers"
+        echo
+        echo ">> Done. '${pkg}' is installed and ready to boot."
+        ;;
+
+    remove)
+        [ "$pkg" = "linux" ] && \
+            die "the base 'linux' kernel is kept as a safety fallback and cannot be removed here."
+        [ "$pkg" = "$(running_pkgbase)" ] && \
+            die "'$pkg' is the kernel you are running right now — reboot into another kernel first."
+        echo ">> Removing ${pkg} + ${pkg}-headers"
+        echo
+        # -Rns removes the kernel, its headers and now-orphaned deps. pacman
+        # still refuses if another package needs them, so this cannot break deps.
+        if pacman -Qq -- "${pkg}-headers" >/dev/null 2>&1; then
+            stdbuf -oL -eL pacman -Rns --noconfirm -- "$pkg" "${pkg}-headers"
+        else
+            stdbuf -oL -eL pacman -Rns --noconfirm -- "$pkg"
+        fi
+        echo
+        echo ">> Done. '${pkg}' has been removed."
+        # If the removed kernel was the pinned boot default, drop the pin and
+        # re-sign so grubx64.efi points at a kernel that still exists. Package
+        # REMOVAL fires none of the Maze Secure Boot hooks (they trigger on
+        # Install/Upgrade only), so nothing else would do this.
+        if [ -r /etc/maze/kernel-default ] \
+           && [ "$(tr -d '[:space:]' < /etc/maze/kernel-default)" = "$pkg" ]; then
+            rm -f /etc/maze/kernel-default
+            echo ">> '${pkg}' was the pinned boot default; the pin has been cleared."
+            if command -v maze-sb-sign >/dev/null 2>&1; then
+                echo ">> Re-pointing the boot image at the newest installed kernel…"
+                maze-sb-sign --force-bootloader || \
+                    echo ">> WARNING: re-signing failed — run 'maze-sb-sign --force-bootloader' BEFORE rebooting." >&2
+            fi
+        fi
+        ;;
+
+    set-default)
+        # Maze does NOT boot through a systemd-boot menu: the chain is
+        # firmware -> shim (\EFI\BOOT\BOOTX64.EFI) -> grubx64.efi, and grubx64.efi
+        # IS the (MOK-signed) Unified Kernel Image of the default kernel. sd-boot's
+        # NVRAM entry is deliberately removed, so `bootctl set-default` reports
+        # "Not booted with a supported boot loader" and cannot help. Choosing a
+        # default kernel therefore means installing that kernel's signed UKI as the
+        # shim second stage — exactly what maze-sb-sign does for the newest kernel,
+        # done here for the one the user picked.
+        kver="$(kver_for "$pkg")" || die "'$pkg' is not installed."
+        echo ">> Selecting '${pkg}' (${kver}) as the default boot kernel"
+
+        ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+        [ -n "$ESP" ] && [ -d "$ESP" ] || ESP=/efi
+        [ -d "$ESP" ] || ESP=/boot
+
+        # The kernel-install UKI for this version, named <machine-id>-<kver>.efi.
+        uki=""
+        for f in "$ESP"/EFI/Linux/*-"${kver}".efi; do
+            [ -f "$f" ] && { uki="$f"; break; }
+        done
+        [ -n "$uki" ] || die "no boot image found for '$pkg' under $ESP/EFI/Linux (expected *-${kver}.efi). Reinstall the kernel and retry."
+        echo ">> Boot image: $uki"
+
+        grubdir="$ESP/EFI/BOOT"
+        grub="$grubdir/grubx64.efi"
+        [ -d "$grubdir" ] || die "shim directory $grubdir not found — unexpected boot layout, aborting to stay safe."
+
+        # Behave according to the ACTUAL Secure Boot state:
+        #   * SB ON  -> grubx64.efi MUST be MOK-signed or the firmware rejects it
+        #              and the machine won't boot. Verify, (re)sign if needed, and
+        #              REFUSE the whole operation if we cannot produce a signed
+        #              image (better a no-op than a brick).
+        #   * SB OFF -> any UKI boots; install it directly. Still sign best-effort
+        #              (harmless) so it stays bootable if SB is enabled later.
+        KEYDIR=/var/lib/maze-secureboot
+        _sign_uki() {  # sign $uki in place; return non-zero on failure
+            command -v sbsign >/dev/null 2>&1 || return 1
+            sbsign --key "$KEYDIR/MOK.key" --cert "$KEYDIR/MOK.crt" \
+                   --output "$uki.maze-signed" "$uki" 2>/dev/null || {
+                rm -f "$uki.maze-signed" 2>/dev/null || true; return 1; }
+            mv -f "$uki.maze-signed" "$uki"; sync
+        }
+
+        if secure_boot_enabled; then
+            echo ">> Secure Boot is ENABLED — the boot image must be MOK-signed."
+            [ -r "$KEYDIR/MOK.key" ] && [ -r "$KEYDIR/MOK.crt" ] || \
+                die "Secure Boot is on but this machine's MOK key ($KEYDIR/MOK.key) is missing — cannot produce a signed default. Aborting to avoid an unbootable system."
+            command -v sbverify >/dev/null 2>&1 || \
+                die "Secure Boot is on but sbverify is missing — install 'sbsigntools' and retry."
+            if sbverify --cert "$KEYDIR/MOK.crt" "$uki" >/dev/null 2>&1; then
+                echo ">> UKI is already signed with this machine's MOK."
+            else
+                echo ">> Signing the UKI with the machine MOK…"
+                _sign_uki || die "failed to sign the '$pkg' UKI; refusing to set an unsigned default under Secure Boot."
+            fi
+        else
+            echo ">> Secure Boot is OFF — signing not required."
+            # Best-effort sign if the key exists; never fail the operation on it.
+            if [ -r "$KEYDIR/MOK.key" ] && [ -r "$KEYDIR/MOK.crt" ] \
+               && command -v sbverify >/dev/null 2>&1 \
+               && ! sbverify --cert "$KEYDIR/MOK.crt" "$uki" >/dev/null 2>&1; then
+                _sign_uki || true
+            fi
+        fi
+
+        # Atomically replace grubx64.efi: copy to a temp on the same FAT volume,
+        # flush, then rename. A crash mid-write can never truncate the live
+        # grubx64.efi. Keep the previous one as a manual fallback (.maze-prev).
+        echo ">> Installing it as the shim second stage: $grub"
+        # Record which kernel each image is, in the SAME two markers maze-sb-sign
+        # reads and writes (.maze-kver for what grubx64.efi holds now,
+        # .maze-prev.kver for the rollback copy). Without this the switcher and
+        # the automatic signer would disagree about what is installed, and the
+        # signer would rotate the fallback away on its next run.
+        prev_kver=""
+        [ -r "$grub.maze-kver" ] && prev_kver="$(tr -d '[:space:]' < "$grub.maze-kver")" || true
+        if [ -s "$grub" ] && [ "$prev_kver" != "$kver" ]; then
+            if cp -f "$grub" "$grub.maze-prev" 2>/dev/null; then
+                if [ -n "$prev_kver" ]; then
+                    printf '%s\n' "$prev_kver" > "$grub.maze-prev.kver" 2>/dev/null || true
+                else
+                    rm -f "$grub.maze-prev.kver" 2>/dev/null || true
+                fi
+            fi
+        fi
+        tmp="$grubdir/.grubx64.maze-new"
+        cp -f "$uki" "$tmp"
+        sync
+        mv -f "$tmp" "$grub"
+        printf '%s\n' "$kver" > "$grub.maze-kver" 2>/dev/null || true
+        sync
+
+        # Record the choice in a world-readable marker. The ESP is root-only, so
+        # the (unprivileged) GUI cannot inspect grubx64.efi itself — it reads this
+        # file to show which kernel is the current default.
+        mkdir -p /etc/maze 2>/dev/null || true
+        printf '%s\n' "$pkg" > /etc/maze/kernel-default 2>/dev/null || true
+        chmod 644 /etc/maze/kernel-default 2>/dev/null || true
+
+        echo
+        echo ">> Done. '${pkg}' will boot by default from now on."
+        echo ">> The choice is recorded in /etc/maze/kernel-default, which maze-sb-sign"
+        echo ">> honours on every kernel update — installing or updating another kernel"
+        echo ">> no longer re-pins the newest one. The pin is dropped only if '${pkg}'"
+        echo ">> stops being installed, in which case the newest kernel takes over."
+        ;;
+
+    *)
+        die "usage: maze-kernel-helper {install|remove|set-default} <pkgbase>"
+        ;;
+esac

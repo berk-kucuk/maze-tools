@@ -1,0 +1,7 @@
+# makepkg build artifacts
+/pkg/
+/src/
+*.pkg.tar.*
+*.log
+__pycache__/
+*.pyc

@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+#
+# maze-gpu-driver — install & configure the NVIDIA proprietary driver on an
+# installed Maze Linux system.
+#
+# Maze ships OPEN-SOURCE drivers by default (mesa + nouveau), which work out of
+# the box and are Secure-Boot clean. Proprietary NVIDIA is OPT-IN: run this only
+# if you have an NVIDIA GPU and want the proprietary driver.
+#
+# It handles the two things that make NVIDIA painful on a hardened/Secure-Boot
+# system:
+#   * KMS (nvidia-drm.modeset=1 + fbdev on the cmdline, modprobe.d options) so
+#     the desktop comes up cleanly on the NVIDIA GPU. The modules are NOT put in
+#     the initramfs — see the note at the MODULES step below.
+#   * Secure Boot: NVIDIA's kernel modules are DKMS-built and UNSIGNED, so under
+#     kernel lockdown (which Secure Boot enables) they are refused. This wires
+#     DKMS to sign every module it builds with THIS machine's MOK key (the same
+#     key maze-sb-sign / the installer enrolled), so nvidia loads under Secure
+#     Boot and stays signed across kernel updates.
+#
+# Usage:
+#   sudo maze-gpu-driver            # interactive
+#   sudo maze-gpu-driver --nvidia   # install NVIDIA proprietary, no prompt
+#   sudo maze-gpu-driver --open     # revert to open-source (remove nvidia)
+set -euo pipefail
+
+KEYDIR=/var/lib/maze-secureboot
+MOK_KEY="${KEYDIR}/MOK.key"
+MOK_CRT="${KEYDIR}/MOK.crt"
+
+log()  { printf '\033[1;37m[maze-gpu]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[maze-gpu] WARNING:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[maze-gpu] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+[[ "${EUID}" -eq 0 ]] || die "run as root (sudo maze-gpu-driver)"
+
+MODE="ask"
+case "${1:-}" in
+    --nvidia) MODE="nvidia" ;;
+    --open)   MODE="open" ;;
+    "" )      MODE="ask" ;;
+    *) die "unknown option '$1' (use --nvidia, --open, or no argument)" ;;
+esac
+
+has_nvidia_gpu() { lspci -nn 2>/dev/null | grep -iE 'VGA|3D|Display' | grep -qi 'NVIDIA'; }
+
+# Rebuild the actual booted UKI(s) for every installed kernel. Maze ships
+# layout=uki (/etc/kernel/install.conf), so the real boot artifact lives at
+# $ESP/EFI/Linux/<machine-id>-<kver>.efi and is built ONLY by `kernel-install
+# add` (from the CURRENT /etc/mkinitcpio.conf MODULES + /etc/kernel/cmdline). A
+# standalone `mkinitcpio -P` does NOT touch that file — it only regenerates the
+# plain /boot/initramfs-*.img, which nothing boots — so callers must run this
+# (not just mkinitcpio -P) whenever MODULES or cmdline changes, or the change
+# never reaches the booted UKI.
+rebuild_ukis() {
+    local kdir kver out ok=0 fail=0
+    for kdir in /usr/lib/modules/*/; do
+        [[ -f "${kdir}vmlinuz" ]] || continue
+        kver="$(basename "${kdir}")"
+        # Output used to go to /dev/null, so the ONE message that explains a
+        # broken boot ("module not found: 'nvidia'") was thrown away and the
+        # run continued to its "REBOOT to load it" ending. Keep it.
+        if out="$(kernel-install add "${kver}" "${kdir}vmlinuz" 2>&1)"; then
+            ok=1
+        else
+            fail=1
+            warn "kernel-install add FAILED for ${kver} — the UKI on the ESP is now STALE:"
+            printf '%s\n' "${out}" | sed 's/^/    /' >&2
+        fi
+    done
+    if ((!ok)); then
+        warn "no kernel-install UKI was rebuilt"
+        return 1
+    fi
+    if ((fail)); then return 1; fi
+    return 0
+}
+
+# Verify the machine will actually boot what we just built — BEFORE telling the
+# user to reboot. Every failure this catches is otherwise silent: kernel-install
+# only warns, and the signer installs whatever UKI it finds. The end state is a
+# machine booting a kernel whose /usr/lib/modules pacman has already deleted, so
+# NO module loads at all — vfat included, which is why /boot cannot even be
+# mounted afterwards to diagnose it.
+verify_boot_chain() {
+    local kver esp uki grub gk f rc=0
+    kver="$(for f in /usr/lib/modules/*/; do
+                [[ -f "${f}vmlinuz" ]] || continue
+                f="${f%/}"; printf '%s\n' "${f##*/}"
+            done | sort -V | tail -1)"
+    if [[ -z "${kver}" ]]; then
+        warn "verify: no installed kernel found under /usr/lib/modules"
+        return 1
+    fi
+
+    esp="$(bootctl --print-esp-path 2>/dev/null || true)"
+    if [[ -z "${esp}" || ! -d "${esp}/EFI" ]]; then esp=""; fi
+    if [[ -z "${esp}" && -d /boot/EFI ]]; then esp=/boot; fi
+    if [[ -z "${esp}" && -d /efi/EFI  ]]; then esp=/efi;  fi
+    if [[ -z "${esp}" ]]; then
+        warn "verify: no ESP found — cannot confirm the boot image"
+        return 1
+    fi
+
+    # 1) The ESP must carry a UKI for the kernel that is actually installed.
+    uki=""
+    for f in "${esp}"/EFI/Linux/*"${kver}".efi; do
+        if [[ -f "${f}" ]]; then uki="${f}"; fi
+    done
+    if [[ -z "${uki}" ]]; then
+        warn "verify: no UKI on the ESP for kernel ${kver} (looked in ${esp}/EFI/Linux)"
+        rc=1
+    else
+        log "verify: UKI present for ${kver} — $(basename "${uki}")"
+    fi
+
+    # 2) Under the shim chain, grubx64.efi is what actually boots. It is a
+    #    SEPARATE copy of the UKI, so a correct EFI/Linux says nothing about it.
+    grub="${esp}/EFI/BOOT/grubx64.efi"
+    if [[ -f "${grub}" ]]; then
+        gk=""
+        if command -v objcopy >/dev/null 2>&1; then
+            gk="$(objcopy -O binary --only-section=.uname "${grub}" /dev/stdout 2>/dev/null \
+                    | tr -d '\0' | tr -d '[:space:]')"
+        fi
+        if [[ -z "${gk}" ]]; then
+            gk="$(grep -aoE '[0-9]+\.[0-9]+\.[0-9]+-arch[0-9]+-[0-9]+' "${grub}" 2>/dev/null | sort -u | head -1)"
+        fi
+        if [[ "${gk}" == "${kver}" ]]; then
+            log "verify: grubx64.efi boots ${kver} — matches the installed kernel"
+        elif [[ -n "${gk}" ]]; then
+            warn "verify: grubx64.efi boots ${gk}, but the installed kernel is ${kver}"
+            if [[ ! -d "/usr/lib/modules/${gk}" ]]; then
+                warn "verify: ${gk} has NO modules on disk — this machine would NOT boot"
+            fi
+            rc=1
+        else
+            warn "verify: could not read a kernel version out of grubx64.efi"
+            rc=1
+        fi
+    fi
+
+    MAZE_VERIFIED_KVER="${kver}"
+    return "${rc}"
+}
+
+secure_boot_active() {
+    # mokutil is the most reliable; fall back to the efivar.
+    if command -v mokutil >/dev/null 2>&1; then
+        mokutil --sb-state 2>/dev/null | grep -qi 'enabled' && return 0
+    fi
+    [[ -d /sys/firmware/efi ]] && \
+        grep -qi '\x01$' /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null && return 0
+    return 1
+}
+# We set up signing whenever a per-machine MOK key exists (i.e. the installer
+# configured Secure Boot), even if SB happens to be OFF right now — so enabling
+# it later just works.
+mok_present() { [[ -r "${MOK_KEY}" && -r "${MOK_CRT}" ]]; }
+
+if [[ "${MODE}" == "ask" ]]; then
+    echo
+    log "Detected GPU(s):"
+    lspci 2>/dev/null | grep -iE 'VGA|3D|Display' | sed 's/^/    /'
+    echo
+    if has_nvidia_gpu; then
+        log "An NVIDIA GPU was detected."
+    else
+        warn "No NVIDIA GPU detected. The proprietary driver is only for NVIDIA cards."
+    fi
+    echo "  Maze uses OPEN-SOURCE drivers by default (recommended)."
+    echo
+    read -rp "Install the NVIDIA proprietary driver now? [y/N] " ans
+    case "${ans}" in [yY]*) MODE="nvidia" ;; *) log "Keeping open-source drivers. Nothing to do."; exit 0 ;; esac
+fi
+
+# ---------------------------------------------------------------------------
+revert_to_open() {
+    log "Removing the proprietary NVIDIA driver (reverting to open-source)"
+    pacman -Rns --noconfirm nvidia-dkms nvidia-utils lib32-nvidia-utils cuda ollama-cuda 2>/dev/null || \
+        warn "could not remove some nvidia packages (maybe not installed)"
+    rm -f /etc/modprobe.d/nvidia.conf
+    # Drop nvidia from initramfs MODULES.
+    if [[ -f /etc/mkinitcpio.conf ]]; then
+        # Scoped to the MODULES line (the old pattern ran over the WHOLE file)
+        # and matches the trailing '?' the install path now writes.
+        sed -i -E '/^[[:space:]]*MODULES=/ s/[[:space:]]*nvidia(_modeset|_uvm|_drm)?\??//g' \
+            /etc/mkinitcpio.conf || true
+    fi
+    mkinitcpio -P || warn "mkinitcpio rebuild failed"
+    rebuild_ukis
+    # command -v, not a hardcoded path: the packaged binary lives at
+    # /usr/bin/maze-sb-sign (maze-secureboot). /usr/local/bin/maze-sb-sign is
+    # only a compat shim the package's .install scriptlet creates when
+    # migrating a machine that already had a file there from a pre-package
+    # installer — on every fresh install there is nothing at that path at
+    # all (".install"'s own _install_shim: "a machine installed from a new
+    # ISO has nothing at the old path and gets no shim"), so this check was
+    # false on every fresh Maze Linux install and silently skipped re-signing
+    # after every driver revert.
+    command -v maze-sb-sign >/dev/null 2>&1 && maze-sb-sign --force-bootloader || true
+    log "Reverted to open-source drivers. Reboot to apply."
+    exit 0
+}
+[[ "${MODE}" == "open" ]] && revert_to_open
+
+# ---------------------------------------------------------------------------
+# NVIDIA proprietary install.
+has_nvidia_gpu || warn "no NVIDIA GPU detected — installing anyway as requested"
+
+# 1) Secure Boot: configure DKMS to sign modules with this machine's MOK key
+#    BEFORE building nvidia, so the modules are signed the moment they're built.
+if mok_present; then
+    log "Secure Boot key found — configuring DKMS to sign modules with the MOK"
+    install -d -m755 /etc/dkms
+    # dkms (>=3.0) reads these from framework.conf and signs every built module.
+    if ! grep -q '^mok_signing_key=' /etc/dkms/framework.conf 2>/dev/null; then
+        {
+            echo "# Maze Linux: sign DKMS modules with the per-machine Secure Boot MOK key"
+            echo "mok_signing_key=\"${MOK_KEY}\""
+            echo "mok_certificate=\"${MOK_CRT}\""
+        } >> /etc/dkms/framework.conf
+    fi
+else
+    warn "no per-machine MOK key (${MOK_KEY}); modules will be UNSIGNED."
+    warn "if you enable Secure Boot later, nvidia will fail to load until signed."
+fi
+
+# 2) Install the driver + DKMS + headers for every installed kernel, plus the
+#    CUDA toolkit and ollama-cuda so Maze's bundled ollama (CPU-only by
+#    default, see packages.x86_64) picks up GPU acceleration on this machine.
+#    ollama-cuda depends on both ollama and cuda, so this is best-effort added
+#    on top rather than required (a slow/offline mirror should not fail the
+#    whole NVIDIA driver install over a ~2.2 GiB extra download).
+log "Installing NVIDIA proprietary driver (nvidia-dkms + utils + headers)"
+# Headers for EVERY installed kernel (linux, linux-lts, linux-zen, ...), so DKMS
+# can build the nvidia module against each one — now and on future kernels.
+hdrs=()
+for kver in /usr/lib/modules/*/; do
+    [[ -f "${kver}/pkgbase" ]] || continue
+    pkgbase="$(cat "${kver}/pkgbase" 2>/dev/null || true)"
+    [[ -n "${pkgbase}" ]] && hdrs+=("${pkgbase}-headers")
+done
+# de-duplicate (guard the empty case so we never pass "" to pacman)
+if ((${#hdrs[@]})); then
+    mapfile -t hdrs < <(printf '%s\n' "${hdrs[@]}" | sort -u)
+fi
+# -Syu (FULL sync) not -Sy: the nvidia driver and the running kernel must match,
+# and a partial upgrade (-Sy + install) is the classic way to break Arch.
+pacman -Syu --needed --noconfirm nvidia-dkms nvidia-utils lib32-nvidia-utils dkms "${hdrs[@]}" \
+    || die "package install failed (need internet / a full mirror). Nothing changed permanently."
+
+# CUDA + ollama-cuda (best-effort, separate call): a slow mirror or offline
+# build should not fail the NVIDIA driver install itself over this ~2.2 GiB
+# extra download. Without it, ollama silently keeps running CPU-only.
+if pacman -Syu --needed --noconfirm cuda ollama-cuda; then
+    log "CUDA + ollama-cuda installed — ollama will use the GPU"
+else
+    warn "cuda/ollama-cuda install failed (offline/slow mirror?); ollama stays CPU-only for now"
+    warn "retry later with: sudo pacman -S cuda ollama-cuda"
+fi
+
+# 3) Early-KMS + power management (same tuning the Maze installer applies).
+log "Configuring early KMS and NVIDIA power management"
+cat > /etc/modprobe.d/nvidia.conf <<'EOF'
+# Maze Linux NVIDIA tuning.
+options nvidia_drm modeset=1 fbdev=1
+options nvidia NVreg_EnableGpuFirmware=1
+options nvidia NVreg_PreserveVideoMemoryAllocations=1   # suspend-to-RAM (Maze does not hibernate)
+options nvidia NVreg_UsePageAttributeTable=1
+blacklist nouveau
+options nouveau modeset=0
+EOF
+# The nvidia modules are deliberately NOT put into mkinitcpio MODULES. This
+# script used to add them (as `nvidia? …`, optional so a missing DKMS build could
+# not break `kernel-install`), and the installer's deploy-to-target.sh then
+# stripped them again at the next deploy — the two disagreed, and the price of
+# "early KMS on the dGPU" was the whole /usr/lib/firmware/nvidia GSP tree in the
+# UKI (~214 MB, 240 MB signed image, ~6 s of loader time on every boot for shim
+# to read and hash it). Nothing needed to mount root lives on the GPU: nvidia
+# loads from the real root a moment after switch-root, and nvidia-drm.modeset=1
+# (set below) gives KMS from that point on. The installer already picks the
+# panel's driver (i915/amdgpu) for the initramfs; leave MODULES alone here and
+# just make sure no stale nvidia/nouveau entries from an older Maze survive.
+if [[ -f /etc/mkinitcpio.conf ]]; then
+    sed -i -E '/^[[:space:]]*MODULES=/ s/[[:space:]]*\b(nouveau|nvidia(_modeset|_uvm|_drm)?)\b\??//g' \
+        /etc/mkinitcpio.conf || warn "could not clean mkinitcpio MODULES"
+fi
+# nvidia-hibernate.service is intentionally left out: Maze cannot hibernate.
+# There is no swap partition (the installer does not offer one), so no `resume`
+# hook and no `resume=` on the cmdline, and the everyday swap is zram — which
+# lives in RAM and can never hold a hibernation image. Suspend-to-RAM works and
+# is what these two units cover.
+systemctl enable nvidia-suspend.service nvidia-resume.service >/dev/null 2>&1 || \
+    warn "could not enable nvidia suspend/resume services"
+
+# 4) Kernel param nvidia-drm.modeset=1 on /etc/kernel/cmdline — the UKI is the
+#    only thing Maze boots (layout=uki), and kernel-install reads this file to
+#    embed the cmdline in it, so this is the sole place the param needs to go.
+NV_PARAMS="nvidia-drm.modeset=1 nvidia-drm.fbdev=1"
+mkdir -p /etc/kernel
+if [[ -f /etc/kernel/cmdline ]]; then
+    # /etc/kernel/cmdline must stay a SINGLE line — append in place, never with
+    # >> (which would create a malformed second line after the trailing newline).
+    if ! grep -qw 'nvidia-drm.modeset=1' /etc/kernel/cmdline; then
+        printf '%s %s\n' "$(tr -d '\n' < /etc/kernel/cmdline)" "${NV_PARAMS}" > /etc/kernel/cmdline
+    fi
+else
+    printf '%s\n' "${NV_PARAMS}" > /etc/kernel/cmdline
+fi
+
+# 5) Rebuild the initramfs content AND the actual booted UKI (mkinitcpio -P
+#    alone only touches the unused plain /boot/initramfs-*.img — see
+#    rebuild_ukis() above), then re-sign for Secure Boot.
+log "Rebuilding initramfs and UKI"
+mkinitcpio -P || warn "mkinitcpio rebuild failed"
+rebuild_ukis
+
+# What the signature check below actually established. Three states, because
+# "could not look" must never be reported as "signed" — the final message at
+# the end of this script reads this rather than assuming.
+NV_SIGNED_STATE="unknown"
+
+# command -v, not a hardcoded path — see the comment on the same check in
+# revert_to_open() above: /usr/local/bin/maze-sb-sign does not exist on a
+# fresh install.
+if mok_present && command -v maze-sb-sign >/dev/null 2>&1; then
+    log "Re-signing boot artifacts for Secure Boot"
+    maze-sb-sign --force-bootloader || warn "maze-sb-sign reported problems"
+    # Confirm the freshly built nvidia modules carry a signature.
+    #
+    # Asked per INSTALLED kernel with -k, never for the RUNNING one. Step 2 of
+    # this script is a deliberate full `pacman -Syu`, so it routinely upgrades
+    # the kernel — and that upgrade deletes /usr/lib/modules/<running kver>.
+    # A bare `modinfo -F signer nvidia` resolves against the running kernel, so
+    # from that point it searches a module tree that no longer exists, finds
+    # nothing, and reports "does not appear signed" — every single time the
+    # driver install brought a new kernel with it, which is the common case.
+    # DKMS built the modules for the kernels that are still on disk, so those
+    # are the ones worth asking about.
+    if command -v modinfo >/dev/null 2>&1; then
+        _nv_ok=1
+        _nv_seen=0
+        for _d in /usr/lib/modules/*/; do
+            [[ -f "${_d}pkgbase" ]] || continue
+            _k="${_d%/}"; _k="${_k##*/}"
+            # Skip kernels DKMS has not built the module for; the "no module
+            # anywhere" case is reported separately below.
+            modinfo -k "${_k}" nvidia >/dev/null 2>&1 || continue
+            _nv_seen=1
+            if modinfo -k "${_k}" -F signer nvidia 2>/dev/null | grep -qi 'Maze'; then
+                log "nvidia module signed with the Maze MOK key for ${_k} ✔"
+            else
+                _nv_ok=0
+                warn "nvidia module for ${_k} does not appear signed — under Secure Boot it may not load."
+                warn "Check: modinfo -k ${_k} -F signer nvidia"
+            fi
+        done
+        if [[ "${_nv_seen}" -eq 0 ]]; then
+            warn "no built nvidia module found for any installed kernel — did DKMS run?"
+            warn "Check: dkms status"
+        elif [[ "${_nv_ok}" -eq 1 ]]; then
+            NV_SIGNED_STATE="signed"
+        else
+            NV_SIGNED_STATE="unsigned"
+        fi
+    fi
+fi
+
+echo
+log "Verifying the boot chain before declaring success"
+if verify_boot_chain; then
+    log "NVIDIA proprietary driver installed. REBOOT to load it."
+    # Report what the check above actually found. This used to assert
+    # "modules are signed" unconditionally — so a run that had just warned
+    # "does not appear signed" four lines earlier ended by claiming the
+    # opposite. Saying something unverified is the one habit the rest of this
+    # stack is written to avoid (see maze-boot-check's recovery-entry check).
+    if mok_present; then
+        case "${NV_SIGNED_STATE}" in
+            signed)
+                log "Secure Boot: modules are signed with your MOK; nothing else to enroll." ;;
+            unsigned)
+                warn "Secure Boot: at least one nvidia module is NOT signed (see above)."
+                warn "  With Secure Boot on, that kernel will boot without the driver."
+                warn "  Rebuild and re-sign with: sudo dkms autoinstall && sudo maze-sb-sign --force-bootloader" ;;
+            *)
+                log "Secure Boot: DKMS is configured to sign with your MOK; the signature could not be read here." ;;
+        esac
+    fi
+    exit 0
+fi
+
+# Reaching here means the ESP does not boot the kernel that is installed.
+# The packages are on disk and harmless; the boot image is not. Say so instead
+# of ending on "REBOOT to load it", which is how this used to brick machines.
+_kv="${MAZE_VERIFIED_KVER:-<kver>}"
+echo >&2
+die "boot chain verification FAILED — DO NOT REBOOT.
+
+The NVIDIA packages installed fine, but the boot image on the ESP does not match
+the installed kernel (${_kv}). Rebooting now would start a kernel whose modules
+are not on disk: nothing would load, vfat included, so /boot could not even be
+mounted to repair it.
+
+Repair from THIS still-running session:
+    sudo kernel-install add ${_kv} /usr/lib/modules/${_kv}/vmlinuz
+    sudo maze-sb-sign --force-bootloader
+    sudo maze-gpu-driver --nvidia          # re-run; it will re-verify
+
+If that does not clear it, undo the driver and reboot on the open-source stack:
+    sudo maze-gpu-driver --open"

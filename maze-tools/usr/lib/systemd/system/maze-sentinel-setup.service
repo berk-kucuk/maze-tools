@@ -1,0 +1,13 @@
+[Unit]
+Description=Maze Linux: arm Maze Sentinel audit watches and baselines
+After=auditd.service local-fs.target
+Wants=auditd.service
+ConditionPathExists=!/var/lib/maze/sentinel/setup.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/maze-sentinel-setup
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1073 @@
+#!/usr/bin/env bash
+#
+# maze-audit — verify an INSTALLED Maze Linux system against what the source
+# tree says the installer should have produced. Shipped in maze-tools (as of
+# 1.1.0-37) so every installed machine carries it; in the source tree it is
+# reachable as MazeLinux/tools/audit-installed-system.sh (a symlink here).
+#
+# maze-doctor answers "is this machine healthy?". This script answers a
+# different question, from the developer's side: "did the ISO built from the
+# source tree, installed through deploy-to-target.sh, leave the machine in
+# exactly the state the source intends?" Every expectation below is taken from
+# a concrete place in the tree:
+#
+#   packages.x86_64                              what must be installed
+#   maze-meta/PKGBUILD                           the default Maze package set
+#   deploy-to-target.sh                          live-only files that must be GONE,
+#                                                cmdline params, services, pacman.conf,
+#                                                root lock, user groups, plymouth ...
+#   airootfs/usr/local/share/maze/enable-services.sh   build-time enabled services
+#   */usr/lib/systemd/system-preset/*.preset     package presets
+#   maze-secureboot                              the boot chain layout on the ESP
+#   maze-installer/etc/calamares/modules/*.conf  subvolume layout, fstab/crypttab
+#
+# It is READ-ONLY. It never repairs anything.
+#
+# Usage:
+#   sudo maze-audit [--src DIR] [--deep] [--lynis] [--no-color] [--skip-doctor] [--out FILE]
+#
+#   --src DIR       Maze-Linux-Source checkout. Enables the source-drift and
+#                   version comparisons (section 7/8). Auto-detected when run
+#                   from the source tree (MazeLinux/tools/…); otherwise off.
+#   --deep          extra root-only checks that take longer or need a decision:
+#                   what is inside the sealed initrd (no LUKS keyfile / private
+#                   keys), LUKS keyslots, every MOK enrolled in firmware, every
+#                   tmpfiles.d/sysusers.d declaration of the Maze apps against
+#                   the filesystem, usbguard policy safety, firejail/AppArmor
+#                   coverage of Maze apps, stray files on the ESP, the previous
+#                   boot's shutdown, and maze-doctor --deep (whole-system -Qkk).
+#   --lynis         also run `lynis audit system` (several minutes, needs lynis)
+#   --skip-doctor   do not run maze-doctor / maze-boot-check at the end
+#   --out FILE      also write the plain-text report there
+#                   (default: /var/tmp/maze-audit-<timestamp>.txt)
+#
+# Exit code: 0 = no FAIL, 1 = at least one FAIL, 2 = cannot run.
+
+set -u
+
+# ---------------------------------------------------------------- options ---
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Source tree: only when this really is a checkout (…/Maze-Linux-Source/maze-tools/maze-tools/usr/local/bin
+# via the symlink, or …/MazeLinux/tools). Installed at /usr/local/bin there is no tree — leave SRC empty.
+SRC=""
+for _cand in "${SCRIPT_DIR}/../../../../.." "${SCRIPT_DIR}/../.."; do
+    if [[ -f "${_cand}/MazeLinux/packages.x86_64" && -d "${_cand}/maze-tools" ]]; then SRC="$(cd "${_cand}" && pwd)"; break; fi
+done
+COLOR=1
+RUN_DOCTOR=1
+DEEP=0
+LYNIS=0
+OUT="/var/tmp/maze-audit-$(date +%Y%m%d-%H%M%S).txt"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --src) SRC="$2"; shift 2 ;;
+        --no-color) COLOR=0; shift ;;
+        --skip-doctor) RUN_DOCTOR=0; shift ;;
+        --deep) DEEP=1; shift ;;
+        --lynis) LYNIS=1; shift ;;
+        --out) OUT="$2"; shift 2 ;;
+        -h|--help) sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+[[ -t 1 ]] || COLOR=0
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "maze-audit: run as root (sudo) — the ESP, /etc/shadow and the MOK key dir are root-only." >&2
+    exit 2
+fi
+
+# ---------------------------------------------------------------- output ----
+if [[ "${COLOR}" -eq 1 ]]; then
+    C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[34m'; C_C=$'\e[36m'; C_0=$'\e[0m'; C_BOLD=$'\e[1m'
+else
+    C_R=""; C_G=""; C_Y=""; C_B=""; C_C=""; C_0=""; C_BOLD=""
+fi
+
+N_PASS=0; N_WARN=0; N_FAIL=0; N_INFO=0
+FAILS=""; WARNS=""
+CUR_SECTION=""
+
+exec > >(tee -a "${OUT}") 2>&1
+
+section() {
+    CUR_SECTION="$1"
+    printf '\n%s%s== %s ==%s\n' "${C_BOLD}" "${C_B}" "$1" "${C_0}"
+}
+pass() { N_PASS=$((N_PASS+1)); printf '  %s[ OK ]%s %s\n' "${C_G}" "${C_0}" "$1"; }
+info() { N_INFO=$((N_INFO+1)); printf '  %s[info]%s %s\n' "${C_C}" "${C_0}" "$1"; }
+warn() {
+    N_WARN=$((N_WARN+1)); printf '  %s[WARN]%s %s\n' "${C_Y}" "${C_0}" "$1"
+    [[ -n "${2:-}" ]] && printf '         %s\n' "$2"
+    WARNS="${WARNS}  - [${CUR_SECTION}] $1"$'\n'
+}
+fail() {
+    N_FAIL=$((N_FAIL+1)); printf '  %s[FAIL]%s %s\n' "${C_R}" "${C_0}" "$1"
+    [[ -n "${2:-}" ]] && printf '         %s\n' "$2"
+    FAILS="${FAILS}  - [${CUR_SECTION}] $1"$'\n'
+}
+detail() { printf '         %s\n' "$1"; }
+# Print a command's output indented (bounded).
+show() { local n="${2:-20}"; eval "$1" 2>&1 | head -n "$n" | sed 's/^/         | /'; }
+
+has() { command -v "$1" >/dev/null 2>&1; }
+pkg_installed() { pacman -Qq "$1" >/dev/null 2>&1; }
+# Absent (rm'd by deploy) files: FAIL if present.
+must_be_absent() {
+    local f="$1" why="${2:-live-only file}"
+    if [[ -e "$f" ]]; then fail "still present: $f" "$why"; else pass "gone: $f"; fi
+}
+must_exist() {
+    local f="$1" why="${2:-}"
+    if [[ -e "$f" ]]; then pass "present: $f"; else fail "missing: $f" "$why"; fi
+}
+
+printf '%sMaze Linux — installed-system audit%s\n' "${C_BOLD}" "${C_0}"
+printf 'date: %s   host: %s   report: %s\n' "$(date -Is)" "$(cat /etc/hostname 2>/dev/null || uname -n)" "${OUT}"
+printf 'source tree: %s\n' "${SRC:-<none>}"
+
+# =========================================================== 1. identity =====
+section "1. Identity"
+. /etc/os-release 2>/dev/null || true
+[[ "${ID:-}" == "mazelinux" && "${NAME:-}" == "Maze Linux" ]] \
+    && pass "os-release: ${PRETTY_NAME:-?} (ID=${ID:-?})" \
+    || fail "os-release is not Maze (ID=${ID:-?}, NAME=${NAME:-?})" "deploy copies /usr/local/share/maze/os-release -> /usr/lib/os-release"
+if [[ -L /etc/os-release ]]; then pass "/etc/os-release is a symlink -> $(readlink /etc/os-release)"; else warn "/etc/os-release is not a symlink"; fi
+if [[ -n "${SRC}" && -f "${SRC}/MazeLinux/airootfs/usr/local/share/maze/os-release" ]]; then
+    cmp -s /usr/lib/os-release "${SRC}/MazeLinux/airootfs/usr/local/share/maze/os-release" \
+        && pass "/usr/lib/os-release identical to source" \
+        || warn "/usr/lib/os-release differs from source airootfs copy"
+fi
+_hn="$(cat /etc/hostname 2>/dev/null || true)"
+case "${_hn}" in
+    ""|mazelinux|archiso) warn "hostname is '${_hn:-<empty>}' — the live-medium default, Calamares should have set the user's choice" ;;
+    *) pass "hostname: ${_hn}" ;;
+esac
+[[ -f /etc/machine-id && "$(wc -c < /etc/machine-id)" -eq 33 ]] && pass "machine-id: $(cat /etc/machine-id)" || fail "machine-id missing/invalid"
+info "kernel: $(uname -r)   arch: $(uname -m)"
+[[ -d /sys/firmware/efi ]] && pass "booted in UEFI mode" || fail "NOT booted via UEFI — Maze is UEFI-only"
+if [[ -f /etc/issue ]] && grep -qi 'archiso\|Arch Linux' /etc/issue; then warn "/etc/issue still carries the live-medium banner"; else pass "/etc/issue is not the archiso banner"; fi
+if [[ -f /etc/motd ]]; then
+    if grep -q 'paru -Syu' /etc/motd && ! grep -qi 'live and install medium' /etc/motd; then pass "/etc/motd is the installed-system update notice"; else fail "/etc/motd is not the deploy-written TARGETMOTD (live motd leaked?)"; fi
+else
+    warn "/etc/motd missing (deploy writes one)"
+fi
+_lc="$(cat /etc/locale.conf 2>/dev/null | tr '\n' ' ')"; info "locale.conf: ${_lc:-<none>}"
+grep -qE '^LC_(TIME|NUMERIC|MONETARY)=' /etc/locale.conf 2>/dev/null && info "LC_* overrides present in locale.conf (deploy aligns formats to LANG unless user chose otherwise)"
+
+# ==================================================== 2. kernel cmdline ======
+section "2. Kernel command line (sealed in the UKI)"
+CMDLINE="$(cat /proc/cmdline)"
+info "/proc/cmdline: ${CMDLINE}"
+# From deploy-to-target.sh EXTRA_PARAMS (NVIDIA params only when nvidia is installed).
+for p in quiet splash bgrt_disable logo.nologo "lsm=landlock,lockdown,yama,integrity,apparmor,bpf" apparmor=1 security=apparmor; do
+    if grep -qwF -- "$p" <<<"${CMDLINE}"; then pass "cmdline has ${p}"; else fail "cmdline lacks ${p}" "deploy appends it to /etc/kernel/cmdline before the UKI build"; fi
+done
+grep -qE '(^| )root=' <<<"${CMDLINE}" && pass "root= present" || fail "root= missing from cmdline"
+grep -qE 'rootflags=subvol=/?@( |$)' <<<"${CMDLINE}" && pass "rootflags=subvol=@ (Calamares btrfs layout)" || info "no rootflags=subvol=@ (rollback mode via btrfs default subvolume, or non-btrfs)"
+if grep -q 'cryptdevice=' <<<"${CMDLINE}"; then
+    grep -qE 'cryptdevice=[^ ]*:allow-discards' <<<"${CMDLINE}" && pass "cryptdevice carries allow-discards (TRIM through dm-crypt)" || warn "cryptdevice= without allow-discards — TRIM will not reach the SSD"
+    ROOT_IS_LUKS=1
+else
+    ROOT_IS_LUKS=0; info "no cryptdevice= — root is not LUKS"
+fi
+if pacman -Qq nvidia nvidia-dkms nvidia-open nvidia-open-dkms nvidia-lts 2>/dev/null | grep -q .; then
+    grep -q 'nvidia' <<<"${CMDLINE}" && pass "NVIDIA installed and nvidia params on cmdline" || warn "NVIDIA driver installed but no nvidia params on cmdline"
+fi
+if [[ -f /etc/kernel/cmdline ]]; then
+    _etc="$(tr -s ' \n' '  ' < /etc/kernel/cmdline | sed 's/ *$//')"
+    _proc="$(sed -E 's/ systemd\.machine_id=[0-9a-f]+//; s/ *$//' <<<"${CMDLINE}")"
+    if [[ "$(tr ' ' '\n' <<<"${_etc}" | sort)" == "$(tr ' ' '\n' <<<"${_proc}" | sort)" ]]; then
+        pass "/etc/kernel/cmdline matches the running cmdline (UKI is current)"
+    else
+        warn "/etc/kernel/cmdline differs from /proc/cmdline (next UKI build changes the boot params)"
+        detail "etc : ${_etc}"
+        detail "proc: ${_proc}"
+    fi
+else
+    fail "/etc/kernel/cmdline missing — kernel-install cannot build a correct UKI"
+fi
+grep -qE '^[[:space:]]*layout=uki' /etc/kernel/install.conf 2>/dev/null && pass "/etc/kernel/install.conf: layout=uki" || fail "/etc/kernel/install.conf lacks layout=uki" "kernel updates would stop producing UKIs"
+
+# ================================================ 3. mkinitcpio / plymouth ===
+section "3. Initramfs configuration and Plymouth"
+MKCONF=/etc/mkinitcpio.conf
+HOOKS="$(grep -E '^[[:space:]]*HOOKS=' "${MKCONF}" 2>/dev/null | tail -1)"
+info "${HOOKS:-HOOKS= <missing>}"
+for h in base udev autodetect microcode kms modconf keyboard block plymouth filesystems; do
+    grep -qE "\b${h}\b" <<<"${HOOKS}" && pass "hook ${h}" || warn "hook ${h} not in HOOKS"
+done
+grep -qE '\bfsck\b' <<<"${HOOKS}" || info "no fsck hook (fine on btrfs; Calamares omits it there)"
+if [[ "${ROOT_IS_LUKS}" -eq 1 ]]; then
+    grep -qE '\bencrypt\b' <<<"${HOOKS}" && pass "hook encrypt (LUKS root will prompt)" || fail "LUKS root but no 'encrypt' hook — the machine could not unlock its disk after the next rebuild"
+    # order: keyboard < encrypt < filesystems ; kms < plymouth < encrypt
+    _ord="$(sed -E 's/.*HOOKS=\(([^)]*)\).*/\1/' <<<"${HOOKS}")"
+    _i() { tr ' ' '\n' <<<"${_ord}" | grep -nxF "$1" | cut -d: -f1; }
+    if [[ -n "$(_i keyboard)" && -n "$(_i encrypt)" && "$(_i keyboard)" -lt "$(_i encrypt)" ]]; then pass "keyboard precedes encrypt"; else warn "keyboard does not precede encrypt (passphrase may be untypeable)"; fi
+    if [[ -n "$(_i plymouth)" && -n "$(_i encrypt)" && "$(_i plymouth)" -lt "$(_i encrypt)" ]]; then pass "plymouth precedes encrypt"; else warn "plymouth does not precede encrypt (no graphical passphrase box)"; fi
+fi
+_nc="$(grep -cE '^[[:space:]]*COMPRESSION=' "${MKCONF}" 2>/dev/null || echo 0)"
+if [[ "${_nc}" -eq 1 ]] && grep -qE '^[[:space:]]*COMPRESSION="?zstd"?' "${MKCONF}"; then pass "COMPRESSION=zstd (exactly one line)"; else warn "COMPRESSION lines: ${_nc} — expected exactly one, zstd"; show "grep -nE '^[[:space:]]*#?[[:space:]]*COMPRESSION' ${MKCONF}"; fi
+must_be_absent /etc/mkinitcpio.conf.d/archiso.conf "archiso drop-in overrides HOOKS with the live set and xz compression"
+must_be_absent /etc/mkinitcpio.d/archiso.preset
+for pre in /etc/mkinitcpio.d/*.preset; do
+    [[ -f "$pre" ]] || continue
+    if grep -q 'PRESETS=()' "$pre"; then pass "$(basename "$pre"): empty preset (UKI layout, as calamares-mount-api.sh writes)"; else warn "$(basename "$pre") is not the Maze empty preset — mkinitcpio -P would write loose images"; fi
+done
+if [[ -f /etc/plymouth/plymouthd.conf ]] && grep -qE '^Theme=maze' /etc/plymouth/plymouthd.conf; then pass "plymouthd.conf Theme=maze"; else fail "plymouthd.conf does not set Theme=maze"; fi
+grep -qE '^ShowDelay=0' /etc/plymouth/plymouthd.conf 2>/dev/null && pass "plymouth ShowDelay=0" || warn "plymouth ShowDelay not 0"
+[[ -d /usr/share/plymouth/themes/maze ]] && pass "plymouth theme dir present" || fail "/usr/share/plymouth/themes/maze missing"
+if has plymouth-set-default-theme; then
+    _t="$(plymouth-set-default-theme 2>/dev/null)"; [[ "${_t}" == "maze" ]] && pass "plymouth-set-default-theme -> maze" || warn "plymouth-set-default-theme reports '${_t}'"
+fi
+
+# ======================================================== 4. boot chain =====
+section "4. Boot chain on the ESP (shim -> grubx64.efi UKI -> kernel)"
+ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+if [[ -z "${ESP}" || ! -d "${ESP}/EFI" ]]; then
+    ESP=""; for c in /boot /efi /boot/efi; do [[ -d "$c/EFI" ]] && { ESP="$c"; break; }; done
+fi
+KEYDIR=/var/lib/maze-secureboot
+if [[ -z "${ESP}" ]]; then
+    fail "no ESP found (no EFI dir under /boot, /efi)"
+else
+    pass "ESP: ${ESP} ($(findmnt -no FSTYPE,OPTIONS "${ESP}" 2>/dev/null | tr '\n' ' '))"
+    _eo="$(findmnt -no OPTIONS "${ESP}" 2>/dev/null)"
+    if grep -q 'umask=0077' <<<"${_eo}" || { grep -q 'fmask=0077' <<<"${_eo}" && grep -q 'dmask=0077' <<<"${_eo}"; }; then pass "ESP mounted umask=0077 (fmask/dmask 0077)"; else warn "ESP not mounted with umask=0077 (mount.conf/fstab.conf expect it)"; fi
+    _shim="${ESP}/EFI/BOOT/BOOTX64.EFI"; _grub="${ESP}/EFI/BOOT/grubx64.efi"; _mm="${ESP}/EFI/BOOT/mmx64.efi"
+    must_exist "${_shim}" "shim must be the removable-path loader"
+    must_exist "${_mm}" "MokManager is needed for enrollment"
+    must_exist "${_grub}" "the signed UKI shim chainloads"
+    must_exist "${ESP}/MOK.cer" "certificate for MokManager enrollment"
+    if [[ -f /usr/share/shim-signed/shimx64.efi && -f "${_shim}" ]]; then
+        cmp -s /usr/share/shim-signed/shimx64.efi "${_shim}" && pass "BOOTX64.EFI is byte-identical to the packaged shim ($(pacman -Q shim-signed 2>/dev/null))" || warn "BOOTX64.EFI differs from /usr/share/shim-signed/shimx64.efi (older shim, or bootctl overwrote it?)"
+    fi
+    if [[ -f "${_grub}" ]] && has sbverify && has objcopy; then
+        if [[ -f "${KEYDIR}/MOK.crt" ]]; then
+            sbverify --cert "${KEYDIR}/MOK.crt" "${_grub}" >/dev/null 2>&1 && pass "grubx64.efi verifies against the machine MOK" || fail "grubx64.efi does NOT verify against ${KEYDIR}/MOK.crt" "sudo maze-sb-sign ${ESP} --force-bootloader"
+        else
+            fail "${KEYDIR}/MOK.crt missing — no per-machine key was generated"
+        fi
+        _gk="$(objcopy -O binary --only-section=.uname "${_grub}" /dev/stdout 2>/dev/null | tr -d '\0[:space:]')"
+        _gc="$(objcopy -O binary --only-section=.cmdline "${_grub}" /dev/stdout 2>/dev/null | tr -d '\0' | sed 's/ *$//')"
+        info "grubx64.efi .uname = ${_gk:-?}"
+        [[ "${_gk}" == "$(uname -r)" ]] && pass "running kernel == grubx64.efi kernel" || warn "running $(uname -r) but grubx64.efi carries ${_gk:-?} (reboot pending, or a different image was booted)"
+        [[ -d "/usr/lib/modules/${_gk}" ]] && pass "grubx64.efi kernel has modules on disk" || fail "grubx64.efi kernel ${_gk} has NO modules on disk — would not boot"
+        _pin=""; [[ -r /etc/maze/kernel-default ]] && _pin="$(tr -d '[:space:]' < /etc/maze/kernel-default)"
+        [[ -n "${_pin}" ]] && info "kernel pinned via /etc/maze/kernel-default: ${_pin}"
+        # Peek inside the sealed initrd for the hooks that matter.
+        _tmp="$(mktemp -d)"
+        if objcopy -O binary --only-section=.initrd "${_grub}" "${_tmp}/initrd.img" 2>/dev/null && [[ -s "${_tmp}/initrd.img" ]] && has lsinitcpio; then
+            _lst="$(lsinitcpio "${_tmp}/initrd.img" 2>/dev/null)"
+            if [[ "${ROOT_IS_LUKS}" -eq 1 ]]; then grep -q 'hooks/encrypt' <<<"${_lst}" && pass "UKI initrd contains hooks/encrypt" || fail "UKI initrd LACKS hooks/encrypt — this image cannot unlock the LUKS root"; fi
+            grep -q 'hooks/plymouth' <<<"${_lst}" && pass "UKI initrd contains hooks/plymouth" || warn "UKI initrd lacks plymouth hook"
+            grep -q 'usr/share/plymouth/themes/maze' <<<"${_lst}" && pass "UKI initrd embeds the maze plymouth theme" || warn "maze plymouth theme not inside the initrd"
+            _ic="$(lsinitcpio -a "${_tmp}/initrd.img" 2>/dev/null | grep -iE 'Compressed with|compress' | head -1)"; [[ -n "${_ic}" ]] && info "initrd: ${_ic}"
+            info "UKI cmdline: ${_gc:-?}"
+        else
+            warn "could not extract/inspect the .initrd section of grubx64.efi"
+        fi
+        rm -rf "${_tmp}"
+    fi
+    # One UKI per installed kernel, each signed.
+    MID="$(cat /etc/machine-id 2>/dev/null)"
+    for d in /usr/lib/modules/*/; do
+        [[ -f "${d}vmlinuz" ]] || continue
+        kv="$(basename "$d")"; pb="$(cat "${d}pkgbase" 2>/dev/null || echo '?')"
+        uki="${ESP}/EFI/Linux/${MID}-${kv}.efi"
+        if [[ -f "${uki}" ]]; then
+            if has sbverify && [[ -f "${KEYDIR}/MOK.crt" ]]; then
+                sbverify --cert "${KEYDIR}/MOK.crt" "${uki}" >/dev/null 2>&1 && pass "UKI for ${kv} (${pb}) present and MOK-signed" || warn "UKI for ${kv} (${pb}) present but unsigned/other key"
+            else pass "UKI for ${kv} (${pb}) present"; fi
+        else
+            fail "no UKI on the ESP for installed kernel ${kv} (${pb})" "sudo kernel-install add ${kv} /usr/lib/modules/${kv}/vmlinuz"
+        fi
+        [[ -d "/usr/lib/modules/${kv}/build" ]] && pass "headers present for ${kv}" || warn "no headers for ${kv} (DKMS modules cannot build against it)"
+    done
+    # Stale UKIs (kernel gone)
+    for u in "${ESP}"/EFI/Linux/*.efi; do
+        [[ -f "$u" ]] || continue
+        kv="$(objcopy -O binary --only-section=.uname "$u" /dev/stdout 2>/dev/null | tr -d '\0[:space:]')"
+        [[ -n "${kv}" && ! -d "/usr/lib/modules/${kv}" ]] && warn "stale UKI $(basename "$u") for uninstalled kernel ${kv} (maze-sb-sign normally prunes these)"
+    done
+    # Recovery kernel
+    if [[ -f "${ESP}/EFI/maze-recovery/grubx64.efi" ]]; then
+        _rk="$(objcopy -O binary --only-section=.uname "${ESP}/EFI/maze-recovery/grubx64.efi" /dev/stdout 2>/dev/null | tr -d '\0[:space:]')"
+        pass "recovery image present (kernel ${_rk:-?})"
+        [[ -f "${ESP}/EFI/maze-recovery/BOOTX64.EFI" ]] && pass "recovery shim present" || warn "recovery dir has no BOOTX64.EFI shim"
+        [[ -d "/usr/lib/modules/${_rk}" ]] && pass "recovery kernel is installed" || fail "recovery image points at uninstalled kernel ${_rk}"
+        [[ -f "${KEYDIR}/MOK.crt" ]] && { sbverify --cert "${KEYDIR}/MOK.crt" "${ESP}/EFI/maze-recovery/grubx64.efi" >/dev/null 2>&1 && pass "recovery image MOK-signed" || fail "recovery image not signed with the machine MOK"; }
+        [[ "${_rk}" != "${_gk:-}" ]] && pass "recovery kernel differs from the primary image" || warn "recovery image is the SAME kernel as the primary — no real fallback"
+    else
+        warn "no recovery image under ${ESP}/EFI/maze-recovery (maze-secureboot >=1.2.0-8 creates it when linux-lts is installed)"
+    fi
+    [[ -f "${_grub}.maze-prev" ]] && info "rollback copy grubx64.efi.maze-prev present (kver: $(cat "${_grub}.maze-prev.kver" 2>/dev/null || echo '?'))"
+    # systemd-boot leftovers from Calamares' bootctl install
+    [[ -f "${ESP}/EFI/systemd/systemd-bootx64.efi" ]] && info "systemd-boot binary present at EFI/systemd (Calamares bootctl install) — unused by the shim chain"
+    [[ -d "${ESP}/loader/entries" ]] && { n=$(ls "${ESP}/loader/entries" 2>/dev/null | wc -l); [[ "$n" -gt 0 ]] && warn "${n} BLS entries under loader/entries — layout=uki should produce none" || pass "no BLS entries (layout=uki)"; }
+    _lc="${ESP}/loader/loader.conf"
+    if [[ -f "${_lc}" ]]; then
+        grep -qE '^[[:space:]]*timeout[[:space:]]+0' "${_lc}" && pass "loader.conf timeout 0" || warn "loader.conf timeout is not 0"
+        grep -qE '^[[:space:]]*console-mode[[:space:]]+keep' "${_lc}" && pass "loader.conf console-mode keep" || warn "loader.conf console-mode is not 'keep'"
+    fi
+    _free="$(df -h --output=avail "${ESP}" 2>/dev/null | tail -1 | tr -d ' ')"; _used="$(df -h --output=pcent "${ESP}" 2>/dev/null | tail -1 | tr -d ' ')"
+    info "ESP free: ${_free} (used ${_used})"
+    [[ "$(df --output=avail -m "${ESP}" 2>/dev/null | tail -1 | tr -d ' ')" -lt 200 ]] && warn "ESP has <200 MB free — the next kernel update needs room for a ~100 MB UKI"
+fi
+# MOK key material
+if [[ -d "${KEYDIR}" ]]; then
+    [[ "$(stat -c %a "${KEYDIR}")" == "700" ]] && pass "${KEYDIR} mode 700" || warn "${KEYDIR} mode is $(stat -c %a "${KEYDIR}"), expected 700"
+    for f in MOK.key MOK.crt MOK.cer shimx64.efi mmx64.efi ENROLLMENT.txt; do
+        [[ -f "${KEYDIR}/$f" ]] && pass "${KEYDIR}/$f" || fail "${KEYDIR}/$f missing"
+    done
+    [[ -f "${KEYDIR}/MOK.key" ]] && { [[ "$(stat -c %a "${KEYDIR}/MOK.key")" == "600" ]] && pass "MOK.key mode 600" || warn "MOK.key mode $(stat -c %a "${KEYDIR}/MOK.key")"; }
+    [[ -f "${KEYDIR}/SIGNING-STATUS.txt" ]] && fail "SIGNING-STATUS.txt present — install-time signing verification FAILED" "$(head -3 "${KEYDIR}/SIGNING-STATUS.txt" | tr '\n' ' ')"
+    [[ -f "${KEYDIR}/BOOT-STATUS.txt" ]] && fail "BOOT-STATUS.txt present — install-time boot image did not match the installed kernel"
+    [[ -f "${KEYDIR}/MOK.crt" ]] && info "MOK cert: $(openssl x509 -in "${KEYDIR}/MOK.crt" -noout -subject -enddate 2>/dev/null | tr '\n' ' ')"
+else
+    fail "${KEYDIR} missing — Secure Boot was never set up"
+fi
+if has mokutil; then
+    _sb="$(mokutil --sb-state 2>&1 | head -1)"; info "mokutil: ${_sb}"
+    if [[ -f "${KEYDIR}/MOK.cer" ]]; then
+        if mokutil --test-key "${KEYDIR}/MOK.cer" 2>/dev/null | grep -q 'already enrolled'; then pass "machine MOK is enrolled in firmware"; else warn "machine MOK not enrolled (MokManager enrollment pending) — with Secure Boot ON the machine will not boot"; fi
+    fi
+    mokutil --list-new 2>/dev/null | grep -q . && info "a MOK enrollment request is pending for the next boot"
+fi
+if has efibootmgr; then
+    _eb="$(efibootmgr -v 2>/dev/null)"
+    show "printf '%s\n' \"${_eb//\'/}\" | grep -E '^(BootCurrent|BootOrder|Boot[0-9A-F]{4})'" 25
+    _nm="$(grep -cE '^Boot[0-9A-F]{4}\*? +Maze Linux[[:space:]]+HD\(' <<<"${_eb}")"
+    [[ "${_nm}" -ge 1 ]] && pass "firmware entry 'Maze Linux' present (${_nm})" || warn "no 'Maze Linux' NVRAM entry (removable-path fallback only)"
+    [[ "${_nm}" -gt 1 ]] && warn "${_nm} 'Maze Linux' entries — duplicates from reinstalls; see maze-boot-entries"
+    grep -qE 'Maze Linux \(recovery kernel\)' <<<"${_eb}" && pass "firmware entry for the recovery kernel present" || info "no recovery-kernel firmware entry"
+    grep -qi 'systemd-bootx64.efi' <<<"${_eb}" && fail "an NVRAM entry points directly at systemd-bootx64.efi (unsigned path; deploy step 4b should have deleted it)" || pass "no direct unsigned systemd-boot entry"
+    grep -qi 'systemd-boot-fallbackx64.efi' <<<"${_eb}" && warn "'Fallback Linux Boot Manager' entry points at the UNSIGNED \\EFI\\systemd\\systemd-boot-fallbackx64.efi" "bootctl (newer systemd) creates it; deploy step 4b only greps 'systemd-bootx64.efi' so it survives. Harmless while the Maze entry is first in BootOrder; with Secure Boot ON it can never boot. Consider extending the 4b pattern to 'systemd-boot.*x64\\.efi'."
+    _bc="$(sed -n 's/^BootCurrent: //p' <<<"${_eb}")"; _bcl="$(grep -E "^Boot${_bc}" <<<"${_eb}" | head -1)"; info "booted via: ${_bcl:-?}"
+fi
+[[ -e /var/lib/maze/boot-unsafe ]] && fail "/var/lib/maze/boot-unsafe flag is raised (maze-boot-guard is blocking shutdown)" "$(head -3 /var/lib/maze/boot-unsafe | tr '\n' ' ')" || pass "no boot-unsafe flag"
+# Shadowing copies in /etc that would silently freeze the packaged secureboot code
+_sh=""
+for f in /etc/pacman.d/hooks/85-maze-kernel-install.hook /etc/pacman.d/hooks/zz-maze-secureboot.hook /etc/pacman.d/hooks/zzz-maze-boot-verify.hook /etc/pacman.d/hooks/95-maze-secureboot.hook \
+         /etc/kernel/install.d/95-maze-sb-sign.install /usr/local/bin/maze-sb-sign /usr/local/bin/maze-kernel-install-add \
+         /etc/systemd/system/maze-sb-resign.service /etc/systemd/system/maze-sb-resign.path /etc/systemd/system/maze-boot-guard.service /etc/systemd/system/maze-boot-guard.path \
+         /etc/systemd/system/maze-boot-check.service /etc/systemd/system/maze-boot-check.timer /etc/systemd/system/systemd-boot-update.service.d/99-maze-resign.conf \
+         /etc/systemd/system/emergency.service.d/10-maze-sulogin.conf /etc/systemd/system/rescue.service.d/10-maze-sulogin.conf; do
+    [[ -e "$f" && ! -L "$f" ]] && _sh="${_sh} $f"
+done
+[[ -n "${_sh}" ]] && fail "unowned copies shadow packaged maze-secureboot files:${_sh}" || pass "no /etc or /usr/local copies shadowing maze-secureboot"
+systemctl is-enabled systemd-boot-update.service 2>/dev/null | grep -q masked && warn "systemd-boot-update.service is masked (old Maze behaviour; the 99-maze-resign drop-in replaces the mask)"
+
+# ===================================================== 5. live residue ======
+section "5. Live-medium residue (must be gone on an installed system)"
+must_be_absent /etc/sudoers.d/10-maze "passwordless wheel sudo from the live ISO"
+must_be_absent /etc/sudoers.d/99-maze-build "temporary NOPASSWD for the AUR build user"
+must_be_absent /etc/polkit-1/rules.d/49-maze-calamares.rules "passwordless pkexec rule"
+must_be_absent /etc/systemd/system/getty@tty1.service.d/autologin.conf "console autologin"
+must_be_absent /etc/sddm.conf.d/10-maze-autologin.conf "SDDM autologin of the live user"
+must_be_absent /etc/firefox/policies/policies.json "live-only Firefox policy"
+must_be_absent /usr/local/bin/maze-calamares
+must_be_absent /usr/share/applications/maze-calamares.desktop
+must_be_absent /usr/local/share/maze/setup-live-user.sh
+must_be_absent /etc/ssh/sshd_config.d/10-archiso.conf "allows root password SSH login"
+must_be_absent /etc/systemd/logind.conf.d/do-not-suspend.conf "blocks laptop suspend/lid"
+must_be_absent /etc/systemd/journald.conf.d/volatile-storage.conf "would wipe the journal every boot"
+must_be_absent /etc/systemd/resolved.conf.d/archiso.conf "enables mDNS"
+must_be_absent /etc/systemd/resolved.conf.d/maze-dns.conf
+must_be_absent /etc/systemd/system/etc-pacman.d-gnupg.mount "tmpfs would shadow the pacman keyring"
+must_be_absent /etc/systemd/system/pacman-init.service
+must_be_absent /var/lib/maze/boot-unsafe
+for h in 0350-uncomment-mirrors 0400-maze-locale 0500-maze-os-release 0600-maze-live-user 0700-maze-wallpaper 0800-maze-services zzzz99-remove-custom-hooks-from-airootfs; do
+    [[ -e "/etc/pacman.d/hooks/${h}.hook" ]] && fail "build-time hook leaked: /etc/pacman.d/hooks/${h}.hook" "zzzz99 hook should have deleted it during the ISO build"
+done
+[[ -e /etc/pacman.d/hooks/0600-maze-live-user.hook ]] || pass "no build-time pacman hooks leaked"
+if id maze >/dev/null 2>&1; then fail "live user 'maze' still exists (removeuser module did not run)"; else pass "live user 'maze' removed"; fi
+[[ -d /home/maze ]] && fail "/home/maze left behind" || pass "/home/maze purged"
+if getent group maze >/dev/null; then pass "group 'maze' exists (GID $(getent group maze | cut -d: -f3)) — maze-guard socket group"; else fail "group 'maze' missing — maze-guard helper socket unusable without root"; fi
+if pkg_installed maze-installer; then fail "maze-installer package still installed" "sudo pacman -Rns maze-installer"; else pass "maze-installer package removed"; fi
+if pkg_installed calamares; then
+    _rs="$(pacman -Qi calamares 2>/dev/null | sed -n 's/^Install Reason *: //p')"
+    warn "calamares ($(pacman -Q calamares | cut -d' ' -f2)) is still installed on the installed system [${_rs}]" "deploy relies on 'pacman -Rns maze-installer' to drop it, but packages.x86_64 installs calamares EXPLICITLY, so -Rns never removes it. Fix: sudo pacman -Rns calamares"
+else pass "calamares not installed"; fi
+if pkg_installed xorg-xhost; then info "xorg-xhost still installed (only needed by the live installer launcher)"; fi
+for f in /etc/systemd/system/choose-mirror.service /etc/systemd/system/livecd-talk.service /etc/systemd/system/livecd-alsa-unmuter.service \
+         /usr/local/bin/choose-mirror /usr/local/bin/Installation_guide /usr/local/bin/livecd-sound /root/.automated_script.sh /root/.zlogin \
+         /etc/systemd/network/20-ethernet.network /etc/systemd/network/20-wlan.network /etc/systemd/network/20-wwan.network \
+         /etc/systemd/system/systemd-networkd-wait-online.service.d/wait-for-only-one-interface.conf /usr/local/share/livecd-sound; do
+    [[ -e "$f" ]] && info "archiso/live leftover (harmless; maze-installer >= 2.0.0-22 removes it at install): $f"
+done
+[[ -e /usr/share/grub/themes/maze ]] && info "leftover /usr/share/grub/themes/maze (removed from airootfs after 11 Sep 2026 — old ISO)"
+# NOPASSWD anywhere?
+_np="$(grep -rlsE '^[[:space:]]*[^#[:space:]].*NOPASSWD' /etc/sudoers /etc/sudoers.d 2>/dev/null)"
+[[ -n "${_np}" ]] && fail "active NOPASSWD sudo rule(s): $(tr '\n' ' ' <<<"${_np}")" || pass "no passwordless sudo"
+if [[ -f /etc/sudoers.d/10-maze-wheel ]] && grep -qE '^%wheel ALL=\(ALL:ALL\) ALL' /etc/sudoers.d/10-maze-wheel; then pass "/etc/sudoers.d/10-maze-wheel: wheel with password"; else warn "/etc/sudoers.d/10-maze-wheel missing or unexpected"; fi
+for f in /etc/sudoers.d/*; do [[ -f "$f" ]] && { m="$(stat -c %a "$f")"; [[ "$m" == "440" || "$m" == "400" ]] || warn "$f mode ${m} (sudo wants 0440)"; }; done
+visudo -c >/dev/null 2>&1 && pass "visudo -c: sudoers parse OK" || fail "visudo -c reports a syntax error"
+[[ -e /etc/skel/.config/autostart/maze-welcome.desktop ]] && pass "skel has the first-login Maze Welcome autostart (installed-system only)" || warn "skel lacks maze-welcome.desktop autostart"
+[[ -e /etc/skel/.config/autostart/maze-primary-screen.desktop ]] && pass "skel has maze-primary-screen autostart" || warn "skel lacks maze-primary-screen.desktop autostart"
+if grep -qs 'maze-calamares' /etc/skel/.config/plasma-org.kde.plasma.desktop-appletsrc; then
+    _pcu="$(grep -E 'upgraded maze-plasma-config' /var/log/pacman.log 2>/dev/null | tail -1)"
+    fail "installer launcher pinned in /etc/skel panel config (users created from now on get an 'Install Maze Linux' icon)" "maze-plasma-config OWNS that skel file and ships it with the pin; deploy's sed edit is lost on every package upgrade${_pcu:+ — last: ${_pcu}}. Fix in source: drop the pin from the package's skel and let setup-live-user.sh add it to the live user's panel only."
+else pass "installer launcher stripped from skel panel"; fi
+
+# ============================================================ 6. root/users =
+section "6. Root account, users, shells, homes"
+_rf="$(awk -F: '$1=="root"{print $2}' /etc/shadow)"
+case "${_rf}" in
+    "")      fail "root has an EMPTY password — anyone at a TTY is root" "sudo passwd -l root" ;;
+    '!'|'!*'|'*'|'!!'|'!'*) pass "root is locked (shadow field '${_rf:0:3}…')" ;;
+    *)       info "root has a password hash set (not locked, but not empty)" ;;
+esac
+grep -q 'SULOGIN_FORCE=1' /usr/lib/systemd/system/emergency.service.d/10-maze-sulogin.conf 2>/dev/null && pass "emergency.service SULOGIN_FORCE=1 (rescue shell reachable with locked root)" || warn "no SULOGIN_FORCE drop-in for emergency.service"
+grep -q 'SULOGIN_FORCE=1' /usr/lib/systemd/system/rescue.service.d/10-maze-sulogin.conf 2>/dev/null && pass "rescue.service SULOGIN_FORCE=1" || warn "no SULOGIN_FORCE drop-in for rescue.service"
+_maze_groups="$(for f in /usr/lib/sysusers.d/*.conf; do case "$f" in */maze*|*/entropy*|*/qlam*|*/haze*|*/sentin*) awk '/^g /{print $2}' "$f";; esac; done 2>/dev/null | sort -u | tr '\n' ' ')"
+info "Maze app groups declared by sysusers.d: ${_maze_groups:-<none>}"
+for g in ${_maze_groups}; do getent group "$g" >/dev/null && pass "group $g exists" || fail "group $g declared in sysusers.d but missing (systemd-sysusers did not run?)"; done
+while IFS=: read -r u _ uid gid _ home shell; do
+    [[ "${uid}" -ge 1000 && "${uid}" -lt 65000 ]] || continue
+    printf '  %s-- user %s (uid %s, home %s)%s\n' "${C_BOLD}" "$u" "$uid" "$home" "${C_0}"
+    [[ "${shell}" == "/usr/bin/zsh" ]] && pass "shell zsh" || warn "shell is ${shell} (deploy sets zsh)"
+    _gr="$(id -nG "$u")"
+    for g in wheel maze ${_maze_groups}; do grep -qw "$g" <<<"${_gr}" && pass "member of ${g}" || warn "not in group ${g}"; done
+    for g in libvirt kvm wireshark; do getent group "$g" >/dev/null && { grep -qw "$g" <<<"${_gr}" || info "not in optional group ${g}"; }; done
+    [[ -d "${home}" ]] || { fail "home ${home} missing"; continue; }
+    m="$(stat -c %a "${home}")"; [[ "$m" == "700" ]] && pass "home mode 700" || warn "home mode ${m} (deploy sets 700)"
+    [[ "$(stat -c %u "${home}")" == "${uid}" ]] && pass "home owned by ${u}" || fail "home not owned by ${u}"
+    _foreign="$(find "${home}" -xdev \( -path "${home}/.cache" -o -path "${home}/.local/share/Trash" \) -prune -o ! -user "${u}" -print 2>/dev/null | head -5)"
+    [[ -n "${_foreign}" ]] && warn "files in ${home} not owned by ${u}:" "$(tr '\n' ' ' <<<"${_foreign}")" || pass "everything in home owned by ${u}"
+    if [[ -d "${home}/.ssh" ]]; then
+        # ssh only refuses group/other-WRITABLE files and non-700 dirs; a 644
+        # known_hosts is fine, a 644 private key is not.
+        _bad="$(find "${home}/.ssh" \( -type d ! -perm 700 \) -o \( -type f -perm /022 \) -o \( -type f -name 'id_*' ! -name '*.pub' ! -perm 600 \) 2>/dev/null | head -3)"
+        [[ -n "${_bad}" ]] && warn "~/.ssh permissions off: $(tr '\n' ' ' <<<"${_bad}")" || pass "~/.ssh permissions strict"
+    fi
+    [[ -f "${home}/.zshrc" ]] && { grep -q 'oh-my-zsh\|ZSH=' "${home}/.zshrc" 2>/dev/null && pass "~/.zshrc is the Maze oh-my-zsh config" || warn "~/.zshrc is not the Maze one (grml?)"; }
+    [[ -d "${home}/.oh-my-zsh" ]] && pass "~/.oh-my-zsh present" || warn "~/.oh-my-zsh missing"
+    [[ -f "${home}/.face.icon" ]] && pass "~/.face.icon avatar" || info "no ~/.face.icon"
+    [[ -f "/var/lib/AccountsService/users/${u}" ]] && pass "AccountsService entry" || info "no AccountsService entry for ${u}"
+    _ap="${home}/.config/plasma-org.kde.plasma.desktop-appletsrc"
+    if [[ -f "${_ap}" ]]; then
+        grep -q 'maze-calamares' "${_ap}" && fail "installer launcher still pinned in ${u}'s panel" || pass "no installer launcher in panel"
+        grep -q '/home/maze/' "${_ap}" && fail "panel config still references /home/maze/" || pass "no /home/maze references in panel config"
+    else info "no plasma appletsrc yet (Plasma not started for ${u}?)"; fi
+    if [[ -f "${home}/.config/mimeapps.list" ]]; then grep -qE 'x-scheme-handler/https?=firefox' "${home}/.config/mimeapps.list" && pass "default browser firefox" || info "default browser not firefox in mimeapps.list"; fi
+    [[ -f "${home}/.config/autostart/maze-welcome.desktop" ]] && info "Maze Welcome autostart still armed (first login not completed yet)"
+    [[ -f "${home}/.config/autostart/opensnitch_ui.desktop" || -f /etc/xdg/autostart/opensnitch_ui.desktop ]] && pass "opensnitch UI autostart" || info "no opensnitch_ui autostart"
+    # kscreenlocker / powermanagement must NOT be the live "never lock/sleep" ones
+    grep -qs 'Autolock=false' "${home}/.config/kscreenlockerrc" && warn "kscreenlockerrc has Autolock=false — the live-session setting leaked into ${u}'s home"
+    [[ -f "${home}/.config/powermanagementprofilesrc" ]] && [[ "$(grep -vcE '^\[|^$' "${home}/.config/powermanagementprofilesrc")" -eq 0 ]] && warn "powermanagementprofilesrc is the empty live profile (no idle actions)"
+done < /etc/passwd
+
+# ============================================================== 7. packages =
+section "7. Packages"
+for p in maze-meta maze-secureboot maze-snapshots maze-tools maze-branding maze-plasma-config maze-hardening mazelinux-keyring; do
+    pkg_installed "$p" && pass "$(pacman -Q "$p")" || fail "core package $p not installed"
+done
+# maze-meta depends (single source of truth)
+_deps="$(pacman -Qi maze-meta 2>/dev/null | sed -n 's/^Depends On *: //p' | tr ' ' '\n' | grep -v '^None$')"
+for d in ${_deps}; do pkg_installed "${d%%[<>=]*}" || fail "maze-meta dependency ${d} not installed"; done
+[[ -n "${_deps}" ]] && pass "all maze-meta dependencies present ($(wc -w <<<"${_deps}") pkgs)"
+# deploy DEFAULT_MAZE_APPS vs maze-meta policy
+for p in linux-chan-ai sentinai; do
+    pkg_installed "$p" && info "$p is installed — optional (can send data to Google Gemini); installs made with maze-installer < 2.0.0-22 got it by default. Remove if unwanted: sudo pacman -Rns $p"
+done
+# curated AUR set from deploy-to-target.sh
+for p in paru onlyoffice-bin upscayl-bin session-desktop-bin joplin-bin claude-code; do
+    pkg_installed "$p" && pass "AUR app $(pacman -Q "$p")" || warn "curated AUR app $p not installed (install-time AUR build failed? run maze-aur-setup)"
+done
+pkg_installed paru-bin && warn "paru-bin installed alongside/instead of source-built paru (breaks after libalpm soname bumps)"
+[[ -f /var/log/maze-aur-install.log ]] && { info "install-time AUR log: /var/log/maze-aur-install.log"; grep -iE 'fail|error' /var/log/maze-aur-install.log | grep -vE 'no failures|fatal library error, lookup self|thiserror|No debugging symbols' | head -5 | sed 's/^/         | /'; }
+grep -q 'fatal library error, lookup self' /var/log/pacman.log 2>/dev/null && info "pacman.log: 'fatal library error, lookup self' printed by snap-pac hooks during the install-time chroot transactions (snapper cannot resolve users inside arch-chroot; harmless, no snapper config existed yet)"
+[[ -x /usr/local/bin/maze-aur-setup ]] && pass "maze-aur-setup retry helper present" || warn "/usr/local/bin/maze-aur-setup missing"
+# packages.x86_64 coverage
+if [[ -n "${SRC}" && -f "${SRC}/MazeLinux/packages.x86_64" ]]; then
+    _miss=""; _n=0
+    while read -r p; do
+        p="${p%%#*}"; p="${p// /}"; [[ -z "$p" ]] && continue
+        case "$p" in maze-installer|calamares|xorg-xhost) continue ;; esac
+        _n=$((_n+1))
+        pacman -Qq "$p" >/dev/null 2>&1 || pacman -Qq "$(pacman -Sqs "^$p\$" 2>/dev/null | head -1)" >/dev/null 2>&1 || _miss="${_miss} $p"
+    done < "${SRC}/MazeLinux/packages.x86_64"
+    if [[ -z "${_miss}" ]]; then pass "all ${_n} packages.x86_64 entries installed"; else warn "packages.x86_64 entries NOT installed:${_miss}" "removed by the user, or the ISO was built from an older list"; fi
+fi
+# versions vs source tree builds
+if [[ -n "${SRC}" && -d "${SRC}" ]]; then
+    for dir in maze-meta maze-secureboot maze-snapshots maze-tools maze-branding maze-plasma-config maze-hardening maze-installer maze-keyring; do
+        [[ -d "${SRC}/${dir}" ]] || continue
+        newest="$(ls -1 "${SRC}/${dir}"/*.pkg.tar.zst 2>/dev/null | sed -E 's/.*\/([^/]+)-([^-]+-[^-]+)-any\.pkg\.tar\.zst/\1 \2/' | sort -k2 -V | tail -1)"
+        [[ -n "${newest}" ]] || continue
+        name="${newest%% *}"; ver="${newest#* }"
+        if pkg_installed "${name}"; then
+            iv="$(pacman -Q "${name}" | cut -d' ' -f2)"
+            case "$(vercmp "${iv}" "${ver}")" in
+                0) pass "${name} ${iv} == newest build in source tree" ;;
+                -1) warn "${name} installed ${iv} < newest built ${ver} in source tree" "the ISO shipped an older build, or the repo has a newer one not yet published/updated" ;;
+                1) info "${name} installed ${iv} > newest local build ${ver}" ;;
+            esac
+        fi
+    done
+fi
+# pacman database sanity
+_orph="$(pacman -Qdtq 2>/dev/null | tr '\n' ' ')"; [[ -n "${_orph}" ]] && info "orphans (pacman -Qdt): ${_orph}" || pass "no orphaned packages"
+_dbg="$(pacman -Qq 2>/dev/null | grep -- '-debug$' | tr '\n' ' ')"; [[ -n "${_dbg}" ]] && info "debug packages installed: ${_dbg}"
+_dk="$(pacman -Dk 2>&1 | grep -v '^$')"
+if [[ -z "${_dk}" ]]; then pass "pacman -Dk: local database consistent"
+elif [[ "$(grep -vc "plasma-welcome" <<<"${_dk}")" -eq 0 ]]; then info "pacman -Dk: only the plasma-meta -> plasma-welcome dependency is broken (deploy removes plasma-welcome with -Rdd on purpose; every 'pacman -S plasma-meta' will want it back)"
+else warn "pacman -Dk reports problems:"; sed 's/^/         | /' <<<"${_dk}" | head -10; fi
+_foreign="$(pacman -Qmq 2>/dev/null | tr '\n' ' ')"; info "foreign packages (pacman -Qm, updated only via paru): ${_foreign:-<none>}"
+# Maze package file integrity
+for p in maze-secureboot maze-snapshots maze-tools maze-branding maze-plasma-config maze-hardening maze-python maze-guard maze-cloak entropy-shield qlam haze hazedrop maze-ai maze-connect shim-signed; do
+    pkg_installed "$p" || continue
+    _qk="$(pacman -Qkk "$p" 2>&1 | grep -vE ': [0-9]+ total files, 0 altered files$|^$' | grep -vE '\(Modification time|Size mismatch\)' )"
+    # maze-cloak ships /etc/maze-cloak{,/config.json} as 0755/0644 root:root and
+    # then declares them 0775/0664 root:maze in tmpfiles.d (group-writable so any
+    # maze member can save MAC settings). The package cannot carry the maze GID —
+    # the group does not exist at build time — so -Qkk reports GID + Permissions
+    # on exactly those two paths after every boot. §18 checks the tmpfiles state.
+    [[ "$p" == "maze-cloak" ]] && _qk="$(grep -vE '^warning: maze-cloak: /etc/maze-cloak(/config\.json)? \((GID|Permissions) mismatch\)$|^maze-cloak: [0-9]+ total files, [0-9]+ altered files$' <<<"${_qk}")"
+    if [[ -z "${_qk}" ]]; then pass "pacman -Qkk ${p}: intact"; else
+        _alt="$(grep -cE 'altered|missing|Permissions|UID|GID|Symlink' <<<"${_qk}")"
+        [[ "$p" == "maze-plasma-config" ]] && info "pacman -Qkk ${p}: ${_alt} altered entries (deploy patches skel with sed — expected)" || warn "pacman -Qkk ${p}: ${_alt} altered/missing entries"
+        head -8 <<<"${_qk}" | sed 's/^/         | /'
+    fi
+done
+# pacman.conf
+PC=/etc/pacman.conf
+grep -q '^\[mazelinux\]' "$PC" && pass "[mazelinux] repo configured" || fail "[mazelinux] repo missing from pacman.conf — no Maze updates"
+awk '/^\[mazelinux\]/{f=1;next} /^\[/{f=0} f' "$PC" | grep -q 'SigLevel = Required' && pass "[mazelinux] SigLevel Required" || warn "[mazelinux] does not require signatures"
+awk '/^\[mazelinux\]/{f=1;next} /^\[/{f=0} f' "$PC" | grep -q 'mazerepo.berkkucukk.com.tr' && pass "[mazelinux] server URL" || warn "[mazelinux] server URL unexpected"
+grep -q '^\[maze-aur\]' "$PC" && fail "[maze-aur] build-time localrepo still in pacman.conf (file:// on the build host)" || pass "[maze-aur] stripped"
+grep -q '^\[blackarch\]' "$PC" && info "[blackarch] repo enabled" || pass "no stray [blackarch]"
+grep -q '^\[multilib\]' "$PC" && pass "[multilib] enabled (steam)" || warn "[multilib] not enabled"
+grep -qE '^ParallelDownloads = 15' "$PC" && pass "ParallelDownloads = 15" || info "ParallelDownloads not 15"
+grep -qE '^Color$' "$PC" && grep -qE '^ILoveCandy' "$PC" && pass "Color + ILoveCandy" || info "Color/ILoveCandy not both set"
+grep -qE '^NoExtract.*kded_plasma_welcome' "$PC" && info "NoExtract for kded_plasma_welcome carried over from the ISO pacman.conf"
+_ml="$(grep -cE '^Server' /etc/pacman.d/mirrorlist 2>/dev/null || echo 0)"; [[ "${_ml}" -gt 0 ]] && pass "mirrorlist has ${_ml} active servers" || fail "mirrorlist has no active Server lines"
+# keyring
+_kr=/etc/pacman.d/gnupg/pubring.gpg
+if [[ -f "${_kr}" && "$(stat -c %s "${_kr}")" -gt 10240 ]]; then pass "pacman keyring populated ($(stat -c %s "${_kr}") bytes)"; else fail "pacman keyring missing/empty — every signed package install fails"; fi
+pacman-key --list-keys 2>/dev/null | grep -qi 'maze' && pass "Maze signing key in pacman keyring" || fail "no Maze key in the pacman keyring (mazelinux-keyring not populated?)"
+mountpoint -q /etc/pacman.d/gnupg && fail "/etc/pacman.d/gnupg is a mountpoint (live tmpfs shadowing the keyring)" || pass "/etc/pacman.d/gnupg is on disk"
+pacman -Sl mazelinux >/dev/null 2>&1 && pass "[mazelinux] sync db present ($(pacman -Sl mazelinux 2>/dev/null | wc -l) pkgs)" || warn "[mazelinux] sync db not downloaded yet (pacman -Sy)"
+_upd="$(checkupdates 2>/dev/null | wc -l)"; has checkupdates && info "pending official/[mazelinux] updates: ${_upd}"
+pkg_installed plasma-welcome && warn "plasma-welcome still installed (deploy removes it so only Maze Welcome runs)" || pass "KDE plasma-welcome removed"
+# pacman hooks of the maze packages present?
+for h in 85-maze-kernel-install zz-maze-secureboot zzz-maze-boot-verify; do [[ -f "/usr/share/libalpm/hooks/${h}.hook" ]] && pass "hook ${h}" || fail "packaged hook ${h}.hook missing"; done
+[[ -f /usr/share/libalpm/hooks/05-snap-pac-pre.hook || -f /usr/share/libalpm/hooks/00-snapper-pre.hook ]] && pass "snap-pac hooks present" || warn "snap-pac hooks missing"
+
+# ================================================== 8. source-tree drift ====
+section "8. Installed files vs source tree (are we running the code in the repo?)"
+if [[ -n "${SRC}" && -d "${SRC}" ]]; then
+    for dir in maze-secureboot maze-snapshots maze-tools maze-hardening maze-branding maze-plasma-config; do
+        tree="${SRC}/${dir}/${dir}"; [[ -d "${tree}" ]] || continue
+        nd=0; nm=0; nt=0; diffs=""
+        while IFS= read -r -d '' f; do
+            rel="${f#${tree}}"; nt=$((nt+1))
+            case "${rel}" in */__pycache__/*) continue ;; esac
+            if [[ ! -e "${rel}" ]]; then nm=$((nm+1)); diffs="${diffs} MISSING:${rel}"; continue; fi
+            cmp -s "$f" "${rel}" || { nd=$((nd+1)); diffs="${diffs} ${rel}"; }
+        done < <(find "${tree}" -type f -print0 2>/dev/null)
+        if [[ "${nd}" -eq 0 && "${nm}" -eq 0 ]]; then pass "${dir}: all ${nt} files identical to the source tree"
+        else
+            case "${dir}" in
+                maze-plasma-config|maze-branding) info "${dir}: ${nd} differ, ${nm} missing of ${nt} (skel/theme files are patched by deploy; check anything unexpected)" ;;
+                *) warn "${dir}: ${nd} differ, ${nm} missing of ${nt} — the installed system does not run the repo's code (source newer than the shipped package, or local edits)" ;;
+            esac
+            tr ' ' '\n' <<<"${diffs}" | grep . | head -12 | sed 's/^/         | /'
+        fi
+    done
+    # The build-time overlay files that stay on the target
+    for f in /etc/audit/rules.d/maze.rules /etc/fail2ban/jail.d/sshd.conf /etc/ssh/sshd_config.d/00-maze-hardening.conf /etc/opensnitchd/default-config.json \
+             /etc/systemd/zram-generator.conf /etc/systemd/oomd.conf.d/10-maze.conf /etc/kernel/install.conf /etc/maze/sentinel.conf /etc/pam.d/passwd \
+             /usr/share/sddm/themes/breeze/theme.conf.user; do
+        s="${SRC}/MazeLinux/airootfs${f}"
+        [[ -f "$s" ]] || continue
+        if [[ ! -e "$f" ]]; then warn "airootfs file missing on target: $f"; elif cmp -s "$s" "$f"; then pass "airootfs file identical: $f"; else warn "airootfs file differs from source: $f"; fi
+    done
+else
+    info "no source tree — drift check skipped (use --src)"
+fi
+
+# ============================================================== 9. services =
+section "9. systemd units"
+EXP_ENABLED=(apparmor auditd firewalld fail2ban opensnitchd tor maze-guardd maze-cloak ollama acpid power-profiles-daemon smartd systemd-oomd
+             fwupd-refresh.timer reflector.timer maze-flatpak-setup maze-sentinel maze-sentinel-setup fstrim.timer bluetooth cups clamav-freshclam
+             NetworkManager display-manager systemd-resolved systemd-timesyncd
+             maze-sb-resign.path maze-sb-resign.service maze-boot-guard.path maze-boot-check.timer
+             maze-snapshots-setup snapper-cleanup.timer maze-pacman-keyring)
+EXP_DISABLED=(sshd vboxservice hv_kvp_daemon hv_vss_daemon hv_fcopy_daemon vmtoolsd vmware-vmblock-fuse choose-mirror livecd-talk
+              cloud-init-local cloud-init-network cloud-init-main cloud-config cloud-final pacman-init systemd-time-wait-sync
+              livecd-alsa-unmuter NetworkManager-wait-online systemd-networkd iwd)
+for u in "${EXP_ENABLED[@]}"; do
+    st="$(systemctl is-enabled "$u" 2>/dev/null || true)"; act="$(systemctl is-active "$u" 2>/dev/null || true)"
+    case "${st}" in
+        enabled|enabled-runtime|alias|static|indirect)
+            if [[ "${act}" == "failed" ]]; then fail "${u}: enabled but FAILED"; show "systemctl status ${u} --no-pager -l | tail -5" 5
+            elif [[ "${act}" == "active" ]]; then pass "${u}: ${st}, active"
+            else info "${u}: ${st}, ${act}"; fi ;;
+        "") warn "${u}: unit not found" ;;
+        masked) fail "${u}: masked" ;;
+        *) warn "${u}: ${st} (expected enabled)" ;;
+    esac
+done
+for u in "${EXP_DISABLED[@]}"; do
+    st="$(systemctl is-enabled "$u" 2>/dev/null || true)"; act="$(systemctl is-active "$u" 2>/dev/null || true)"
+    case "${st}" in
+        enabled|enabled-runtime) fail "${u}: ENABLED — live-only / must be off on an installed system" ;;
+        "") pass "${u}: not present" ;;
+        *) [[ "${act}" == "active" ]] && warn "${u}: ${st} but active" || pass "${u}: ${st}, ${act}" ;;
+    esac
+done
+[[ "$(systemctl get-default)" == "graphical.target" ]] && pass "default target graphical" || fail "default target is $(systemctl get-default)"
+_dm="$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null)"; [[ "${_dm}" == *sddm* ]] && pass "display-manager -> sddm" || warn "display-manager -> ${_dm:-none}"
+_failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+[[ -n "${_failed}" ]] && fail "failed units: ${_failed}" || pass "no failed units"
+_uf="$(systemctl --user -M "$(awk -F: '$3>=1000 && $3<65000{print $1; exit}' /etc/passwd)@" --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+[[ -n "${_uf}" ]] && warn "failed USER units: ${_uf}" || pass "no failed user units"
+info "boot time: $(systemd-analyze 2>/dev/null | head -1)"
+show "systemd-analyze blame 2>/dev/null | head -8" 8
+# Live-only unit FILES the source expects deploy to remove or that airootfs shipped
+for f in /etc/systemd/system/multi-user.target.wants/sshd.service /etc/systemd/system/multi-user.target.wants/pacman-init.service /etc/systemd/system/multi-user.target.wants/choose-mirror.service \
+         /etc/systemd/system/sysinit.target.wants/systemd-time-wait-sync.service /etc/systemd/system/network-online.target.wants/NetworkManager-wait-online.service; do
+    [[ -L "$f" ]] && fail "wants symlink still present: $f"
+done
+for l in $(find /etc/systemd/system -xtype l 2>/dev/null); do warn "dangling unit symlink: $l"; done
+# firewalld services
+if systemctl is-active firewalld >/dev/null 2>&1 && has firewall-cmd; then
+    _fs="$(firewall-cmd --list-services 2>/dev/null)"; info "firewalld default zone: $(firewall-cmd --get-default-zone 2>/dev/null) services: ${_fs}"
+    for s in kdeconnect maze-connect; do grep -qw "$s" <<<"${_fs}" && pass "firewalld allows $s" || warn "firewalld does not allow $s"; done
+    grep -qw ssh <<<"${_fs}" && info "firewalld allows ssh (deploy adds it, sshd is disabled)"
+fi
+
+# ============================================================== 10. security =
+section "10. Security posture"
+[[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" == "Y" ]] && pass "AppArmor enabled in kernel" || fail "AppArmor not enabled"
+_lsm="$(cat /sys/kernel/security/lsm 2>/dev/null)"; info "active LSMs: ${_lsm}"
+grep -q apparmor <<<"${_lsm}" && grep -q landlock <<<"${_lsm}" && pass "lsm list contains apparmor+landlock" || warn "lsm list unexpected"
+if has aa-status; then _aa="$(aa-status --json 2>/dev/null)"; info "AppArmor: $(aa-status 2>/dev/null | sed -n '2p;3p' | tr '\n' ' ')"; fi
+# sysctl profile
+if [[ -f /etc/sysctl.d/99-maze-hardening.conf ]]; then
+    _bad=0
+    while IFS='=' read -r k v; do
+        k="${k// /}"; v="${v// /}"; [[ -z "$k" || "$k" == \#* ]] && continue
+        cur="$(sysctl -n "$k" 2>/dev/null | tr -s '\t' ' ')"
+        [[ "${cur}" == "${v}" ]] || { _bad=$((_bad+1)); detail "sysctl ${k} = ${cur:-<unset>} (expected ${v})"; }
+    done < /etc/sysctl.d/99-maze-hardening.conf
+    [[ "${_bad}" -eq 0 ]] && pass "all maze-hardening sysctl values live" || warn "${_bad} sysctl values differ from 99-maze-hardening.conf"
+else fail "/etc/sysctl.d/99-maze-hardening.conf missing"; fi
+if systemctl is-active auditd >/dev/null 2>&1 && has auditctl; then n="$(auditctl -l 2>/dev/null | grep -vc 'No rules')"; [[ "$n" -gt 0 ]] && pass "auditd: ${n} rules loaded" || warn "auditd running but no rules loaded (/etc/audit/rules.d/maze.rules)"; fi
+if has fail2ban-client && systemctl is-active fail2ban >/dev/null 2>&1; then _j="$(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:\s*//p')"; info "fail2ban jails: ${_j:-<none>}"; fi
+# sshd -T needs host keys, which only exist once sshd has started; read the config instead
+# (Arch's sshd_config Includes sshd_config.d/*.conf first, so the first match wins).
+_prl="$(cat /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config 2>/dev/null | awk '/^[[:space:]]*PermitRootLogin/{print $2; exit}')"
+[[ "${_prl}" == "no" ]] && pass "sshd config: PermitRootLogin no (first match)" || warn "sshd PermitRootLogin=${_prl:-<default: prohibit-password>}"
+# Loopback of any kind, NetworkManager/dhcp client sockets, browsers' ephemeral
+# UDP (QUIC/WebRTC) and kdeconnect (a deliberate LAN feature, firewalled by
+# service name) are not findings; anything else bound to a non-loopback address is.
+_ls="$(ss -ltnupH 2>/dev/null | grep -vE '127\.[0-9.]+:|\[::1\]:|%lo:' | grep -vE 'kdeconnectd|NetworkManager|dhcpcd|firefox|chromium|brave|torbrowser' | awk '!($1=="udp" && $5 ~ /:[3-6][0-9][0-9][0-9][0-9]$/)')"
+[[ -n "${_ls}" ]] && { warn "services listening on non-loopback addresses (kdeconnect/NM/browsers excluded):"; sed 's/^/         | /' <<<"${_ls}" | head -10; } || pass "nothing unexpected listens on non-loopback addresses"
+ss -lunpH 2>/dev/null | grep -q ':5353.*kdeconnectd' && info "kdeconnectd answers mDNS on udp/5353 (KDE Connect device discovery — a deliberate LAN feature; disable KDE Connect to silence it)"
+# LAN presence broadcasting — a privacy desktop should not announce its hostname.
+systemctl is-active avahi-daemon >/dev/null 2>&1 && warn "avahi-daemon is running (mDNS hostname broadcast on the LAN)" "socket-activated: $(systemctl show -p TriggeredBy --value avahi-daemon); pulled by $(pacman -Qi avahi 2>/dev/null | sed -n 's/^Required By *: //p'). Nothing in deploy/enable-services masks it."
+systemctl is-active passim >/dev/null 2>&1 && warn "passim is running (fwupd's LAN firmware-cache sharing daemon, advertises via mDNS/avahi)" "static unit pulled in by fwupd; disable with: sudo systemctl mask passim avahi-daemon.socket avahi-daemon.service"
+[[ -d /var/log/journal && "$(ls -A /var/log/journal 2>/dev/null)" ]] && pass "journal is persistent (/var/log/journal)" || warn "journal not persistent"
+if has resolvectl; then
+    _pr="$(resolvectl status 2>/dev/null | awk '/^Global/{g=1} g && /Protocols:/{print; exit}' | tr -s ' ')"; info "resolved global: ${_pr# }"
+    grep -q '+mDNS' <<<"${_pr}" && warn "systemd-resolved has mDNS ON (responder on udp/5353)" "Arch's resolved default is MulticastDNS=yes; deploy removes the archiso drop-in but adds no MulticastDNS=no. Fix idea: ship /etc/systemd/resolved.conf.d/10-maze-privacy.conf with MulticastDNS=no + LLMNR=no." || pass "resolved mDNS off"
+    grep -q '+LLMNR' <<<"${_pr}" && warn "systemd-resolved has LLMNR ON (responder on udp/5355, answers hostname queries on the LAN)" || pass "resolved LLMNR off"
+fi
+[[ "$(readlink /etc/resolv.conf)" == *stub-resolv.conf* ]] && pass "/etc/resolv.conf -> resolved stub" || info "/etc/resolv.conf -> $(readlink /etc/resolv.conf 2>/dev/null || echo 'regular file')"
+if [[ "${ROOT_IS_LUKS}" -eq 1 ]]; then
+    _map="$(findmnt -no SOURCE / | sed 's/\[.*\]//; s#/dev/mapper/##')"
+    _cs="$(cryptsetup status "${_map}" 2>/dev/null)"; info "LUKS: $(grep -E 'type|cipher' <<<"${_cs}" | tr -s ' ' | tr '\n' ' ')"
+    grep -q 'flags:.*discards' <<<"${_cs}" && pass "dm-crypt opened with discards" || warn "dm-crypt opened WITHOUT discards"
+    _ld="$(cryptsetup luksDump "$(cryptsetup status "${_map}" | awk '/device:/{print $2}')" 2>/dev/null | grep -A1 '^Flags' | tail -1)"; grep -q allow-discards <<<"${_ld}" && pass "allow-discards persisted in the LUKS2 header" || info "allow-discards not persisted in the LUKS header (cmdline provides it; optional: cryptsetup --allow-discards --persistent refresh ${_map})"
+    grep -qE 'luks,discard' /etc/crypttab 2>/dev/null && pass "crypttab has luks,discard" || info "crypttab: $(grep -v '^#' /etc/crypttab 2>/dev/null | tr '\n' ';')"
+    [[ -f /crypto_keyfile.bin ]] && { m="$(stat -c %a /crypto_keyfile.bin)"; [[ "$m" == "0" || "$m" == "400" || "$m" == "600" ]] && pass "/crypto_keyfile.bin mode ${m}" || fail "/crypto_keyfile.bin mode ${m} — LUKS keyfile readable"; }
+fi
+[[ -f /etc/modprobe.d/maze-killswitch-camera.conf ]] && info "camera kill switch is ENGAGED (uvcvideo blacklisted)"
+# maze-hardening >= 1.0.0-4
+[[ -f /usr/lib/modprobe.d/10-maze-broadcom-wl.conf && -f /usr/lib/udev/rules.d/80-maze-broadcom-wl.rules ]] && pass "maze-hardening wl gating files present" || warn "maze-hardening wl gating files missing (package < 1.0.0-4)"
+[[ -f /etc/systemd/resolved.conf.d/zz-maze-privacy.conf ]] && pass "resolved zz-maze-privacy.conf present" || warn "resolved zz-maze-privacy.conf missing (maze-hardening < 1.0.0-4)"
+for _u in passim.service avahi-daemon.socket avahi-daemon.service; do [[ "$(systemctl is-enabled "$_u" 2>/dev/null)" == "masked" ]] && pass "${_u} masked" || info "${_u} not masked ($(systemctl is-enabled "$_u" 2>/dev/null || echo absent))"; done
+has usbguard && { _up="$(grep -E '^ImplicitPolicyTarget' /etc/usbguard/usbguard-daemon.conf 2>/dev/null)"; info "usbguard ${_up:-config default}; service: $(systemctl is-enabled usbguard 2>/dev/null)"; }
+has rfkill && show "rfkill list | grep -E '^[0-9]|blocked: yes'" 12
+grep -q 'pam_gnome_keyring' /etc/pam.d/passwd 2>/dev/null && pass "pam_gnome_keyring password-change hook" || info "no pam_gnome_keyring in /etc/pam.d/passwd"
+for f in /etc/shadow /etc/gshadow; do m="$(stat -c %a $f)"; [[ "$m" == "600" || "$m" == "400" || "$m" == "640" ]] && pass "$f mode $m" || warn "$f mode $m"; done
+_suid_local="$(find /usr/local -perm -4000 -type f 2>/dev/null)"; [[ -n "${_suid_local}" ]] && warn "setuid binaries under /usr/local: $(tr '\n' ' ' <<<"${_suid_local}")" || pass "no setuid binaries under /usr/local"
+_ww="$(find /usr/local/bin /usr/bin /etc -xdev -type f -perm -o+w 2>/dev/null | head -5)"; [[ -n "${_ww}" ]] && fail "world-writable files: $(tr '\n' ' ' <<<"${_ww}")" || pass "no world-writable files in /usr/bin, /usr/local/bin, /etc"
+
+# =============================================================== 11. storage =
+section "11. Storage, btrfs layout, snapshots, swap"
+show "lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS,LABEL -e7" 20
+_rfs="$(findmnt -no FSTYPE /)"; info "root fs: ${_rfs}"
+if [[ "${_rfs}" == "btrfs" ]]; then
+    for sv in @ @home @cache @log; do btrfs subvolume list / 2>/dev/null | grep -qE " path ${sv}\$" && pass "subvolume ${sv}" || warn "subvolume ${sv} not found (mount.conf btrfsSubvolumes)"; done
+    for mp in /home /var/cache /var/log; do findmnt -n "$mp" >/dev/null 2>&1 && pass "${mp} is its own mount ($(findmnt -no SOURCE "$mp" | sed 's/.*\[//; s/\]//'))" || warn "${mp} is not a separate subvolume mount"; done
+    findmnt -no OPTIONS / | grep -q 'compress=zstd' && pass "root mounted with compress=zstd" || warn "root not mounted with compress=zstd:1"
+    findmnt -no OPTIONS / | grep -q 'noatime' && pass "root noatime" || info "root without noatime"
+    _def="$(btrfs subvolume get-default / 2>/dev/null)"; info "btrfs default subvolume: ${_def}"
+    if grep -qE '^ID 5 ' <<<"${_def}"; then info "default subvolume is the top level (ID 5); cmdline rootflags pins @ — Calamares layout, rollback mode not enabled"
+    elif grep -qE ' path @$' <<<"${_def}"; then pass "default subvolume is @"
+    else info "default subvolume is a snapshot/other (maze-enable-rollback applied, or rollback pending)"; fi
+    show "btrfs filesystem usage -h / 2>/dev/null | grep -E 'Device size|Used|Free \(estimated\)|Data ratio'" 5
+    if [[ -f /etc/snapper/configs/root ]]; then
+        pass "snapper config 'root' present"
+        _ns="$(snapper -c root list 2>/dev/null | tail -n +4 | grep -c .)"; info "snapshots: ${_ns}"
+        mountpoint -q /.snapshots && pass "/.snapshots mounted ($(findmnt -no SOURCE /.snapshots))" || warn "/.snapshots is not a mountpoint (maze-snapshots-setup job 2)"
+        grep -q '/.snapshots' /etc/fstab && pass "/.snapshots in fstab" || info "/.snapshots not in fstab"
+        grep -qE '^TIMELINE_CREATE="?no"?' /etc/snapper/configs/root && pass "timeline snapshots off (by design)" || info "TIMELINE_CREATE not 'no'"
+    else fail "no snapper config for / — maze-snapshots-setup.service did not run/succeed" "journalctl -u maze-snapshots-setup"; fi
+    _err="$(btrfs device stats / 2>/dev/null | awk '$2!=0' | wc -l)"; [[ "${_err}" -eq 0 ]] && pass "btrfs device stats: no errors" || fail "btrfs device stats report errors"; show "btrfs device stats / | awk '\$2!=0'" 6
+    _scrub="$(btrfs scrub status / 2>/dev/null | grep -E 'Status|no stats|Error summary' | tr '\n' ' ')"; info "scrub: ${_scrub}"
+fi
+# fstab sanity
+for l in $(awk '!/^#/ && NF>=2 {print $2}' /etc/fstab); do [[ "$l" == none || "$l" == swap ]] && continue; findmnt -n "$l" >/dev/null 2>&1 || warn "fstab entry ${l} is not mounted"; done
+grep -qE 'umask=0077' /etc/fstab && pass "fstab ESP umask=0077" || warn "fstab ESP without umask=0077"
+findmnt --verify >/dev/null 2>&1 && pass "findmnt --verify: fstab OK" || { warn "findmnt --verify complaints:"; show "findmnt --verify 2>&1 | grep -v '^$'" 6; }
+# swap / zram
+if swapon --show --noheadings 2>/dev/null | grep -q zram; then pass "zram swap active: $(swapon --show --noheadings | grep zram | awk '{print $1" "$3}')"; else warn "no zram swap active (zram-generator.conf shipped)"; fi
+[[ -f /etc/systemd/zram-generator.conf ]] && pass "zram-generator.conf present" || fail "zram-generator.conf missing"
+systemctl is-active systemd-oomd >/dev/null 2>&1 && pass "systemd-oomd active" || warn "systemd-oomd not active"
+_avail="$(df -m --output=avail / | tail -1 | tr -d ' ')"; [[ "${_avail}" -gt 5000 ]] && pass "root has ${_avail} MB free" || warn "root has only ${_avail} MB free"
+has smartctl && for d in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print $1}'); do
+    _h="$(smartctl -H /dev/$d 2>/dev/null | grep -iE 'overall-health|SMART Health' | sed 's/.*: //')"; [[ -n "${_h}" ]] && { [[ "${_h}" =~ PASSED|OK ]] && pass "SMART /dev/$d: ${_h}" || fail "SMART /dev/$d: ${_h}"; }
+done
+
+# =========================================================== 12. desktop =====
+section "12. Desktop, branding, SDDM"
+must_exist /etc/sddm.conf.d/20-maze-theme.conf "SDDM greeter branding"
+[[ -f /usr/share/sddm/themes/breeze/theme.conf.user ]] && pass "breeze theme.conf.user overlay (branded login)" || warn "breeze theme.conf.user missing — stock Breeze login"
+[[ -d /usr/share/sddm/themes/maze-oled ]] && pass "maze-oled SDDM theme" || info "no maze-oled SDDM theme dir"
+for d in /usr/share/plasma/look-and-feel/com.mazelinux.oled /usr/share/plasma/look-and-feel/com.mazelinux.oled.light /usr/share/plasma/plasmoids/com.mazelinux.panic /usr/share/wallpapers/Maze /usr/share/color-schemes/MazeDark.colors /usr/share/color-schemes/MazeLight.colors /usr/share/pixmaps/maze-logo.png /usr/share/icons/hicolor/256x256/apps/mazelinux.png /usr/share/maze/fastfetch-logo.txt; do
+    [[ -e "$d" ]] && pass "$(basename "$d")" || warn "missing: $d"
+done
+_wc="$(ls -d /usr/share/wallpapers/Maze* 2>/dev/null | wc -l)"; info "Maze wallpaper packages: ${_wc}"
+grep -q '<default>Maze</default>' /usr/share/plasma/wallpapers/org.kde.image/contents/config/main.xml 2>/dev/null && pass "org.kde.image default wallpaper = Maze" || warn "org.kde.image default wallpaper not patched to Maze"
+grep -qsE '^Image=Maze' /usr/share/plasma/look-and-feel/org.kde.breeze.desktop/contents/defaults && pass "breeze L&F defaults Image=Maze" || info "breeze look-and-feel defaults not patched"
+for b in maze-doctor maze-control-center maze-hardware maze-killswitch maze-guardd maze-guardctl maze-panic maze-panic-restore maze-kernel maze-kernel-helper maze-sentinel maze-welcome maze-gpu-driver maze-flatpak-setup maze-enable-blackarch maze-install-vmware maze-power-saver maze-primary-screen maze-apply-wallpaper mazelinux; do
+    [[ -x "/usr/local/bin/$b" ]] || fail "/usr/local/bin/$b missing or not executable"
+done
+[[ -x /usr/local/bin/maze-doctor ]] && pass "maze-tools binaries present"
+for b in maze-sb-sign maze-boot-check maze-boot-entries maze-boot-guard maze-boot-notify maze-initramfs-rebuild maze-kernel-install-add maze-rollback maze-enable-rollback maze-snapshots-setup; do
+    [[ -x "/usr/bin/$b" ]] || fail "/usr/bin/$b missing"
+done
+[[ -x /usr/bin/maze-sb-sign ]] && pass "maze-secureboot / maze-snapshots binaries present"
+for lib in maze_ui maze_status maze_i18n; do [[ -f "/usr/local/lib/maze/${lib}.py" ]] || fail "/usr/local/lib/maze/${lib}.py missing (maze-welcome/control-center import it)"; done
+python3 - <<'PY' 2>/dev/null && pass "python: /usr/local/lib/maze modules parse" || warn "python: a /usr/local/lib/maze module has a syntax error"
+import ast, glob
+for f in glob.glob('/usr/local/lib/maze/*.py'): ast.parse(open(f).read(), f)
+PY
+for s in /usr/local/bin/maze-guardd /usr/local/bin/maze-doctor /usr/bin/maze-sb-sign /usr/bin/maze-boot-check /usr/bin/maze-boot-entries /usr/bin/maze-snapshots-setup /usr/bin/maze-rollback /usr/local/bin/maze-power-saver /usr/local/bin/maze-gpu-driver /usr/local/bin/maze-kernel-helper; do
+    [[ -f "$s" ]] || continue
+    if head -1 "$s" | grep -q python; then python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])" "$s" 2>/dev/null || warn "python syntax error in $s"
+    else bash -n "$s" 2>/dev/null && : || { sh -n "$s" 2>/dev/null || warn "shell syntax error in $s"; }; fi
+done
+pass "syntax check of core Maze scripts done"
+# The Maze apps
+for app in maze-guard maze-cloak entropy-shield qlam haze hazedrop maze-ai maze-connect said360; do
+    pkg_installed "$app" && info "$(pacman -Q "$app")  files: $(pacman -Ql "$app" | wc -l)" || warn "app ${app} not installed"
+done
+for d in /etc/maze-cloak /etc/maze; do [[ -d "$d" ]] && info "$d: $(stat -c '%U:%G %a' "$d")"; done
+[[ -d /etc/maze-cloak ]] && { [[ "$(stat -c %G /etc/maze-cloak)" == "maze" ]] && pass "/etc/maze-cloak group maze (tmpfiles.d applied)" || warn "/etc/maze-cloak group is $(stat -c %G /etc/maze-cloak) — tmpfiles.d ownership not applied"; }
+[[ -S /run/maze/guard.sock ]] && pass "maze-guardd socket /run/maze/guard.sock" || warn "maze-guardd socket missing"
+[[ -S /run/maze/maze.sock ]] && pass "maze-guard helper socket /run/maze/maze.sock" || info "maze-guard helper socket not present (helper not running)"
+ls /run/maze/status/*.json >/dev/null 2>&1 && info "suite status files: $(ls /run/maze/status/ | tr '\n' ' ')" || info "no /run/maze/status/*.json published"
+[[ -d /etc/NetworkManager/conf.d ]] && show "ls /etc/NetworkManager/conf.d/" 6
+has flatpak && { flatpak remotes 2>/dev/null | grep -q flathub && pass "flathub remote registered" || info "flathub not registered yet (maze-flatpak-setup needs network)"; }
+has ollama && info "ollama models: $(ollama list 2>/dev/null | tail -n +2 | awk '{print $1}' | tr '\n' ' ')"
+grep -qsE '^(Session|DisplayServer)=' /etc/sddm.conf.d/*.conf && show "grep -hE '^(\[|User=|Session=|DisplayServer=|Current=)' /etc/sddm.conf.d/*.conf" 8
+
+# =========================================================== 13. kernels =====
+section "13. Kernels, DKMS, firmware"
+show "pacman -Q linux linux-lts linux-headers linux-lts-headers 2>/dev/null" 4
+pkg_installed linux-lts && pass "linux-lts recovery kernel installed" || warn "no linux-lts (maze-meta depends on it)"
+if has dkms; then
+    _ds="$(dkms status 2>/dev/null)"; [[ -n "${_ds}" ]] && { sed 's/^/         | /' <<<"${_ds}"; grep -qvE 'installed' <<<"${_ds}" && warn "some DKMS modules are not in 'installed' state" || pass "all DKMS modules installed"; } || info "no DKMS modules"
+fi
+if lsmod | grep -qE '^wl '; then
+    if lspci -n 2>/dev/null | grep -qE ' 14e4:'; then info "broadcom wl module loaded (Broadcom device present)"
+    else fail "proprietary broadcom 'wl' module is loaded but there is NO Broadcom device" "wl.ko carries the wildcard alias pci:v*d*sv*sd*bc02sc80i* (any PCI class 0280 network controller), so udev loads it for Intel/other WiFi too. It is unsigned (taints kernel), and the kernel warns 'Unpatched return thunk in use' — it disables retbleed/SRSO return-thunk mitigations for the whole kernel. Fix: blacklist wl by default (modprobe.d) and load it only on 14e4 vendor via a udev rule, or drop broadcom-wl-dkms from packages.x86_64."; fi
+fi
+journalctl -b -k -q 2>/dev/null | grep -q 'Unpatched return thunk in use' && warn "kernel: 'Unpatched return thunk in use' — an out-of-tree module (wl) defeated the return-thunk mitigation"
+_uc="$(journalctl -b -k -q 2>/dev/null | grep -m1 -iE 'microcode: (updated|Current revision)')"; [[ -n "${_uc}" ]] && pass "microcode: ${_uc#*]: }" || info "no microcode update line in dmesg"
+[[ -f /etc/modprobe.d/broadcom-wl.conf ]] && info "broadcom-wl modprobe conf present (from airootfs)"
+_gpu="$(lspci -nnk 2>/dev/null | grep -A3 -iE 'VGA|3D|Display' | grep -E 'VGA|3D|Display|Kernel driver' | tr -s ' ' | tr '\n' ';')"; info "GPU: ${_gpu}"
+
+# =========================================================== 14. journal =====
+section "14. Journal — this boot"
+_ne="$(journalctl -b -p err -q --no-pager 2>/dev/null | wc -l)"
+[[ "${_ne}" -eq 0 ]] && pass "no error-priority journal entries this boot" || { warn "${_ne} error-priority journal lines this boot:"; show "journalctl -b -p err -q --no-pager -o short | tail -25" 25; }
+_nm="$(journalctl -b -q --no-pager -p warning -u 'maze-*' 2>/dev/null | wc -l)"; [[ "${_nm}" -eq 0 ]] && pass "no warnings from maze-* units" || { warn "${_nm} warning+ lines from maze-* units:"; show "journalctl -b -q --no-pager -p warning -u 'maze-*' | tail -15" 15; }
+_aa="$(journalctl -b -k -q 2>/dev/null | grep -c 'apparmor="DENIED"')"; [[ "${_aa}" -eq 0 ]] && pass "no AppArmor denials" || { info "${_aa} AppArmor DENIED events:"; show "journalctl -b -k -q | grep 'apparmor=\"DENIED\"' | sed -E 's/.*profile=\"([^\"]+)\".*name=\"([^\"]+)\".*/\\1 -> \\2/' | sort | uniq -c | sort -rn | head -8" 8; }
+_oops="$(journalctl -b -k -q 2>/dev/null | grep -ciE 'BUG:|Oops|Call Trace|general protection|kernel panic')"
+if [[ "${_oops}" -eq 0 ]]; then pass "no kernel BUG/Oops/Call Trace"; else
+    fail "${_oops} kernel BUG/Oops/Call-Trace lines this boot (WARNING lines and the faulting module below):"
+    show "journalctl -b -k -q -o short | grep -E 'WARNING: |BUG: |Oops|Call Trace|\[[a-z_0-9]+ [0-9a-f]{40}\]' | head -8" 8
+fi
+_oom="$(journalctl -b -q 2>/dev/null | grep -ciE 'out of memory|oom-kill|Killed process')"; [[ "${_oom}" -eq 0 ]] && pass "no OOM kills" || warn "${_oom} OOM-related lines this boot"
+_usb="$(journalctl -b -k -q 2>/dev/null | grep -ciE 'usb [0-9-]+: USB disconnect')"; info "USB disconnects this boot: ${_usb}"
+_seg="$(journalctl -b -q 2>/dev/null | grep -ci 'segfault')"; [[ "${_seg}" -eq 0 ]] && pass "no segfaults" || { warn "${_seg} segfault lines:"; show "journalctl -b -q | grep -i segfault | tail -5" 5; }
+_cd="$(coredumpctl list --no-legend 2>/dev/null | wc -l)"; [[ "${_cd}" -eq 0 ]] && pass "no coredumps recorded" || { warn "${_cd} coredumps recorded:"; show "coredumpctl list --no-legend | tail -8" 8; }
+_pb="$(journalctl --list-boots -q 2>/dev/null | wc -l)"; info "boots in journal: ${_pb}"
+# Boot-hook and secureboot activity
+show "journalctl -q --no-pager -u maze-sb-resign.service -u maze-boot-check.service -u maze-snapshots-setup.service -u maze-pacman-keyring.service -u maze-sentinel-setup.service -o cat | tail -15" 15
+[[ -f /var/log/pacman.log ]] && { info "last pacman transactions:"; grep -E '\[ALPM\] (installed|upgraded|removed)' /var/log/pacman.log | tail -6 | sed 's/^/         | /'; grep -E 'warning|error' /var/log/pacman.log | tail -6 | sed 's/^/         | /'; }
+
+# ============================================================ 15. deep ======
+if [[ "${DEEP}" -eq 1 ]]; then
+section "15. Deep: what is sealed inside the boot image"
+if [[ -n "${ESP:-}" && -f "${ESP}/EFI/BOOT/grubx64.efi" ]] && has lsinitcpio; then
+    _tmp="$(mktemp -d)"
+    if objcopy -O binary --only-section=.initrd "${ESP}/EFI/BOOT/grubx64.efi" "${_tmp}/initrd.img" 2>/dev/null && [[ -s "${_tmp}/initrd.img" ]]; then
+        _lst="$(lsinitcpio "${_tmp}/initrd.img" 2>/dev/null)"
+        info "initrd entries: $(wc -l <<<"${_lst}")  size: $(du -h "${_tmp}/initrd.img" | cut -f1)"
+        # Calamares' luksbootkeyfile module drops /crypto_keyfile.bin into the
+        # initramfs so the passphrase is typed once. With layout=uki that
+        # initramfs sits on the UNENCRYPTED ESP — a keyfile in there unlocks the
+        # root without any passphrase, i.e. the encryption is decorative.
+        if grep -qE 'crypto_keyfile|\.keyfile$|keyfile\.bin' <<<"${_lst}"; then fail "a LUKS keyfile is embedded in the sealed initrd on the ESP" "$(grep -E 'crypto_keyfile|keyfile' <<<"${_lst}" | head -3 | tr '\n' ' ') — anyone with the disk can unlock root without the passphrase"; else pass "no LUKS keyfile inside the initrd"; fi
+        grep -qE '(MOK|\.key$|\.pem$|id_rsa|id_ed25519)' <<<"${_lst}" && warn "key-looking files inside the initrd: $(grep -E '(MOK|\.key$|\.pem$|id_)' <<<"${_lst}" | head -3 | tr '\n' ' ')" || pass "no private-key-looking files inside the initrd"
+        grep -q 'etc/crypttab' <<<"${_lst}" && info "initrd carries /etc/crypttab"
+        _kmods="$(grep -cE 'kernel/drivers/.*\.ko' <<<"${_lst}")"; info "kernel modules in initrd: ${_kmods}"
+        # Only modules the ROOT needs; built-in (=y) ones never appear as .ko.
+        _need="btrfs"; [[ "${ROOT_IS_LUKS}" -eq 1 ]] && _need="dm_crypt ${_need}"; [[ "$(findmnt -no SOURCE / | sed 's/\[.*\]//')" == /dev/nvme* || "$(cryptsetup status "$(findmnt -no SOURCE / | sed 's/\[.*\]//; s#/dev/mapper/##')" 2>/dev/null | awk '/device:/{print $2}')" == /dev/nvme* ]] && _need="${_need} nvme"
+        for m in ${_need}; do
+            case "$m" in dm_crypt) _opt=CONFIG_DM_CRYPT ;; btrfs) _opt=CONFIG_BTRFS_FS ;; nvme) _opt=CONFIG_BLK_DEV_NVME ;; esac
+            _cfg="$(zcat /proc/config.gz 2>/dev/null | grep -m1 -E "^${_opt}=")"
+            if [[ "${_cfg}" == *=y ]]; then pass "initrd: ${m} is built into the kernel"
+            elif grep -qE "/${m/_/[-_]}\.ko" <<<"${_lst}"; then pass "initrd has ${m}.ko"
+            else warn "initrd lacks ${m}.ko"; fi
+        done
+        grep -qE 'usr/lib/firmware' <<<"${_lst}" && info "firmware files in initrd: $(grep -c 'usr/lib/firmware' <<<"${_lst}")"
+        _fl="$(grep -E '^[[:space:]]*FILES=' /etc/mkinitcpio.conf | tail -1)"; info "mkinitcpio ${_fl:-FILES= <none>}"
+    fi
+    rm -rf "${_tmp}"
+    if has sbverify; then info "signature on grubx64.efi: $(sbverify --list "${ESP}/EFI/BOOT/grubx64.efi" 2>/dev/null | grep -E 'subject|signature [0-9]' | head -3 | tr -s ' ' | tr '\n' ' ')"; fi
+fi
+
+section "16. Deep: LUKS header"
+if [[ "${ROOT_IS_LUKS}" -eq 1 ]] && has cryptsetup; then
+    _map="$(findmnt -no SOURCE / | sed 's/\[.*\]//; s#/dev/mapper/##')"
+    _dev="$(cryptsetup status "${_map}" 2>/dev/null | awk '/device:/{print $2}')"
+    _dump="$(cryptsetup luksDump "${_dev}" 2>/dev/null)"
+    _slots="$(grep -cE '^  [0-9]+: luks2' <<<"${_dump}")"
+    _pbkdf="$(grep -m1 -E 'PBKDF:' <<<"${_dump}" | awk '{print $2}')"
+    _cipher="$(grep -m1 -E 'Cipher:' <<<"${_dump}" | awk '{print $2}')"
+    info "LUKS2 ${_dev}: ${_slots} keyslot(s), PBKDF ${_pbkdf}, cipher ${_cipher}"
+    [[ "${_pbkdf}" == "argon2id" ]] && pass "PBKDF argon2id" || warn "PBKDF is ${_pbkdf} (argon2id expected for LUKS2)"
+    if [[ "${_slots}" -gt 1 ]]; then
+        if [[ -f /crypto_keyfile.bin ]]; then info "${_slots} keyslots — one is the /crypto_keyfile.bin from Calamares' luksbootkeyfile (mode $(stat -c %a /crypto_keyfile.bin))"
+        else warn "${_slots} keyslots but no /crypto_keyfile.bin on disk — an orphan keyslot (luksbootkeyfile added a key, the file is gone)" "Whoever kept a copy of that file can unlock the disk. List: cryptsetup luksDump ${_dev}; remove a slot: cryptsetup luksKillSlot ${_dev} N (keep the passphrase slot!)"; fi
+    else pass "single keyslot (passphrase only)"; fi
+    grep -qE 'Flags:.*allow-discards' <<<"${_dump}" && info "allow-discards persisted in header" || info "allow-discards not in header (cmdline provides it)"
+    _tok="$(grep -cE '^  [0-9]+: systemd-tpm2' <<<"${_dump}")"; [[ "${_tok}" -gt 0 ]] && info "TPM2 tokens: ${_tok}"
+fi
+
+section "17. Deep: every key the firmware trusts via MOK"
+if has mokutil; then
+    _mok="$(mokutil --list-enrolled 2>/dev/null)"
+    # Self-signed certs print the same CN as Issuer and Subject — count Subject lines only.
+    _n="$(grep -c '^\[key ' <<<"${_mok}")"; _maze="$(grep -E '^\s*Subject:' <<<"${_mok}" | grep -c 'Maze Linux Secure Boot machine key')"
+    _iso="$(grep -E '^\s*Subject:' <<<"${_mok}" | grep -cE 'CN=Maze Linux Secure Boot$')"
+    info "MOK entries listed: ${_n} — Maze machine keys: ${_maze}, Maze live-ISO key: ${_iso} (MokListRT also shows shim's built-in vendor CA)"
+    grep -E '^\s*Subject:' <<<"${_mok}" | sed 's/^ *//' | sort | uniq -c | sed 's/^/         | /'
+    if [[ "${_maze}" -gt 1 ]]; then
+        warn "${_maze} Maze machine keys enrolled — earlier installs on this machine left theirs behind" "Each was per-install; its private half died with that install's disk, but it still signs for this firmware. Remove old ones: sudo mokutil --delete <old.cer> (needs the cert; or reset MOK from MokManager) — keep the current /var/lib/maze-secureboot/MOK.cer!"
+    elif [[ "${_maze}" -eq 1 ]]; then pass "exactly one Maze machine key enrolled"; fi
+    _pending="$(mokutil --list-new 2>/dev/null | grep -c '^\[key ')"; [[ "${_pending}" -gt 0 ]] && warn "${_pending} MOK enrollment request(s) pending for next boot"
+    _del="$(mokutil --list-delete 2>/dev/null | grep -c '^\[key ')"; [[ "${_del}" -gt 0 ]] && info "${_del} MOK deletion request(s) pending"
+fi
+
+section "18. Deep: tmpfiles.d / sysusers.d declarations of the Maze apps vs the filesystem"
+# unpackfs copies the live root, so no app scriptlet ever ran on this machine;
+# deploy runs systemd-sysusers + systemd-tmpfiles --create once, and systemd
+# repeats both at boot. Check the result, entry by entry.
+_bad=0; _n=0
+for f in /usr/lib/tmpfiles.d/*.conf /etc/tmpfiles.d/*.conf; do
+    [[ -f "$f" ]] || continue
+    case "$(basename "$f")" in *maze*|*entropy*|*qlam*|*haze*|*sentin*|*said*|*linux-chan*) ;; *) continue ;; esac
+    while read -r typ path mode user group rest; do
+        [[ -z "${typ}" || "${typ}" == \#* ]] && continue
+        case "${typ}" in d|D|z|Z|f|L|C) ;; *) continue ;; esac
+        _n=$((_n+1))
+        if [[ ! -e "${path}" ]]; then [[ "${typ}" == "L" || "${typ}" == "C" ]] && continue; _bad=$((_bad+1)); detail "$(basename "$f"): ${path} MISSING (${typ} ${mode} ${user}:${group})"; continue; fi
+        _cm="$(stat -c %a "${path}")"; _cu="$(stat -c %U "${path}")"; _cg="$(stat -c %G "${path}")"
+        [[ "${mode}" == "-" || -z "${mode}" ]] && mode="${_cm}"; [[ "${user}" == "-" || -z "${user}" ]] && user="${_cu}"; [[ "${group}" == "-" || -z "${group}" ]] && group="${_cg}"
+        mode="${mode#0}"; [[ "${mode}" == "" ]] && mode="0"
+        if [[ "${_cm}" != "${mode}" || "${_cu}" != "${user}" || "${_cg}" != "${group}" ]]; then
+            _bad=$((_bad+1)); detail "$(basename "$f"): ${path} is ${_cu}:${_cg} ${_cm}, declared ${user}:${group} ${mode}"
+        fi
+    done < "$f"
+done
+[[ "${_bad}" -eq 0 ]] && pass "all ${_n} Maze tmpfiles.d entries match (ownership + mode)" || warn "${_bad} of ${_n} Maze tmpfiles.d entries differ (systemd-tmpfiles --create fixes them at boot; a mismatch here means it is being undone)"
+_bad=0; _n=0
+for f in /usr/lib/sysusers.d/*.conf; do
+    case "$(basename "$f")" in *maze*|*entropy*|*qlam*|*haze*|*sentin*|*said*|*linux-chan*) ;; *) continue ;; esac
+    while read -r typ name id rest; do
+        [[ -z "${typ}" || "${typ}" == \#* ]] && continue
+        _n=$((_n+1))
+        case "${typ}" in
+            g) getent group "${name}" >/dev/null || { _bad=$((_bad+1)); detail "$(basename "$f"): group ${name} missing"; } ;;
+            u) getent passwd "${name}" >/dev/null || { _bad=$((_bad+1)); detail "$(basename "$f"): user ${name} missing"; } ;;
+            m) id -nG "${name}" 2>/dev/null | grep -qw "${id}" || { _bad=$((_bad+1)); detail "$(basename "$f"): ${name} not in ${id}"; } ;;
+        esac
+    done < "$f"
+done
+[[ "${_bad}" -eq 0 ]] && pass "all ${_n} Maze sysusers.d entries applied" || fail "${_bad} of ${_n} Maze sysusers.d entries not applied"
+# Which Maze apps declare nothing at all (their scriptlet did the work — and never ran here)?
+for app in maze-guard maze-cloak entropy-shield qlam haze hazedrop maze-ai maze-connect said360; do
+    pkg_installed "$app" || continue
+    _decl="$(pacman -Ql "$app" | grep -cE '(tmpfiles|sysusers)\.d/')"
+    _scr="$(pacman -Qi "$app" 2>/dev/null | sed -n 's/^Install Script *: //p')"
+    [[ "${_decl}" -eq 0 && "${_scr}" == "Yes" ]] && info "${app}: ships an .install scriptlet but no tmpfiles/sysusers — whatever that scriptlet does at install is NOT done on an unpackfs install (see MAZE-TAM-REFERANS §5.3)"
+done
+
+section "18b. Shared Python runtime (maze-python, /opt/maze/venv)"
+# Every Maze desktop app written in Python — maze-guard, maze-cloak, haze,
+# hazedrop, qlam, sentinai — runs on ONE venv owned by the maze-python package.
+# Each used to carry a private venv that pacman never tracked and a Python
+# major upgrade silently broke. What "correct" looks like now: the package is
+# installed, its interpreter is the system one at the pinned minor version,
+# the libraries the apps import actually import, every launcher and unit
+# points at it, and no private venv survived the migration.
+_MV=/opt/maze/venv
+if ! pkg_installed maze-python; then
+    fail "maze-python is not installed — every Python Maze app (guard/cloak/haze/hazedrop/qlam) is missing its interpreter"
+else
+    pass "maze-python $(pacman -Q maze-python | awk '{print $2}') installed"
+    if [[ -x "${_MV}/bin/python3" ]]; then
+        _vpy="$("${_MV}/bin/python3" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null)"
+        _spy="$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null)"
+        [[ -n "${_vpy}" ]] && pass "${_MV}/bin/python3 runs (Python ${_vpy})" || fail "${_MV}/bin/python3 exists but cannot run — the venv is broken"
+        _vcfg="$(sed -n 's/^version *= *//p' "${_MV}/pyvenv.cfg" 2>/dev/null)"
+        if [[ "${_vcfg%.*}" == "${_spy%.*}" ]]; then pass "venv built for Python ${_vcfg%.*}, system Python is ${_spy} (same minor — site-packages match)"
+        else fail "venv built for Python ${_vcfg}, system Python is ${_spy} — rebuild/upgrade maze-python or nothing imports"; fi
+        grep -q '^include-system-site-packages *= *false' "${_MV}/pyvenv.cfg" 2>/dev/null && pass "venv is isolated from the system site-packages (one PyQt6, not two)" || warn "venv sees the system site-packages — two copies of Qt/PyQt6 can shadow each other"
+        # The libraries the apps actually import, in one interpreter start.
+        _imp="$("${_MV}/bin/python3" - 2>&1 <<'PY'
+import importlib, sys
+mods = {"PyQt6.QtWidgets":"guard/cloak/haze/hazedrop/qlam", "scapy":"guard", "httpx":"guard",
+        "qasync":"guard/hazedrop", "cryptography":"guard/haze/hazedrop", "dbus":"guard (NetworkManager)",
+        "stem":"haze/hazedrop", "aiohttp":"haze/hazedrop", "python_socks":"haze/hazedrop",
+        "sounddevice":"haze", "numpy":"haze", "qrcode":"haze/hazedrop", "argon2":"hazedrop",
+        "qtawesome":"qlam", "pyclamd":"qlam", "watchdog":"qlam"}
+bad = []
+for m, who in mods.items():
+    try: importlib.import_module(m)
+    except Exception as e: bad.append(f"{m} ({who}): {type(e).__name__}: {e}")
+print("\n".join(bad))
+PY
+)"
+        if [[ -z "${_imp}" ]]; then pass "all 16 app libraries import from the shared venv"
+        else fail "libraries missing/broken in the shared venv:"; sed 's/^/         | /' <<<"${_imp}"; fi
+        _qt="$("${_MV}/bin/python3" -c 'from PyQt6.QtCore import QT_VERSION_STR, PYQT_VERSION_STR; print(PYQT_VERSION_STR, "on Qt", QT_VERSION_STR)' 2>/dev/null)"
+        [[ -n "${_qt}" ]] && info "PyQt6 ${_qt}"
+    else
+        fail "${_MV}/bin/python3 missing although maze-python is installed"
+    fi
+    # Launchers and units must all use the shared interpreter.
+    for _l in /usr/bin/maze-guard /usr/bin/maze-cloak /usr/bin/haze /usr/bin/hazedrop /usr/bin/qlam /usr/bin/sentinai; do
+        [[ -e "${_l}" ]] || continue
+        if grep -q "${_MV}/bin/python" "${_l}" 2>/dev/null; then pass "$(basename "${_l}") launcher uses ${_MV}"
+        else fail "$(basename "${_l}") launcher does not use ${_MV}: $(grep -m1 '^exec' "${_l}" 2>/dev/null)"; fi
+    done
+    for _u in maze-guard maze-cloak; do
+        [[ -f "/usr/lib/systemd/system/${_u}.service" ]] || continue
+        _es="$(systemctl show -p ExecStart --value "${_u}.service" 2>/dev/null | grep -o 'path=[^ ;]*' | head -1 | cut -d= -f2)"
+        if [[ "${_es}" == "${_MV}/bin/python3" ]]; then pass "${_u}.service ExecStart uses ${_MV}"
+        elif [[ -z "${_es}" ]]; then warn "${_u}.service: could not read ExecStart"
+        else fail "${_u}.service ExecStart is ${_es}, not ${_MV}/bin/python3 (stale unit? daemon-reload?)"; fi
+        if systemctl is-active --quiet "${_u}.service"; then
+            _pid="$(systemctl show -p MainPID --value "${_u}.service")"
+            _exe="$(readlink -f "/proc/${_pid}/exe" 2>/dev/null)"
+            [[ "${_exe}" == /usr/bin/python3* ]] && pass "${_u}.service running (PID ${_pid}) on the system interpreter via the venv" || info "${_u}.service PID ${_pid} exe=${_exe:-?}"
+        fi
+    done
+    # Migration residue: private venvs that predate maze-python.
+    _left=()
+    for _d in /opt/maze-guard/venv /opt/maze-cloak/venv /opt/haze/venv /opt/hazedrop/bin/python /usr/share/qlam/venv /opt/sentinai/.venv; do
+        [[ -e "${_d}" ]] && _left+=("${_d}")
+    done
+    if [[ ${#_left[@]} -eq 0 ]]; then pass "no private per-app venv left behind"
+    else warn "old per-app venvs still on disk (dead weight, nothing uses them): ${_left[*]}"; fi
+    # Runtime pycache under a pacman-owned tree is expected; anything else
+    # untracked there means someone pip-installed into the shared venv by hand.
+    _stray="$(find "${_MV}/lib" -maxdepth 3 -path '*site-packages/*' ! -name __pycache__ 2>/dev/null | xargs -r pacman -Qo 2>&1 >/dev/null | sed -n 's/^error: No package owns //p' | head -5)"
+    [[ -z "${_stray}" ]] && pass "no hand-installed packages in the shared venv (everything is pacman-owned)" || { warn "untracked entries in the shared venv (pip install by hand? they vanish on the next maze-python upgrade):"; sed 's/^/         | /' <<<"${_stray}"; }
+fi
+
+section "19. Deep: sandboxing and device policy"
+if pkg_installed usbguard; then
+    _ue="$(systemctl is-enabled usbguard 2>/dev/null)"
+    _rules="$(grep -cvE '^\s*(#|$)' /etc/usbguard/rules.conf 2>/dev/null || echo 0)"
+    _ipt="$(grep -E '^ImplicitPolicyTarget' /etc/usbguard/usbguard-daemon.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ')"
+    info "usbguard: ${_ue:-absent}, rules.conf lines: ${_rules}, ImplicitPolicyTarget=${_ipt:-?}"
+    if [[ "${_ue}" == "enabled" && "${_rules}" -eq 0 && "${_ipt}" == "block" ]]; then fail "usbguard is enabled with an EMPTY policy and ImplicitPolicyTarget=block — every USB device (keyboard included) gets blocked at next boot" "maze-guardd writes rules.conf from generate-policy before enabling; something enabled it without that. Fix: sudo usbguard generate-policy > /etc/usbguard/rules.conf"
+    elif [[ "${_ue}" == "enabled" ]]; then pass "usbguard enabled with ${_rules} rules (kill switch active)"
+    else pass "usbguard off (kill switch not engaged) — policy generated on demand by maze-guardd"; fi
+fi
+if pkg_installed firejail; then
+    _fc="$(find /usr/local/bin -maxdepth 1 -lname '*firejail*' 2>/dev/null | wc -l)"
+    [[ "${_fc}" -gt 0 ]] && info "firejail: ${_fc} firecfg symlinks in /usr/local/bin (sandboxed launchers)" || info "firejail installed (maze-meta: 'application sandbox') but nothing is sandboxed — no firecfg symlinks, no Maze profiles. Decide: firecfg selected apps (browser, office, chat) or drop the dependency."
+fi
+if has aa-status; then
+    _unc="$(aa-status --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); p=d.get("processes",{}); print(len([1 for k,v in p.items() for e in v if e.get("status")=="unconfined"]))' 2>/dev/null || echo '?')"
+    info "AppArmor: $(aa-status 2>/dev/null | grep -m1 'profiles are loaded'); unconfined processes with a profile available: ${_unc}"
+    _mz="$(ls /etc/apparmor.d/ 2>/dev/null | grep -ciE 'maze|entropy|qlam|haze')"; [[ "${_mz}" -gt 0 ]] && pass "AppArmor profiles for Maze apps: ${_mz}" || info "no AppArmor profiles for any Maze app (only distro profiles: firefox, torbrowser, ...) — future work"
+fi
+if has opensnitchd; then
+    _mode="$(python3 -c 'import json; print(json.load(open("/etc/opensnitchd/default-config.json"))["DefaultAction"])' 2>/dev/null)"
+    info "opensnitch DefaultAction=${_mode:-?} (deploy ships allow = passive mode; user switches to deny in the UI)"
+    _pm="$(python3 -c 'import json; print(json.load(open("/etc/opensnitchd/default-config.json"))["ProcMonitorMethod"])' 2>/dev/null)"; info "opensnitch ProcMonitorMethod=${_pm:-?}"
+    journalctl -b -u opensnitchd -q --no-pager 2>/dev/null | grep -iE 'error|fail' | grep -v 'no such' | tail -3 | sed 's/^/         | /'
+fi
+
+section "20. Deep: ESP contents and previous boot"
+if [[ -n "${ESP:-}" ]]; then
+    show "find ${ESP} -type f -printf '%10s  %TY-%Tm-%Td  %p\n' | sort -k3" 30
+    _stray="$(find "${ESP}" -type f ! -path "*/EFI/BOOT/*" ! -path "*/EFI/Linux/*" ! -path "*/EFI/maze-recovery/*" ! -path "*/EFI/systemd/*" ! -path "*/loader/*" ! -name 'MOK.cer' 2>/dev/null)"
+    [[ -n "${_stray}" ]] && info "files on the ESP outside the known layout: $(tr '\n' ' ' <<<"${_stray}")" || pass "ESP holds only the known layout"
+    _du="$(du -sh "${ESP}/EFI/Linux" 2>/dev/null | cut -f1)"; info "EFI/Linux (UKIs): ${_du}"
+fi
+_pb="$(journalctl -b -1 -q --no-pager -o cat 2>/dev/null | grep -cE 'Unmounting /(var|home|boot)|Reached target.*Unmount')"
+if journalctl -b -1 -q >/dev/null 2>&1; then
+    [[ "${_pb}" -gt 0 ]] && pass "previous boot ended with a clean shutdown (filesystems unmounted)" || warn "previous boot shows no unmount lines — crash or forced power-off?"
+    _pe="$(journalctl -b -1 -p err -q --no-pager 2>/dev/null | grep -vE 'TDX not supported|multicast RX registrations|gkr-pam|Bluetooth: hci0: (Hardware error|Exception)' | wc -l)"
+    [[ "${_pe}" -eq 0 ]] && pass "previous boot: no error-priority lines beyond the known-harmless set" || { info "previous boot: ${_pe} error lines:"; show "journalctl -b -1 -p err -q --no-pager -o short | grep -vE 'TDX not supported|multicast RX|gkr-pam|Bluetooth: hci0' | tail -8" 8; }
+fi
+_susp="$(journalctl -b -q --no-pager 2>/dev/null | grep -cE 'PM: suspend entry')"; _fail="$(journalctl -b -q --no-pager 2>/dev/null | grep -ciE 'PM: Some devices failed to suspend|Failed to suspend')"
+info "suspend cycles this boot: ${_susp}, failed: ${_fail}"
+
+if [[ "${LYNIS}" -eq 1 ]] && has lynis; then
+    section "21. lynis audit system (quick)"
+    lynis audit system --quick --no-colors --quiet 2>/dev/null | grep -vE '^\s*$' | tail -40 | sed 's/^/         | /'
+    info "full log: /var/log/lynis.log, report: /var/log/lynis-report.dat"
+    _hi="$(grep -m1 'hardening_index=' /var/log/lynis-report.dat 2>/dev/null | cut -d= -f2)"; [[ -n "${_hi}" ]] && info "lynis hardening index: ${_hi}"
+    _wn="$(grep -c '^warning\[\]=' /var/log/lynis-report.dat 2>/dev/null)"; _sg="$(grep -c '^suggestion\[\]=' /var/log/lynis-report.dat 2>/dev/null)"; info "lynis: ${_wn} warnings, ${_sg} suggestions"
+    grep '^warning\[\]=' /var/log/lynis-report.dat 2>/dev/null | cut -d= -f2 | sed 's/^/         | /'
+fi
+fi
+
+# ======================================================== 22. maze tools =====
+if [[ "${RUN_DOCTOR}" -eq 1 ]]; then
+    section "22. maze-boot-check --no-flag"
+    if [[ -x /usr/bin/maze-boot-check ]]; then
+        if /usr/bin/maze-boot-check --no-flag 2>&1 | sed 's/^/         | /'; then pass "maze-boot-check: chain is sound"; else fail "maze-boot-check reports a problem"; fi
+    fi
+    section "23. maze-doctor --no-color$([[ "${DEEP}" -eq 1 ]] && echo ' --deep')"
+    if [[ -x /usr/local/bin/maze-doctor ]]; then
+        _dout="$(/usr/local/bin/maze-doctor --no-color $([[ "${DEEP}" -eq 1 ]] && echo --deep) 2>&1)"
+        sed 's/^/         | /' <<<"${_dout}"
+        _df="$(grep -cE '^\s*\[FAIL\]' <<<"${_dout}")"; _dw="$(grep -cE '^\s*\[WARN\]' <<<"${_dout}")"
+        [[ "${_df}" -eq 0 ]] && pass "maze-doctor: 0 FAIL, ${_dw} WARN" || fail "maze-doctor: ${_df} FAIL, ${_dw} WARN"
+    fi
+fi
+
+# =============================================================== summary =====
+section "Summary"
+printf '  %sPASS %d%s   %sWARN %d%s   %sFAIL %d%s   info %d\n' "${C_G}" "${N_PASS}" "${C_0}" "${C_Y}" "${N_WARN}" "${C_0}" "${C_R}" "${N_FAIL}" "${C_0}" "${N_INFO}"
+[[ -n "${FAILS}" ]] && { printf '\n  %sFAILURES:%s\n%s' "${C_R}" "${C_0}" "${FAILS}"; }
+[[ -n "${WARNS}" ]] && { printf '\n  %sWARNINGS:%s\n%s' "${C_Y}" "${C_0}" "${WARNS}"; }
+printf '\nreport written to %s\n' "${OUT}"
+[[ "${N_FAIL}" -eq 0 ]]

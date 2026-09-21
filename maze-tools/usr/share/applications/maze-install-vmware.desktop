@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Install VMware Workstation
+GenericName=VMware Installer
+Comment=Download and install VMware Workstation from the AUR (needs internet)
+Exec=konsole -e /usr/local/bin/maze-install-vmware
+Icon=vmware-workstation
+Terminal=false
+Categories=System;
+Keywords=vmware;workstation;virtualization;vm;

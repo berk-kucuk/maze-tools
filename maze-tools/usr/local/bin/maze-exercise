@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+#
+# maze-exercise — put an installed Maze machine through the paths that only a
+# REAL run can prove, then audit the result. Shipped in maze-tools (as of
+# 1.1.0-37); in the source tree it is MazeLinux/tools/exercise-installed-system.sh.
+#
+# maze-audit reads state. This script CHANGES state, on purpose,
+# in the least risky way that still exercises each mechanism end to end, and
+# checks afterwards that every layer did its job:
+#
+#   1. Kernel-update path — reinstall the RECOVERY kernel (linux-lts). That
+#      fires the whole chain a real `pacman -Syu linux` would:
+#        85-maze-kernel-install.hook -> kernel-install add -> ukify (UKI)
+#          -> 95-maze-sb-sign.install -> maze-sb-sign (sign, recovery entry)
+#        zz-maze-secureboot.hook   -> maze-sb-sign (re-sign, prune)
+#        zzz-maze-boot-verify.hook -> maze-boot-check --quiet
+#        snap-pac pre/post snapshots, DKMS rebuild for the LTS kernel
+#      The PRIMARY boot image is only re-signed from the same UKI, never
+#      replaced, so this cannot make the machine unbootable; the LTS image
+#      it rebuilds is the fallback, and the fallback is exactly what a
+#      broken update path would leave you needing.
+#   2. Service resilience — restart the Maze daemons and check they come back
+#      with their sockets, status files and MAC randomisation intact.
+#   3. Read-only runs of the recovery tooling (maze-rollback list,
+#      maze-boot-entries list, maze-boot-check).
+#   4. Optional suspend/resume cycle (--suspend), verified from the journal:
+#      entry/exit lines, device failures, network back, time taken.
+#   5. maze-audit --deep at the end (unless --no-audit).
+#
+# Usage:
+#   sudo maze-exercise [--yes] [--suspend] [--no-kernel] [--no-audit] [--lynis] [--no-color]
+#
+# Exit code: 0 = every exercised path behaved, 1 = something did not.
+
+set -u
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+AUDIT="${SCRIPT_DIR}/maze-audit"; [[ -x "${AUDIT}" ]] || AUDIT="$(command -v maze-audit 2>/dev/null || true)"
+YES=0; SUSPEND=0; KERNEL=1; AUDIT_RUN=1; LYNIS=0; COLOR=1
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --yes|-y) YES=1 ;;
+        --suspend) SUSPEND=1 ;;
+        --no-kernel) KERNEL=0 ;;
+        --no-audit) AUDIT_RUN=0 ;;
+        --lynis) LYNIS=1 ;;
+        --no-color) COLOR=0 ;;
+        -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac; shift
+done
+[[ -t 1 ]] || COLOR=0
+[[ "$(id -u)" -eq 0 ]] || { echo "run as root (sudo)" >&2; exit 2; }
+
+OUT="/var/tmp/maze-exercise-$(date +%Y%m%d-%H%M%S).txt"
+exec > >(tee -a "${OUT}") 2>&1
+
+if [[ "${COLOR}" -eq 1 ]]; then C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[34m'; C_C=$'\e[36m'; C_0=$'\e[0m'; C_BOLD=$'\e[1m'; else C_R=; C_G=; C_Y=; C_B=; C_C=; C_0=; C_BOLD=; fi
+N_PASS=0; N_WARN=0; N_FAIL=0; FAILS=""; WARNS=""; CUR=""
+section() { CUR="$1"; printf '\n%s%s== %s ==%s\n' "${C_BOLD}" "${C_B}" "$1" "${C_0}"; }
+pass() { N_PASS=$((N_PASS+1)); printf '  %s[ OK ]%s %s\n' "${C_G}" "${C_0}" "$1"; }
+info() { printf '  %s[info]%s %s\n' "${C_C}" "${C_0}" "$1"; }
+warn() { N_WARN=$((N_WARN+1)); printf '  %s[WARN]%s %s\n' "${C_Y}" "${C_0}" "$1"; [[ -n "${2:-}" ]] && printf '         %s\n' "$2"; WARNS="${WARNS}  - [${CUR}] $1"$'\n'; }
+fail() { N_FAIL=$((N_FAIL+1)); printf '  %s[FAIL]%s %s\n' "${C_R}" "${C_0}" "$1"; [[ -n "${2:-}" ]] && printf '         %s\n' "$2"; FAILS="${FAILS}  - [${CUR}] $1"$'\n'; }
+detail() { printf '         %s\n' "$1"; }
+show() { eval "$1" 2>&1 | head -n "${2:-20}" | sed 's/^/         | /'; }
+has() { command -v "$1" >/dev/null 2>&1; }
+confirm() {
+    [[ "${YES}" -eq 1 ]] && return 0
+    printf '  %s?%s %s [y/N] ' "${C_Y}" "${C_0}" "$1"; read -r a </dev/tty; [[ "$a" == y || "$a" == Y ]]
+}
+uname_of() { objcopy -O binary --only-section=.uname "$1" /dev/stdout 2>/dev/null | tr -d '\0[:space:]'; }
+
+printf '%sMaze Linux — installed-system exercise%s\n' "${C_BOLD}" "${C_0}"
+printf 'date: %s   host: %s   report: %s\n' "$(date -Is)" "$(cat /etc/hostname 2>/dev/null)" "${OUT}"
+
+ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+[[ -z "${ESP}" || ! -d "${ESP}/EFI" ]] && { for c in /boot /efi; do [[ -d "$c/EFI" ]] && ESP="$c"; done; }
+[[ -n "${ESP}" ]] || { echo "no ESP found" >&2; exit 2; }
+KEYDIR=/var/lib/maze-secureboot; CRT="${KEYDIR}/MOK.crt"
+GRUB="${ESP}/EFI/BOOT/grubx64.efi"; RGRUB="${ESP}/EFI/maze-recovery/grubx64.efi"
+MID="$(cat /etc/machine-id)"
+RUNNING="$(uname -r)"
+
+# ============================================================ preflight ======
+section "0. Preflight — is it safe to exercise this machine?"
+[[ -e /var/lib/maze/boot-unsafe ]] && { fail "boot-unsafe flag is raised — fix the chain first (sudo maze-boot-check --repair)"; exit 1; }
+if /usr/bin/maze-boot-check --no-flag --quiet >/dev/null 2>&1; then pass "maze-boot-check: chain sound before we start"; else fail "maze-boot-check fails before we start — not exercising a broken chain"; exit 1; fi
+_gk="$(uname_of "${GRUB}")"; [[ "${_gk}" == "${RUNNING}" ]] && pass "primary image carries the running kernel (${RUNNING})" || warn "primary image carries ${_gk}, running ${RUNNING} (reboot pending?)"
+LTS_KVER="$(for d in /usr/lib/modules/*/; do [[ -f "${d}pkgbase" && "$(cat "${d}pkgbase")" == "linux-lts" ]] && basename "$d"; done | sort -V | tail -1)"
+[[ -n "${LTS_KVER}" ]] && pass "recovery kernel installed: linux-lts ${LTS_KVER}" || { warn "no linux-lts — kernel-update rehearsal skipped"; KERNEL=0; }
+[[ "${LTS_KVER}" == "${RUNNING}" ]] && { warn "you are RUNNING the LTS kernel — reinstalling it would rebuild the primary image; rehearsal skipped"; KERNEL=0; }
+_free="$(df --output=avail -m "${ESP}" | tail -1 | tr -d ' ')"; [[ "${_free}" -gt 300 ]] && pass "ESP free: ${_free} MB" || { warn "ESP has only ${_free} MB free — rehearsal skipped"; KERNEL=0; }
+if [[ "${KERNEL}" -eq 1 ]]; then
+    if getent hosts archlinux.org >/dev/null 2>&1 && ping -c1 -W3 archlinux.org >/dev/null 2>&1; then pass "network + DNS reachable (pacman needs a mirror)"
+    elif ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then warn "IP connectivity but NO DNS (archlinux.org does not resolve) — pacman cannot reach a mirror; rehearsal skipped" "resolvectl status; nmcli con up <connection>"; KERNEL=0
+    else warn "no network — rehearsal needs a mirror; skipped"; KERNEL=0; fi
+fi
+pacman -Qkk linux-lts 2>/dev/null | tail -1 | sed 's/^/         | /'
+_snap_before="$(snapper -c root list 2>/dev/null | tail -n +4 | grep -c .)"; info "snapper snapshots before: ${_snap_before}"
+
+# ==================================================== 1. kernel-update path ==
+if [[ "${KERNEL}" -eq 1 ]]; then
+section "1. Kernel-update path — reinstall linux-lts and watch every hook"
+info "this rebuilds the LTS UKI, its recovery copy, re-signs everything and runs boot-check — the primary image is not replaced"
+if confirm "Reinstall linux-lts ${LTS_KVER} now?"; then
+    _uki_lts="${ESP}/EFI/Linux/${MID}-${LTS_KVER}.efi"
+    _m_lts_before="$(stat -c %Y "${_uki_lts}" 2>/dev/null || echo 0)"
+    _m_rec_before="$(stat -c %Y "${RGRUB}" 2>/dev/null || echo 0)"
+    _sha_grub_before="$(sha256sum "${GRUB}" | cut -c1-16)"
+    _plog_lines="$(wc -l < /var/log/pacman.log)"
+    _t0="$(date +%s)"
+    _cached="$(ls -t /var/cache/pacman/pkg/linux-lts-"$(pacman -Q linux-lts | cut -d' ' -f2)"-x86_64.pkg.tar.zst 2>/dev/null | head -1)"
+    if [[ -n "${_cached}" ]]; then
+        info "using cached package ${_cached} (offline, same version)"
+        pacman -U --noconfirm "${_cached}" 2>&1 | sed 's/^/         | /'
+        _rc=${PIPESTATUS[0]}
+    else
+        info "no cached package — pacman -Sy linux-lts linux-lts-headers (may also UPGRADE them, which is an even better test)"
+        pacman -Sy --noconfirm linux-lts linux-lts-headers 2>&1 | sed 's/^/         | /'
+        _rc=${PIPESTATUS[0]}
+    fi
+    _t1="$(date +%s)"
+    [[ "${_rc}" -eq 0 ]] && pass "pacman finished (rc=0) in $((_t1-_t0)) s" || fail "pacman returned ${_rc}"
+    LTS_KVER="$(for d in /usr/lib/modules/*/; do [[ -f "${d}pkgbase" && "$(cat "${d}pkgbase")" == "linux-lts" ]] && basename "$d"; done | sort -V | tail -1)"
+    _uki_lts="${ESP}/EFI/Linux/${MID}-${LTS_KVER}.efi"
+    # --- what did the hooks log?
+    _plog="$(tail -n +"$((_plog_lines+1))" /var/log/pacman.log)"
+    for h in 85-maze-kernel-install zz-maze-secureboot zzz-maze-boot-verify 05-snap-pac-pre zz-snap-pac-post; do
+        grep -q "running '${h}.hook'" <<<"${_plog}" && pass "hook ran: ${h}" || fail "hook did NOT run: ${h}"
+    done
+    grep -q 'dkms' <<<"${_plog}" && { grep -qiE 'dkms.*(error|fail)' <<<"${_plog}" && fail "DKMS reported errors" || pass "DKMS hook ran without errors"; }
+    grep -qiE 'error|warning: .*maze' <<<"${_plog}" && { warn "pacman.log has error/warning lines from this transaction:"; grep -iE 'error|warning' <<<"${_plog}" | head -6 | sed 's/^/         | /'; }
+    # --- journal lines from the signer
+    _j="$(journalctl --since "@${_t0}" -q --no-pager -o cat 2>/dev/null | grep -E 'maze-sb-sign|maze-boot-check|kernel-install')"
+    grep -q 'maze-sb-sign: SIGNED' <<<"${_j}" && pass "maze-sb-sign signed at least one image" || info "no 'SIGNED' line in the journal (hook output may go to pacman's stdout only)"
+    # --- artefacts
+    if [[ -f "${_uki_lts}" ]]; then
+        _m_lts_after="$(stat -c %Y "${_uki_lts}")"
+        [[ "${_m_lts_after}" -gt "${_m_lts_before}" ]] && pass "LTS UKI rebuilt ($(date -d @"${_m_lts_after}" +%T), $(du -h "${_uki_lts}" | cut -f1))" || fail "LTS UKI was NOT rebuilt (mtime unchanged)"
+        [[ "$(uname_of "${_uki_lts}")" == "${LTS_KVER}" ]] && pass "LTS UKI .uname = ${LTS_KVER}" || fail "LTS UKI .uname is $(uname_of "${_uki_lts}")"
+        sbverify --cert "${CRT}" "${_uki_lts}" >/dev/null 2>&1 && pass "LTS UKI signed with the machine MOK" || fail "LTS UKI NOT signed with the machine MOK"
+        _tmp="$(mktemp -d)"; objcopy -O binary --only-section=.initrd "${_uki_lts}" "${_tmp}/i.img" 2>/dev/null
+        _l="$(lsinitcpio "${_tmp}/i.img" 2>/dev/null)"; rm -rf "${_tmp}"
+        if grep -q 'cryptdevice=' /proc/cmdline; then grep -q 'hooks/encrypt' <<<"${_l}" && pass "LTS initrd has hooks/encrypt" || fail "LTS initrd LACKS hooks/encrypt — this image could not unlock the disk"; else info "root not LUKS — encrypt hook not required"; fi
+        grep -qE "modules/${LTS_KVER}/.*wl\.ko" <<<"${_l}" && info "wl.ko is inside the LTS initrd (autodetect saw it loaded?)" || pass "wl.ko not in the LTS initrd"
+    else fail "LTS UKI missing after reinstall: ${_uki_lts}"; fi
+    if [[ -f "${RGRUB}" ]]; then
+        _m_rec_after="$(stat -c %Y "${RGRUB}")"
+        [[ "${_m_rec_after}" -ge "${_m_lts_before}" ]] && pass "recovery image refreshed ($(date -d @"${_m_rec_after}" +%T))" || warn "recovery image mtime not updated"
+        [[ "$(uname_of "${RGRUB}")" == "${LTS_KVER}" ]] && pass "recovery image carries ${LTS_KVER}" || fail "recovery image carries $(uname_of "${RGRUB}")"
+        sbverify --cert "${CRT}" "${RGRUB}" >/dev/null 2>&1 && pass "recovery image signed" || fail "recovery image NOT signed"
+        cmp -s "${ESP}/EFI/maze-recovery/BOOTX64.EFI" "${KEYDIR}/shimx64.efi" && pass "recovery shim intact" || warn "recovery shim differs from the stored shim"
+    else fail "recovery image missing after reinstall"; fi
+    _sha_grub_after="$(sha256sum "${GRUB}" | cut -c1-16)"
+    [[ "$(uname_of "${GRUB}")" == "${RUNNING}" ]] && pass "primary image still carries the running kernel ${RUNNING}" || fail "PRIMARY IMAGE CHANGED KERNEL to $(uname_of "${GRUB}")"
+    sbverify --cert "${CRT}" "${GRUB}" >/dev/null 2>&1 && pass "primary image still verifies" || fail "primary image no longer verifies — DO NOT REBOOT; run: maze-sb-sign ${ESP} --force-bootloader"
+    [[ "${_sha_grub_before}" == "${_sha_grub_after}" ]] && info "primary image bytes unchanged" || info "primary image re-signed (bytes changed, kernel same) — expected from zz-maze-secureboot"
+    cmp -s "${ESP}/EFI/BOOT/BOOTX64.EFI" "${KEYDIR}/shimx64.efi" && pass "primary shim intact" || fail "primary shim was replaced!"
+    efibootmgr 2>/dev/null | grep -q 'Maze Linux (recovery kernel)' && pass "recovery NVRAM entry present" || warn "recovery NVRAM entry missing"
+    _nm="$(efibootmgr -v 2>/dev/null | grep -cE '^Boot[0-9A-F]{4}\*? +Maze Linux[[:space:]]+HD\(')"; [[ "${_nm}" -eq 1 ]] && pass "exactly one 'Maze Linux' NVRAM entry" || warn "${_nm} 'Maze Linux' NVRAM entries"
+    has dkms && { dkms status 2>/dev/null | grep "${LTS_KVER}" | grep -q installed && pass "DKMS modules installed for ${LTS_KVER}" || warn "DKMS status for ${LTS_KVER}: $(dkms status 2>/dev/null | grep "${LTS_KVER}" | tr '\n' ' ')"; }
+    [[ -e /var/lib/maze/boot-unsafe ]] && fail "boot-unsafe flag raised by zzz-maze-boot-verify:" && head -5 /var/lib/maze/boot-unsafe | sed 's/^/         | /' || pass "no boot-unsafe flag after the transaction"
+    /usr/bin/maze-boot-check --no-flag --quiet >/dev/null 2>&1 && pass "maze-boot-check: chain sound after the transaction" || { fail "maze-boot-check FAILS after the transaction:"; show "/usr/bin/maze-boot-check --no-flag" 25; }
+    _snap_after="$(snapper -c root list 2>/dev/null | tail -n +4 | grep -c .)"
+    [[ "${_snap_after}" -ge $((_snap_before+2)) ]] && pass "snap-pac created pre+post snapshots (${_snap_before} -> ${_snap_after})" || warn "snapshot count ${_snap_before} -> ${_snap_after} (expected +2)"
+    _free2="$(df --output=avail -m "${ESP}" | tail -1 | tr -d ' ')"; info "ESP free after: ${_free2} MB (was ${_free})"
+    _stale="$(for u in "${ESP}"/EFI/Linux/*.efi; do k="$(uname_of "$u")"; [[ -n "$k" && ! -d "/usr/lib/modules/$k" ]] && echo "$u"; done)"
+    [[ -z "${_stale}" ]] && pass "no stale UKIs left on the ESP" || warn "stale UKIs: ${_stale}"
+    # path unit: did maze-sb-resign.path fire on top (it watches EFI/Linux)?
+    journalctl --since "@${_t0}" -u maze-sb-resign.service -q --no-pager -o cat 2>/dev/null | grep -q . && info "maze-sb-resign.service also fired (path unit saw the new UKI) — expected, serialised by flock" || info "maze-sb-resign.service did not fire separately (hook signed first)"
+else info "skipped by user"; fi
+fi
+
+# ============================================================ 2. services ===
+section "2. Service resilience — restart the Maze daemons"
+for u in maze-guardd maze-cloak maze-sentinel; do
+    systemctl is-active --quiet "$u" || { warn "$u not active before restart"; continue; }
+    _t="$(date +%s)"
+    if systemctl restart "$u" 2>/dev/null; then
+        sleep 2
+        systemctl is-active --quiet "$u" && pass "$u restarted and active" || fail "$u did not come back after restart"
+        journalctl -u "$u" --since "@${_t}" -p warning -q --no-pager -o cat 2>/dev/null | head -3 | sed 's/^/         | /'
+    else fail "systemctl restart $u failed"; fi
+done
+sleep 1
+[[ -S /run/maze/guard.sock ]] && pass "guard.sock recreated ($(stat -c '%U:%G %a' /run/maze/guard.sock))" || fail "guard.sock missing after restart"
+[[ -S /run/maze/maze.sock ]] && pass "maze.sock present ($(stat -c '%U:%G %a' /run/maze/maze.sock))" || info "maze.sock not present (maze-guard helper not running)"
+[[ -f /run/maze/status/maze-cloak.json ]] && { grep -q '"running": *true' /run/maze/status/maze-cloak.json && pass "maze-cloak republished its status (running)" || warn "maze-cloak status says not running"; } || warn "maze-cloak status file missing after restart"
+for i in $(ls /sys/class/net | grep -vE '^(lo|p2p|tun|wg|docker|virbr|veth)'); do
+    a="$(cat /sys/class/net/$i/address)"; p="$(ethtool -P "$i" 2>/dev/null | awk '{print $3}')"
+    [[ -n "$p" && "$p" != "00:00:00:00:00:00" ]] && { [[ "$a" != "$p" ]] && pass "$i MAC randomised ($a ≠ permanent)" || info "$i using permanent MAC (no connection yet, or excluded)"; }
+done
+[[ -f /etc/NetworkManager/conf.d/99-maze-cloak.conf ]] && pass "maze-cloak NM drop-in present" || info "maze-cloak NM drop-in absent (randomisation off, or no eligible interface — see journalctl -u maze-cloak)"
+# resolved after the hardening drop-in
+systemctl restart systemd-resolved && sleep 1 && resolvectl status 2>/dev/null | awk '/^Global/{g=1} g && /Protocols:/{print; exit}' | grep -q -- '-mDNS' && pass "resolved restarts with mDNS/LLMNR off" || warn "resolved: mDNS/LLMNR not off after restart"
+nmcli -t -f DEVICE,STATE dev 2>/dev/null | grep -qE ':connected' && pass "network still connected: $(nmcli -t -f DEVICE,STATE dev | grep ':connected' | cut -d: -f1 | tr '\n' ' ')" || warn "no connected device after restarts"
+
+# ====================================================== 3. recovery tools ===
+section "3. Recovery tooling, read-only"
+show "/usr/bin/maze-boot-entries 2>&1" 30
+show "/usr/bin/maze-rollback 2>&1" 25
+_rb_rc=$?; info "maze-rollback list exit: ${_rb_rc}"
+[[ -f "${GRUB}.maze-prev" ]] && info "rollback copy: grubx64.efi.maze-prev ($(cat "${GRUB}.maze-prev.kver" 2>/dev/null))" || info "no .maze-prev yet (created on the first real kernel version change)"
+[[ -r /etc/maze/kernel-default ]] && info "kernel pin: $(cat /etc/maze/kernel-default)" || info "no kernel pin (newest kernel boots)"
+
+# =========================================================== 4. suspend ====
+if [[ "${SUSPEND}" -eq 1 ]]; then
+section "4. Suspend / resume"
+info "the machine will suspend now; wake it with the power key or lid. Timing and errors are read from the journal afterwards."
+if confirm "Suspend now?"; then
+    _t="$(date +%s)"
+    systemctl suspend
+    sleep 8   # give the kernel time to actually enter S3 before we look
+    # we resume here
+    for _w in 1 2 3 4 5; do journalctl --since "@${_t}" -k -q -o cat 2>/dev/null | grep -q 'PM: suspend exit' && break; sleep 2; done
+    _k="$(journalctl --since "@${_t}" -k -q --no-pager -o short 2>/dev/null)"
+    grep -q 'PM: suspend entry' <<<"${_k}" && pass "kernel entered suspend" || fail "no 'PM: suspend entry' — did not suspend"
+    grep -q 'PM: suspend exit' <<<"${_k}" && pass "kernel resumed" || fail "no 'PM: suspend exit'"
+    _st="$(grep -m1 'PM: suspend entry' <<<"${_k}" | cut -c1-15)"; _ex="$(grep -m1 'PM: suspend exit' <<<"${_k}" | cut -c1-15)"; info "entry ${_st}  exit ${_ex}"
+    grep -qiE 'failed to suspend|Some devices failed|early wake' <<<"${_k}" && warn "suspend problems in the journal:" && grep -iE 'failed to suspend|Some devices failed|early wake|aborted' <<<"${_k}" | head -4 | sed 's/^/         | /' || pass "no device failed to suspend"
+    grep -qiE 'i915.*(error|reset)|nouveau.*(error|fail)|amdgpu.*(error|fail)' <<<"${_k}" && warn "GPU errors around resume" || pass "no GPU errors around resume"
+    sleep 5
+    nmcli -t -f DEVICE,STATE dev 2>/dev/null | grep -qE ':connected' && pass "network reconnected after resume" || warn "network not reconnected within 5 s of resume"
+    systemctl --failed --no-legend --plain | grep -q . && fail "failed units after resume: $(systemctl --failed --no-legend --plain | awk '{print $1}' | tr '\n' ' ')" || pass "no failed units after resume"
+    [[ -f /run/maze/status/maze-cloak.json ]] && pass "maze-cloak status still published after resume"
+    journalctl --since "@${_t}" -q -p err --no-pager -o short 2>/dev/null | grep -vE 'multicast RX|gkr-pam' | head -5 | sed 's/^/         | /'
+else info "skipped by user"; fi
+else
+    info "suspend test not requested (--suspend)"
+fi
+
+# ============================================================== 5. audit =====
+if [[ "${AUDIT_RUN}" -eq 1 && -n "${AUDIT}" && -x "${AUDIT}" ]]; then
+    section "5. Full audit after exercising (maze-audit --deep)"
+    "${AUDIT}" --deep $([[ "${LYNIS}" -eq 1 ]] && echo --lynis) $([[ "${COLOR}" -eq 0 ]] && echo --no-color) 2>&1 | sed 's/^/   /'
+    _arc=${PIPESTATUS[0]}
+    [[ "${_arc}" -eq 0 ]] && pass "audit: no FAIL" || fail "audit reported FAIL(s) — see above"
+fi
+
+section "Summary"
+printf '  %sPASS %d%s   %sWARN %d%s   %sFAIL %d%s\n' "${C_G}" "${N_PASS}" "${C_0}" "${C_Y}" "${N_WARN}" "${C_0}" "${C_R}" "${N_FAIL}" "${C_0}"
+[[ -n "${FAILS}" ]] && printf '\n  %sFAILURES:%s\n%s' "${C_R}" "${C_0}" "${FAILS}"
+[[ -n "${WARNS}" ]] && printf '\n  %sWARNINGS:%s\n%s' "${C_Y}" "${C_0}" "${WARNS}"
+printf '\nreport written to %s\n' "${OUT}"
+[[ "${N_FAIL}" -eq 0 ]]

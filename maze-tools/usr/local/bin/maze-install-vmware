@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#
+# maze-install-vmware — install VMware Workstation on Maze Linux, on demand.
+#
+# VMware Workstation ships from the AUR (vmware-workstation) and downloads a
+# large vendor bundle at build time, so it can NOT be built reliably during the
+# offline-friendly Calamares install (that is why the installer no longer tries
+# — it failed there every time). Run this once, while online, whenever you want
+# it. It uses paru to build/install the package and its dependencies, enables the
+# host services and loads the kernel modules — everything needed to run VMs.
+#
+set -uo pipefail
+
+if [[ ${EUID} -eq 0 ]]; then
+    echo "Run this as your normal user (NOT root) — paru escalates with sudo itself." >&2
+    exit 1
+fi
+
+if ! command -v paru >/dev/null 2>&1; then
+    echo "paru (AUR helper) not found. Install it first, then re-run this." >&2
+    exit 1
+fi
+
+# vmware-keymaps first, on its own. The AUR vmware-workstation PKGBUILD adds
+# it to depends= at RUN time (inside an `if` on _remove_vmware_keymaps_dependency),
+# which .SRCINFO — and therefore paru's dependency resolution — never sees.
+# paru builds vmware-workstation without it, makepkg then evaluates the
+# PKGBUILD, finds the extra dependency and dies with "Missing dependencies:
+# vmware-keymaps". Seen on a real install, 14 Sep 2026.
+echo ">> Installing vmware-keymaps (AUR; a dependency paru cannot see in vmware-workstation's metadata)..."
+if ! paru -S --needed vmware-keymaps; then
+    echo "!! vmware-keymaps failed to build. Check your internet connection and re-run 'maze-install-vmware'." >&2
+    exit 1
+fi
+echo ">> Installing VMware Workstation + guest tools from the AUR (this downloads a large bundle)..."
+if ! paru -S --needed vmware-workstation open-vm-tools; then
+    echo "!! VMware install failed. Check your internet connection and re-run 'maze-install-vmware'." >&2
+    exit 1
+fi
+
+echo ">> Enabling VMware host services (networking + USB passthrough)..."
+sudo systemctl enable --now vmware-networks.service vmware-usbarbitrator.service 2>/dev/null || true
+# Guest integration services — harmless on bare metal, useful inside a VM.
+sudo systemctl enable --now vmtoolsd.service vmware-vmblock-fuse.service 2>/dev/null || true
+
+echo ">> Loading VMware kernel modules..."
+sudo modprobe -a vmw_vmci vmmon vmnet 2>/dev/null || \
+    echo "   (modules will load on next boot if they were just built)"
+
+echo ""
+echo ">> Done. Launch VMware Workstation from the application menu or run 'vmware'."

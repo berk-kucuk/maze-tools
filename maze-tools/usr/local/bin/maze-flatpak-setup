@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+#
+# maze-flatpak-setup — Register the Flathub remote on the first ONLINE boot.
+#
+# Doing this during the ISO build fails: the build chroot has no initialised
+# CA trust store, so `flatpak remote-add <url>` errors with an SSL CA problem.
+# Running it once at first boot (when the network and CA certs are ready)
+# guarantees Flathub is configured. A stamp file makes this a one-shot.
+#
+set -uo pipefail
+
+STAMP_DIR="/var/lib/maze"
+STAMP="${STAMP_DIR}/flatpak-setup.done"
+
+command -v flatpak >/dev/null 2>&1 || exit 0
+[[ -f "${STAMP}" ]] && exit 0
+
+mkdir -p "${STAMP_DIR}"
+
+# Already registered? Then just stamp and stop. This check reads local flatpak
+# config only — no network — and MUST come first: `remote-add --if-not-exists`
+# does NOT short-circuit on an existing remote, because flatpak downloads the
+# .flatpakrepo file (for the GPG key and URLs) BEFORE it checks. So on a machine
+# that already has Flathub but no DNS yet, remote-add still fails on the fetch,
+# and without this check the unit re-ran and failed on every single boot.
+if flatpak remotes --system --columns=name 2>/dev/null | grep -qx 'flathub'; then
+    touch "${STAMP}"
+    echo "maze-flatpak-setup: Flathub already registered."
+    exit 0
+fi
+
+if flatpak remote-add --system --if-not-exists flathub \
+        https://flathub.org/repo/flathub.flatpakrepo; then
+    touch "${STAMP}"
+    echo "maze-flatpak-setup: Flathub remote registered."
+else
+    # Exit 0, NOT 1. Being offline on this boot is an expected, designed-for state
+    # (the unit has no stamp, so it simply runs again next boot). Exiting non-zero
+    # made systemd mark the unit failed permanently, so a perfectly healthy machine
+    # showed up in `systemctl --failed` — alarming and, on a security distro,
+    # actively misleading.
+    echo "maze-flatpak-setup: could not reach Flathub yet; will retry next boot." >&2
+    exit 0
+fi

@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""mazelinux — the embedded Maze Linux command-line companion.
+
+A small, dependency-light CLI baked into every Maze system. It greets the user,
+reports the live security / privacy / AI posture and prints hardware facts —
+all from the terminal, with no GUI and no network calls. It is the text-mode
+sibling of `maze-welcome` / `maze-control-center` and reuses their shared
+`maze_status` probe library (best-effort; every probe fails soft).
+
+    mazelinux                 # the welcome banner (same as --welcome)
+    mazelinux --welcome       # branded, live-state one-glance summary
+    mazelinux --status        # full security + privacy + AI + system report
+    mazelinux --security      # security services only
+    mazelinux --privacy       # anonymity / network only
+    mazelinux --ai            # local AI (Ollama) only
+    mazelinux --system        # hardware & kernel facts
+    mazelinux --version       # version / codename
+    mazelinux --json          # machine-readable status (with --status/section)
+    mazelinux --help
+
+Colour is auto-disabled when stdout is not a TTY, when NO_COLOR is set, or with
+--no-color. Exit code 0 always for informational output.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import sys
+
+# Shared Maze probe library (also used by the GUI apps). Import is best-effort:
+# the CLI still runs — just with less live detail — if it is ever unavailable.
+sys.path.insert(0, "/usr/local/lib/maze")
+try:
+    import maze_status as ms  # noqa: E402
+except Exception:  # noqa: BLE001
+    ms = None  # type: ignore[assignment]
+
+CODENAME = "Labyrinth"
+WEBSITE = "https://mazelinux.berkkucukk.com.tr"
+
+
+# --- colour ----------------------------------------------------------------
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    GREEN = "\033[38;5;42m"
+    YELLOW = "\033[38;5;221m"
+    RED = "\033[38;5;203m"
+    CYAN = "\033[38;5;80m"
+    GREY = "\033[38;5;245m"
+    ACCENT = "\033[38;5;81m"
+
+
+_USE_COLOR = True
+
+
+def _paint(text: str, *codes: str) -> str:
+    if not _USE_COLOR or not codes:
+        return text
+    return "".join(codes) + text + C.RESET
+
+
+def _init_color(force_off: bool) -> None:
+    global _USE_COLOR
+    _USE_COLOR = (
+        not force_off
+        and "NO_COLOR" not in os.environ
+        and sys.stdout.isatty()
+        and os.environ.get("TERM") not in (None, "", "dumb")
+    )
+
+
+# --- probes (thin wrappers over maze_status, all fail-soft) ----------------
+def _active(unit: str) -> bool | None:
+    return ms.service_active(unit) if ms else None
+
+
+def _arch() -> str:
+    return platform.machine() or "x86_64"
+
+
+def _session() -> str:
+    s = os.environ.get("XDG_SESSION_TYPE", "")
+    return {"wayland": "Wayland", "x11": "X11", "tty": "TTY"}.get(s.lower(), "Wayland")
+
+
+def _mark(state: bool | None) -> str:
+    """Status glyph: ✓ good, ~ partial/unknown, coloured to match."""
+    if state is True:
+        return _paint("✓", C.GREEN, C.BOLD)
+    if state is False:
+        return _paint("✗", C.RED, C.BOLD)
+    return _paint("~", C.YELLOW, C.BOLD)
+
+
+def _dot() -> str:
+    return _paint(" · ", C.GREY)
+
+
+# --- welcome ---------------------------------------------------------------
+def _welcome_lines() -> list[tuple[bool | None, str]]:
+    """(headline_state, text) for the five welcome rows, from live probes."""
+    # Row 1 — identity (always true).
+    ident = (f'{_paint("Maze Linux", C.BOLD)} {_paint(chr(34) + CODENAME + chr(34), C.ACCENT)}'
+             f'{_dot()}Arch-based{_dot()}{_arch()}')
+
+    # Row 2 — desktop (always true on a Maze desktop).
+    desktop = f'KDE Plasma{_dot()}{_session()}{_dot()}SDDM'
+
+    # Row 3 — security services. Tri-state so an unknown probe (e.g. the shared
+    # library missing) reads as "unknown", never a false "inactive".
+    sec = [_active(u) for u in
+           ("apparmor.service", "firewalld.service", "opensnitchd.service")]
+    if all(v is True for v in sec):
+        sec_state, sec_word = True, "active"
+    elif all(v is False for v in sec):
+        sec_state, sec_word = False, "inactive"
+    elif any(v is True for v in sec):
+        sec_state, sec_word = None, "partly active"
+    else:
+        sec_state, sec_word = None, "unknown"
+    security = f'AppArmor{_dot()}firewalld{_dot()}OpenSnitch {_paint(sec_word, C.DIM)}'
+
+    # Row 4 — anonymity. mac_randomization_enabled() is a definite bool when the
+    # library is present, None only when it is not.
+    mac = ms.mac_randomization_enabled() if ms else None
+    vpn_on, _ = ms.vpn_active() if ms else (False, None)
+    tor_on = (ms.tor_status() is True or ms.tor_socks_reachable()) if ms else None
+    if mac is True:
+        priv_state, priv_word = True, "on"
+    elif vpn_on or tor_on:
+        priv_state, priv_word = None, "ready"
+    elif mac is False:
+        priv_state, priv_word = False, "off"
+    else:
+        priv_state, priv_word = None, "unknown"
+    privacy = f'Tor{_dot()}Proton VPN{_dot()}MAC randomization {_paint(priv_word, C.DIM)}'
+
+    # Row 5 — local AI.
+    ai_on = _active("ollama.service")
+    if ai_on is True:
+        ai_state, ai_word = True, "ready"
+    elif ai_on is False:
+        ai_state, ai_word = None, "installed"
+    else:
+        ai_state, ai_word = None, "unknown"
+    ai = (f'Ollama {_paint(ai_word, C.DIM)} — '
+          f'local AI, 0 cloud, 0 telemetry')
+
+    return [
+        (True, ident),
+        (True, desktop),
+        (sec_state, security),
+        (priv_state, privacy),
+        (ai_state, ai),
+    ]
+
+
+def cmd_welcome() -> int:
+    print()
+    for state, text in _welcome_lines():
+        print(f"  {_mark(state)} {text}")
+    print()
+    print(_paint(f"  Learn more:  mazelinux --status   ·   {WEBSITE}", C.GREY))
+    print()
+    return 0
+
+
+# --- section renderers -----------------------------------------------------
+def _header(title: str) -> None:
+    print()
+    print(f"  {_paint(title, C.BOLD, C.CYAN)}")
+    print(_paint("  " + "─" * (len(title) + 2), C.GREY))
+
+
+def _row(label: str, value: str, state: bool | None = None) -> None:
+    mark = f"{_mark(state)} " if state is not None else "  "
+    print(f"  {mark}{label:<22}{_paint(value, C.DIM)}")
+
+
+def cmd_security() -> int:
+    _header("Security")
+    if not ms:
+        _row("status", "unavailable")
+        return 0
+    for label, unit, state in ms.security_status():
+        _row(label, "running" if state else ("stopped" if state is False else "n/a"), state)
+    sb = ms.secure_boot_status()
+    if sb is not None:
+        _row("Secure Boot", "enabled" if sb else "disabled", sb)
+    signed = ms.secure_boot_chain_signed()
+    if signed is not None:
+        _row("Boot chain signed", "valid" if signed else "FAILED", signed)
+    _, score = ms.hardening_report()
+    print()
+    print(f"  {_paint('Hardening score', C.BOLD)}  "
+          f"{_paint(str(score) + '%', C.GREEN if score >= 80 else C.YELLOW)}")
+    return 0
+
+
+def cmd_privacy() -> int:
+    _header("Privacy & Anonymity")
+    if not ms:
+        _row("status", "unavailable")
+        return 0
+    for label, value, good in ms.network_info():
+        _row(label, value, good)
+    return 0
+
+
+def cmd_ai() -> int:
+    _header("Local AI")
+    if not ms:
+        _row("status", "unavailable")
+        return 0
+    ai = ms.ollama_status()
+    _row("Ollama service", "running" if ai else ("stopped" if ai is False else "n/a"), ai)
+    models = ms.ollama_models()
+    if models:
+        for name in models[:8]:
+            _row(name, "ready", True)
+    else:
+        print(_paint("    No models yet — pull one with:  ollama run llama3", C.GREY))
+    return 0
+
+
+def cmd_system() -> int:
+    _header("System")
+    if not ms:
+        _row("kernel", platform.release())
+        return 0
+    for _icon, value in ms.system_facts():
+        print(f"    {_paint('•', C.CYAN)} {value}")
+    return 0
+
+
+def cmd_status() -> int:
+    cmd_welcome()
+    cmd_security()
+    cmd_privacy()
+    cmd_ai()
+    cmd_system()
+    print()
+    return 0
+
+
+def cmd_version() -> int:
+    print(f"Maze Linux \"{CODENAME}\" — Arch-based · {_arch()}")
+    print(f"kernel {platform.release()}")
+    print(WEBSITE)
+    return 0
+
+
+# --- json ------------------------------------------------------------------
+def _json_payload() -> dict:
+    def svc(u: str):
+        return {"active": _active(u)}
+
+    payload: dict = {
+        "name": "Maze Linux",
+        "codename": CODENAME,
+        "arch": _arch(),
+        "kernel": platform.release(),
+        "session": _session(),
+    }
+    if ms:
+        payload["security"] = {
+            label: state for label, _u, state in ms.security_status()
+        }
+        payload["secure_boot"] = ms.secure_boot_status()
+        _checks, score = ms.hardening_report()
+        payload["hardening_score"] = score
+        payload["privacy"] = {
+            "mac_randomization": ms.mac_randomization_enabled(),
+            "vpn": ms.vpn_active()[0],
+            "tor": ms.tor_socks_reachable(),
+        }
+        payload["ai"] = {
+            "ollama": ms.ollama_status(),
+            "models": ms.ollama_models() or [],
+        }
+        payload["system"] = [v for _i, v in ms.system_facts()]
+    return payload
+
+
+# --- entry point -----------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="mazelinux",
+        description="The embedded Maze Linux command-line companion.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"Home: {WEBSITE}",
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--welcome", action="store_true", help="branded live-state summary (default)")
+    g.add_argument("--status", action="store_true", help="full security/privacy/AI/system report")
+    g.add_argument("--security", action="store_true", help="security services only")
+    g.add_argument("--privacy", action="store_true", help="anonymity / network only")
+    g.add_argument("--ai", action="store_true", help="local AI (Ollama) only")
+    g.add_argument("--system", action="store_true", help="hardware & kernel facts")
+    g.add_argument("--version", "-V", action="store_true", help="version and codename")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--no-color", action="store_true", help="disable coloured output")
+    return p
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _init_color(args.no_color)
+
+    if args.json:
+        print(json.dumps(_json_payload(), indent=2))
+        return 0
+
+    if args.version:
+        return cmd_version()
+    if args.status:
+        return cmd_status()
+    if args.security:
+        return cmd_security() or (print() or 0)
+    if args.privacy:
+        return cmd_privacy() or (print() or 0)
+    if args.ai:
+        return cmd_ai() or (print() or 0)
+    if args.system:
+        return cmd_system() or (print() or 0)
+    # default and --welcome
+    return cmd_welcome()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
