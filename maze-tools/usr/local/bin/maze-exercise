@@ -90,10 +90,23 @@ LTS_KVER="$(for d in /usr/lib/modules/*/; do [[ -f "${d}pkgbase" && "$(cat "${d}
 [[ -n "${LTS_KVER}" ]] && pass "recovery kernel installed: linux-lts ${LTS_KVER}" || { warn "no linux-lts — kernel-update rehearsal skipped"; KERNEL=0; }
 [[ "${LTS_KVER}" == "${RUNNING}" ]] && { warn "you are RUNNING the LTS kernel — reinstalling it would rebuild the primary image; rehearsal skipped"; KERNEL=0; }
 _free="$(df --output=avail -m "${ESP}" | tail -1 | tr -d ' ')"; [[ "${_free}" -gt 300 ]] && pass "ESP free: ${_free} MB" || { warn "ESP has only ${_free} MB free — rehearsal skipped"; KERNEL=0; }
+# The rehearsal reinstalls the EXACT installed linux-lts from the package cache.
+# It used to fall back to `pacman -Sy linux-lts` when the file was not cached —
+# a partial upgrade (fresh databases, nothing else upgraded) run on a real
+# machine by a tool whose job is to prove that machine healthy. A full -Syu is
+# not a substitute either: it may replace the mainline kernel too, and the
+# checks below assert that the primary boot image does NOT change. So: cached
+# package or no rehearsal.
+_cached=""
 if [[ "${KERNEL}" -eq 1 ]]; then
-    if getent hosts archlinux.org >/dev/null 2>&1 && ping -c1 -W3 archlinux.org >/dev/null 2>&1; then pass "network + DNS reachable (pacman needs a mirror)"
-    elif ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then warn "IP connectivity but NO DNS (archlinux.org does not resolve) — pacman cannot reach a mirror; rehearsal skipped" "resolvectl status; nmcli con up <connection>"; KERNEL=0
-    else warn "no network — rehearsal needs a mirror; skipped"; KERNEL=0; fi
+    _cached="$(ls -t /var/cache/pacman/pkg/linux-lts-"$(pacman -Q linux-lts | cut -d' ' -f2)"-x86_64.pkg.tar.zst 2>/dev/null | head -1)"
+    if [[ -n "${_cached}" ]]; then
+        pass "cached package for the installed linux-lts: ${_cached##*/}"
+    else
+        warn "installed linux-lts is not in the package cache — rehearsal skipped" \
+             "fetching it would need 'pacman -Sy linux-lts' (a partial upgrade). Run 'sudo pacman -Syu' first, then re-run."
+        KERNEL=0
+    fi
 fi
 pacman -Qkk linux-lts 2>/dev/null | tail -1 | sed 's/^/         | /'
 _snap_before="$(snapper -c root list 2>/dev/null | tail -n +4 | grep -c .)"; info "snapper snapshots before: ${_snap_before}"
@@ -109,16 +122,9 @@ if confirm "Reinstall linux-lts ${LTS_KVER} now?"; then
     _sha_grub_before="$(sha256sum "${GRUB}" | cut -c1-16)"
     _plog_lines="$(wc -l < /var/log/pacman.log)"
     _t0="$(date +%s)"
-    _cached="$(ls -t /var/cache/pacman/pkg/linux-lts-"$(pacman -Q linux-lts | cut -d' ' -f2)"-x86_64.pkg.tar.zst 2>/dev/null | head -1)"
-    if [[ -n "${_cached}" ]]; then
-        info "using cached package ${_cached} (offline, same version)"
-        pacman -U --noconfirm "${_cached}" 2>&1 | sed 's/^/         | /'
-        _rc=${PIPESTATUS[0]}
-    else
-        info "no cached package — pacman -Sy linux-lts linux-lts-headers (may also UPGRADE them, which is an even better test)"
-        pacman -Sy --noconfirm linux-lts linux-lts-headers 2>&1 | sed 's/^/         | /'
-        _rc=${PIPESTATUS[0]}
-    fi
+    info "using cached package ${_cached} (offline, same version)"
+    pacman -U --noconfirm "${_cached}" 2>&1 | sed 's/^/         | /'
+    _rc=${PIPESTATUS[0]}
     _t1="$(date +%s)"
     [[ "${_rc}" -eq 0 ]] && pass "pacman finished (rc=0) in $((_t1-_t0)) s" || fail "pacman returned ${_rc}"
     LTS_KVER="$(for d in /usr/lib/modules/*/; do [[ -f "${d}pkgbase" && "$(cat "${d}pkgbase")" == "linux-lts" ]] && basename "$d"; done | sort -V | tail -1)"

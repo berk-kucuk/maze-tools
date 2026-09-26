@@ -1,0 +1,768 @@
+#!/usr/bin/env bash
+#
+# maze-selftest — prove, on a running machine, that the fixes from the
+# September 2026 audit (MAZE-DENETIM-RAPORU.md) are installed AND work.
+#
+# maze-audit compares the machine against the source tree; maze-doctor asks
+# whether it is healthy. This answers a narrower question: "is every fix that
+# shipped in this round really here, doing what it promises?" Where a fix can
+# be exercised without side effects it is exercised — the HazeDrop server is
+# started on 127.0.0.1 and asked for a file without the link key, Maze AI's
+# command classifier is fed the commands it must refuse, a truncated transfer
+# is decrypted, Maze Cloak generates addresses — instead of grepping for the
+# patch. Where it cannot, the installed file is checked for it.
+#
+# Each check is gated on the package version that carries the fix: an older
+# package is reported as SKIP ("update first"), not as a failure.
+#
+# It is READ-ONLY: nothing on the system is changed. Temporary files live in a
+# private directory under /tmp and are removed on exit.
+#
+# Usage:
+#   sudo maze-selftest [--no-color] [--out FILE]
+#   maze-selftest            also works without root; root-only checks
+#                            (ESP, pacman keyring, sentinel state) are skipped
+#
+#   --no-color       plain output
+#   --out FILE       also write the report to FILE
+#   --pkgroot DIR    developer use: test the package files unpacked under DIR
+#                    (e.g. built packages extracted with bsdtar) instead of the
+#                    installed ones; version gates are then ignored
+#
+# Exit code: 0 = no FAIL, 1 = at least one FAIL, 2 = cannot run.
+
+set -u
+
+COLOR=1
+OUT=""
+PKGROOT=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-color) COLOR=0; shift ;;
+        --out) OUT="${2:?--out needs a file}"; shift 2 ;;
+        --pkgroot) PKGROOT="$(cd "${2:?--pkgroot needs a directory}" && pwd)" || exit 2; shift 2 ;;
+        -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "maze-selftest: unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+[[ -t 1 ]] || COLOR=0
+[[ -n "${OUT}" ]] && exec > >(tee -a "${OUT}") 2>&1
+
+IS_ROOT=0; [[ "$(id -u)" -eq 0 ]] && IS_ROOT=1
+TMP="$(mktemp -d --tmpdir maze-selftest.XXXXXX)" || { echo "maze-selftest: cannot create a temp dir" >&2; exit 2; }
+chmod 700 "${TMP}"
+trap 'rm -rf "${TMP}"' EXIT
+export PYTHONDONTWRITEBYTECODE=1
+
+# Package-owned files are read through P (empty, or --pkgroot).
+P="${PKGROOT}"
+VENV_PY="/opt/maze/venv/bin/python3"
+[[ -x "${VENV_PY}" ]] || VENV_PY=""
+SYS_PY="/usr/bin/python3"
+
+# The desktop user this is about (sudo / pkexec / plain run).
+REAL_USER="${SUDO_USER:-}"
+[[ -z "${REAL_USER}" && -n "${PKEXEC_UID:-}" ]] && REAL_USER="$(id -nu "${PKEXEC_UID}" 2>/dev/null)"
+[[ -z "${REAL_USER}" ]] && REAL_USER="$(id -nu)"
+REAL_UID="$(id -u "${REAL_USER}" 2>/dev/null || id -u)"
+REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
+[[ -n "${REAL_HOME}" ]] || REAL_HOME="${HOME}"
+
+# ---------------------------------------------------------------- output ----
+if [[ "${COLOR}" -eq 1 ]]; then
+    C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[34m'; C_C=$'\e[36m'; C_M=$'\e[35m'; C_0=$'\e[0m'; C_BOLD=$'\e[1m'
+else
+    C_R=""; C_G=""; C_Y=""; C_B=""; C_C=""; C_M=""; C_0=""; C_BOLD=""
+fi
+N_PASS=0; N_WARN=0; N_FAIL=0; N_SKIP=0
+FAILS=""; WARNS=""; CUR_SECTION=""
+
+section() { CUR_SECTION="$1"; printf '\n%s%s== %s ==%s\n' "${C_BOLD}" "${C_B}" "$1" "${C_0}"; }
+pass()   { N_PASS=$((N_PASS+1)); printf '  %s[ OK ]%s %s\n' "${C_G}" "${C_0}" "$1"; }
+info()   { printf '  %s[info]%s %s\n' "${C_C}" "${C_0}" "$1"; }
+skip()   { N_SKIP=$((N_SKIP+1)); printf '  %s[SKIP]%s %s\n' "${C_M}" "${C_0}" "$1"; }
+detail() { printf '         %s\n' "$1"; }
+warn() {
+    N_WARN=$((N_WARN+1)); printf '  %s[WARN]%s %s\n' "${C_Y}" "${C_0}" "$1"
+    [[ -n "${2:-}" ]] && detail "$2"
+    WARNS="${WARNS}  - [${CUR_SECTION}] $1"$'\n'
+}
+fail() {
+    N_FAIL=$((N_FAIL+1)); printf '  %s[FAIL]%s %s\n' "${C_R}" "${C_0}" "$1"
+    [[ -n "${2:-}" ]] && detail "$2"
+    FAILS="${FAILS}  - [${CUR_SECTION}] $1"$'\n'
+}
+
+has() { command -v "$1" >/dev/null 2>&1; }
+
+# need PKG MINVER — true when PKG is installed at a version that carries the
+# fix. Otherwise says why the section is skipped. --pkgroot bypasses it.
+need() {
+    local pkg="$1" min="$2" ver
+    [[ -n "${PKGROOT}" ]] && return 0
+    ver="$(pacman -Q "${pkg}" 2>/dev/null | awk '{print $2}')"
+    if [[ -z "${ver}" ]]; then
+        skip "${pkg} is not installed"
+        return 1
+    fi
+    if [[ "$(vercmp "${ver}" "${min}")" -lt 0 ]]; then
+        skip "${pkg} ${ver} is older than ${min}, which carries these fixes — update first (sudo pacman -Syu)"
+        return 1
+    fi
+    info "${pkg} ${ver}"
+    return 0
+}
+
+# file_has FILE PATTERN MESSAGE [HINT] — a fix that can only be checked in the
+# installed file (grep -F, fixed string).
+file_has() {
+    local f="$1" pat="$2" msg="$3" hint="${4:-}"
+    if [[ ! -r "${f}" ]]; then
+        fail "${msg}: ${f} is missing or unreadable" "${hint}"
+    elif grep -qF -- "${pat}" "${f}"; then
+        pass "${msg}"
+    else
+        fail "${msg}: not found in ${f}" "${hint}"
+    fi
+}
+
+# py_check INTERP [VAR=value ...] <<'PY' — run a Python test program. Its
+# stdout lines "OK …", "FAIL …", "WARN …", "INFO …" become results; anything
+# else is shown as detail. A crash is a FAIL.
+py_check() {
+    local interp="$1"; shift
+    local out rc line
+    if [[ -z "${interp}" || ! -x "${interp}" ]]; then
+        skip "no Python interpreter for this test (${interp:-/opt/maze/venv missing})"
+        cat >/dev/null
+        return
+    fi
+    out="$(cd "${TMP}" && env "$@" timeout 120 "${interp}" -B - 2>&1)"; rc=$?
+    while IFS= read -r line; do
+        case "${line}" in
+            "OK "*)   pass "${line#OK }" ;;
+            "FAIL "*) fail "${line#FAIL }" ;;
+            "WARN "*) warn "${line#WARN }" ;;
+            "INFO "*) info "${line#INFO }" ;;
+            "")       ;;
+            *)        detail "${line}" ;;
+        esac
+    done <<<"${out}"
+    [[ "${rc}" -eq 0 ]] || fail "test program exited with status ${rc} (output above)"
+}
+
+# ESP of the running system (root only).
+find_esp() {
+    local e
+    e="$(bootctl --print-esp-path 2>/dev/null || true)"
+    for e in "${e}" /efi /boot /boot/efi; do
+        [[ -n "${e}" && -d "${e}/EFI" ]] && { printf '%s\n' "${e}"; return 0; }
+    done
+    return 1
+}
+
+printf '%sMaze Linux self-test%s — %s, user %s, %s\n' "${C_BOLD}" "${C_0}" "$(date '+%Y-%m-%d %H:%M')" "${REAL_USER}" \
+    "$([[ ${IS_ROOT} -eq 1 ]] && echo 'running as root' || echo 'NOT root: root-only checks are skipped')"
+[[ -n "${PKGROOT}" ]] && printf 'Testing package files under %s (version gates off)\n' "${PKGROOT}"
+
+# ===================================================== 1. maze-hardening =====
+section "1. maze-hardening — IPv6 privacy addresses"
+if need maze-hardening 1.0.0-5; then
+    file_has "${P}/etc/sysctl.d/99-maze-hardening.conf" "use_tempaddr = 2" "sysctl profile sets use_tempaddr = 2"
+    if [[ -z "${PKGROOT}" ]]; then
+        for k in all default; do
+            v="$(sysctl -n "net.ipv6.conf.${k}.use_tempaddr" 2>/dev/null)"
+            if [[ "${v}" == 2 ]]; then pass "net.ipv6.conf.${k}.use_tempaddr = 2 (active)"
+            else fail "net.ipv6.conf.${k}.use_tempaddr is ${v:-unset}, expected 2" "apply now: sudo sysctl --system (or reboot)"; fi
+        done
+        for d in /proc/sys/net/ipv6/conf/*/; do
+            i="$(basename "${d}")"
+            [[ -e "/sys/class/net/${i}/device" ]] || continue      # physical NICs only
+            v="$(cat "${d}use_tempaddr" 2>/dev/null)"
+            if [[ "${v}" == 2 ]]; then pass "interface ${i}: privacy addresses on"; continue; fi
+            # NetworkManager writes this value itself when it brings a link up:
+            # a profile's ipv6.ip6-privacy wins, and only -1 (default) falls
+            # back to the system default set above. So name the profile.
+            con="$(nmcli -g GENERAL.CONNECTION device show "${i}" 2>/dev/null)"
+            if [[ -z "${con}" ]]; then
+                info "interface ${i}: not connected (use_tempaddr ${v:-?} until NetworkManager brings it up)"
+                continue
+            fi
+            pv="$(nmcli -g ipv6.ip6-privacy connection show "${con}" 2>/dev/null)"
+            case "${pv%% *}" in
+                0|disabled)
+                    warn "interface ${i}: privacy addresses OFF — the connection '${con}' turns them off itself (ipv6.ip6-privacy=0)" \
+                         "turn on: nmcli connection modify '${con}' ipv6.ip6-privacy 2, then: nmcli connection up '${con}'" ;;
+                1)
+                    warn "interface ${i}: connection '${con}' uses ipv6.ip6-privacy=1 (temporary addresses exist but are not preferred)" \
+                         "prefer them: nmcli connection modify '${con}' ipv6.ip6-privacy 2, then: nmcli connection up '${con}'" ;;
+                *)
+                    warn "interface ${i}: use_tempaddr = ${v:-?} although '${con}' uses the system default (ipv6.ip6-privacy=${pv:-?})" \
+                         "reconnect it: nmcli connection up '${con}'" ;;
+            esac
+        done
+        n="$(ip -6 addr show scope global temporary 2>/dev/null | grep -c 'inet6')"
+        if [[ "${n}" -gt 0 ]]; then pass "${n} temporary (privacy) IPv6 address(es) in use"
+        else info "no temporary IPv6 address right now (normal when the network has no IPv6)"; fi
+    fi
+fi
+
+# ====================================================== 2. maze-branding =====
+section "2. maze-branding — os-release survives filesystem upgrades"
+if need maze-branding 1.6.1-2; then
+    osr="${P}/usr/share/maze/os-release"
+    hook="${P}/usr/share/libalpm/hooks/zz-maze-os-release.hook"
+    if [[ -r "${osr}" ]]; then pass "Maze os-release shipped at /usr/share/maze/os-release"
+    else fail "/usr/share/maze/os-release missing" "reinstall: sudo pacman -S maze-branding"; fi
+    file_has "${hook}" "Target = filesystem" "pacman hook re-applies it after every filesystem upgrade"
+    file_has "${hook}" "/usr/share/maze/os-release /usr/lib/os-release" "hook copies the packaged file into place"
+    if [[ -z "${PKGROOT}" ]]; then
+        if cmp -s /usr/lib/os-release "${osr}"; then pass "/usr/lib/os-release is Maze's"
+        else fail "/usr/lib/os-release differs from Maze's copy" "fix: sudo cp /usr/share/maze/os-release /usr/lib/os-release"; fi
+        if [[ "$(readlink -f /etc/os-release)" == /usr/lib/os-release ]]; then pass "/etc/os-release points at it"
+        else warn "/etc/os-release is not a link to /usr/lib/os-release"; fi
+        info "system identifies as: $(. /usr/lib/os-release 2>/dev/null; printf '%s (ID=%s)' "${PRETTY_NAME:-?}" "${ID:-?}")"
+        [[ -f /etc/pacman.d/hooks/maze-os-release.hook ]] && \
+            info "the installer's fallback hook /etc/pacman.d/hooks/maze-os-release.hook is also present (harmless; the packaged zz- hook runs last)"
+    fi
+fi
+
+# =========================================================== 3. maze-meta =====
+section "3. maze-meta — Said360 is no longer a default package"
+if need maze-meta 1.5.0-2; then
+    if [[ -n "${PKGROOT}" ]]; then
+        skip "dependency list is only checked on an installed system"
+    else
+        if LC_ALL=C pacman -Qi maze-meta | awk '/^Depends On/{f=1} /^Optional Deps/{f=0} f' | grep -qw said360; then
+            fail "maze-meta still depends on said360"
+        else
+            pass "maze-meta does not depend on said360"
+        fi
+        if pacman -Qq said360 >/dev/null 2>&1; then
+            if pacman -Qdtq 2>/dev/null | grep -qx said360; then
+                info "said360 is still installed from before, now as an unneeded dependency — remove it with: sudo pacman -Rns said360"
+            else
+                info "said360 is installed explicitly (you chose to keep it)"
+            fi
+        else
+            pass "said360 is not installed"
+        fi
+    fi
+fi
+
+# =================================================== 4. mazelinux-keyring =====
+section "4. mazelinux-keyring — repository signing key"
+FPR="7C4D515A6B930CB04794CEF6147C8159B3E2EE5F"
+if need mazelinux-keyring 20260720-2; then
+    if [[ -n "${PKGROOT}" ]]; then
+        skip "the pacman keyring is only checked on an installed system"
+    elif [[ "${IS_ROOT}" -ne 1 ]]; then
+        skip "reading the pacman keyring needs root"
+    else
+        line="$(gpg --homedir /etc/pacman.d/gnupg --batch --no-auto-check-trustdb --with-colons --list-keys "${FPR}" 2>/dev/null | grep -m1 '^pub:')"
+        if [[ -z "${line}" ]]; then
+            fail "Maze signing key ${FPR} is not in pacman's keyring" "fix: sudo pacman-key --populate mazelinux"
+        else
+            pass "Maze signing key is in pacman's keyring"
+            validity="$(cut -d: -f2 <<<"${line}")"
+            case "${validity}" in
+                f|u) pass "key is trusted (validity ${validity})" ;;
+                *)   fail "key is present but not trusted (validity '${validity}')" "fix: sudo pacman-key --populate mazelinux" ;;
+            esac
+            exp="$(cut -d: -f7 <<<"${line}")"
+            if [[ -z "${exp}" ]]; then
+                pass "key never expires"
+            else
+                days=$(( (exp - $(date +%s)) / 86400 ))
+                if [[ "${days}" -lt 0 ]]; then fail "key EXPIRED on $(date -d "@${exp}" +%F)" "updates cannot be verified — a new mazelinux-keyring is needed"
+                elif [[ "${days}" -lt 365 ]]; then warn "key expires on $(date -d "@${exp}" +%F) (${days} days)" "the maintainer must extend it and publish a new mazelinux-keyring before then"
+                else pass "key valid until $(date -d "@${exp}" +%F) (${days} days)"; fi
+            fi
+        fi
+    fi
+    inst="$(ls -d /var/lib/pacman/local/mazelinux-keyring-*/ 2>/dev/null | head -1)"
+    if [[ -z "${PKGROOT}" && -n "${inst}" && -r "${inst}install" ]]; then
+        inst="${inst}install"
+        if grep -qF "${FPR}" "${inst}"; then pass "uninstall removes the key by its full fingerprint"
+        else fail "keyring scriptlet does not use the full fingerprint"; fi
+    fi
+fi
+
+# ===================================================== 5. maze-secureboot =====
+section "5. maze-secureboot — signing, rollback copy, chroot guard"
+if need maze-secureboot 1.2.0-16; then
+    file_has "${P}/usr/share/libalpm/hooks/zz-maze-secureboot.hook" "Operation = Remove" \
+        "removing a kernel re-runs the signer (stale images are pruned)"
+    file_has "${P}/usr/bin/maze-boot-check" "systemd-detect-virt --chroot" \
+        "boot check never raises the 'unsafe' flag from inside a chroot (installer/repair)"
+    file_has "${P}/usr/bin/maze-sb-sign" '_sberr="$(sbsign' "a failed signature shows sbsign's own error"
+    file_has "${P}/usr/bin/maze-sb-sign" '/usr/lib/modules/$_prev_kver/vmlinuz' \
+        "rollback copy is only kept while its kernel is installed"
+    if [[ -n "${PKGROOT}" ]]; then
+        :
+    elif [[ "${IS_ROOT}" -ne 1 ]]; then
+        skip "ESP checks need root"
+    elif ! esp="$(find_esp)"; then
+        warn "could not find the ESP (bootctl --print-esp-path, /efi, /boot)"
+    else
+        g="${esp}/EFI/BOOT/grubx64.efi"
+        if [[ -r "${g}.maze-kver" ]]; then
+            k="$(tr -d '[:space:]' < "${g}.maze-kver")"
+            if [[ -f "/usr/lib/modules/${k}/vmlinuz" ]]; then pass "the kernel that boots (${k}) is installed"
+            else fail "the ESP boots kernel ${k}, which is not installed" "fix: sudo maze-sb-sign"; fi
+        else
+            info "no ${g}.maze-kver (Secure Boot chain not in use on this machine?)"
+        fi
+        if [[ -e "${g}.maze-prev" ]]; then
+            pk="$(tr -d '[:space:]' < "${g}.maze-prev.kver" 2>/dev/null)"
+            if [[ -n "${pk}" && -f "/usr/lib/modules/${pk}/vmlinuz" ]]; then
+                pass "rollback copy boots kernel ${pk}, which is still installed"
+            else
+                fail "rollback copy ${g}.maze-prev is for a kernel that is gone (${pk:-unlabelled})" \
+                     "it would boot without modules; sudo maze-sb-sign removes it"
+            fi
+        else
+            pass "no stale rollback copy on the ESP"
+        fi
+        crt="/var/lib/maze-secureboot/MOK.crt"
+        if has sbverify && [[ -r "${crt}" ]]; then
+            if [[ -r "${g}" ]]; then
+                if sbverify --cert "${crt}" "${g}" >/dev/null 2>&1; then pass "grubx64.efi carries a valid Maze signature"
+                else fail "grubx64.efi is NOT signed with the Maze key" "fix: sudo maze-sb-sign"; fi
+            fi
+        fi
+    fi
+    if [[ -z "${PKGROOT}" ]]; then
+        if [[ -e /var/lib/maze/boot-unsafe ]]; then
+            warn "boot-unsafe flag is raised: $(tr '\n' ' ' < /var/lib/maze/boot-unsafe 2>/dev/null)" "details: sudo maze-boot-check"
+        else
+            pass "no boot-unsafe flag"
+        fi
+    fi
+fi
+
+# ====================================================== 6. maze-snapshots =====
+section "6. maze-snapshots — rollback checks the kernel that will boot"
+if need maze-snapshots 1.1.0-5; then
+    file_has "${P}/usr/bin/maze-rollback" "boot_kver()" "maze-rollback checks the ESP's kernel, not just the running one"
+    if [[ -z "${PKGROOT}" && "${IS_ROOT}" -eq 1 ]] && esp="$(find_esp)" && [[ -r "${esp}/EFI/BOOT/grubx64.efi.maze-kver" ]]; then
+        k="$(tr -d '[:space:]' < "${esp}/EFI/BOOT/grubx64.efi.maze-kver")"
+        if [[ "${k}" == "$(uname -r)" ]]; then info "boot kernel = running kernel (${k})"
+        else info "a newer kernel waits for a reboot: boots ${k}, running $(uname -r) — rollback now checks ${k} (this is the fix)"; fi
+    fi
+fi
+# Rollback mode at install (maze-installer >= 2.0.0-31, maze-snapshots >= 1.1.0-6):
+# without it `maze-rollback` "succeeds" and the machine boots the same root again.
+if need maze-snapshots 1.1.0-6; then
+    file_has "${P}/usr/bin/maze-enable-rollback" "--no-rebuild" "rollback mode can be switched on by the installer"
+    if [[ -z "${PKGROOT}" && "$(findmnt -no FSTYPE / 2>/dev/null)" == btrfs ]]; then
+        if grep -qE 'rootflags=[^ ]*subvol=' /proc/cmdline; then
+            warn "root is pinned to a subvolume: 'maze-rollback' would not change what boots" "enable once: sudo maze-enable-rollback --apply, then reboot"
+        else
+            pass "rollback works: root comes from the btrfs default subvolume (no pin on the cmdline)"
+        fi
+    fi
+fi
+
+# ========================================================== 7. maze-tools =====
+section "7. maze-tools"
+if need maze-tools 1.1.0-43; then
+    if [[ -z "${PKGROOT}" ]]; then
+        if pacman -Qlq maze-tools 2>/dev/null | grep -qE '__pycache__|\.pyc$'; then fail "maze-tools ships Python bytecode"
+        else pass "no stale Python bytecode in the package"; fi
+    fi
+    B="${P}/usr/local/bin"
+    # maze-power-saver: the udev rules used to be written with doubled
+    # backslashes, which made the whole file invalid.
+    file_has "${B}/maze-power-saver" 'TEST=="phy80211"' "power saver's Wi-Fi rule matches real wireless devices"
+    file_has "${B}/maze-power-saver" "udevadm verify" "power saver validates the rules it writes"
+    if [[ -z "${PKGROOT}" ]]; then
+        shopt -s nullglob
+        rules=(/etc/udev/rules.d/50-power-saver-*.rules)
+        shopt -u nullglob
+        if [[ ${#rules[@]} -eq 0 ]]; then
+            info "power saver is not enabled (no /etc/udev/rules.d/50-power-saver-*.rules)"
+        fi
+        for r in "${rules[@]}"; do
+            if grep -qF '\\\\' "${r}"; then
+                fail "$(basename "${r}") still has doubled backslashes (written by an older version)" "rewrite it: sudo maze-power-saver"
+            elif has udevadm && udevadm verify --help >/dev/null 2>&1; then
+                if udevadm verify "${r}" >/dev/null 2>&1; then pass "$(basename "${r}") is valid udev syntax"
+                else fail "$(basename "${r}") is rejected by udevadm verify" "details: udevadm verify ${r}; rewrite: sudo maze-power-saver"; fi
+            else
+                pass "$(basename "${r}") has no doubled backslashes"
+            fi
+        done
+    fi
+    file_has "${B}/maze-sentinel" "benign_writer() {" "sentinel only trusts known writers that pacman owns"
+    file_has "${B}/maze-sentinel" "authorized-keys.list" "sentinel watches SSH authorized_keys"
+    if [[ -z "${PKGROOT}" && "${IS_ROOT}" -eq 1 ]]; then
+        if [[ -f /var/lib/maze/sentinel/authorized-keys.list ]]; then pass "sentinel has an authorized_keys baseline"
+        else info "no authorized_keys baseline yet (created on the sentinel's next baseline run)"; fi
+    fi
+    file_has "${B}/maze-apply-wallpaper" "WallpaperApplied" "wallpaper is applied once per desktop, never forced again"
+    file_has "${B}/maze-gpu-driver" "kernel-default" "GPU driver check respects a pinned default kernel"
+    if [[ -r "${B}/maze-audit" ]] && ! grep -q 'said360' "${B}/maze-audit"; then pass "maze-audit no longer expects said360"
+    else fail "maze-audit still lists said360"; fi
+    # maze-guardd: the panic/kill-switch socket must only obey a user sitting
+    # at this machine — not an SSH login or a background process.
+    GUARDD="${B}/maze-guardd"
+    if [[ -r "${GUARDD}" ]]; then
+        py_check "${SYS_PY}" GUARDD="${GUARDD}" REAL_UID="${REAL_UID}" <<'PY'
+import importlib.machinery, importlib.util, os
+path = os.environ["GUARDD"]
+loader = importlib.machinery.SourceFileLoader("maze_guardd", path)
+spec = importlib.util.spec_from_loader("maze_guardd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)          # definitions only; the daemon starts under __main__
+if not hasattr(m, "_has_local_active_session"):
+    print("FAIL maze-guardd has no local-session check")
+else:
+    print("OK maze-guardd requires a local, active session")
+    print(("OK" if not m._authorized(0) else "FAIL") + " root (uid 0) is refused by the guard socket")
+    print(("OK" if not m._authorized(65534) else "FAIL") + " nobody (uid 65534) is refused by the guard socket")
+    uid = int(os.environ["REAL_UID"])
+    if uid >= 1000:
+        ok = m._authorized(uid)
+        where = "at this machine's seat" if ok else "not in a local, active session (SSH, or screen locked/switched away)"
+        print(f"INFO user uid {uid}: {where} -> panic button {'works' if ok else 'refused'}")
+PY
+    else
+        fail "${GUARDD} is missing"
+    fi
+fi
+
+# ========================================================= 8. maze-python =====
+section "8. maze-python — pinned pip-only libraries"
+if need maze-python 1.1.0-2; then
+    req="${P}/opt/maze/requirements.txt"
+    if [[ ! -r "${req}" ]]; then
+        fail "${req} missing"
+    elif [[ -n "${PKGROOT}" ]]; then
+        n="$(grep -cE '^[A-Za-z0-9._-]+==' "${req}")"
+        if [[ "${n}" -gt 0 ]]; then pass "${n} pip-only libraries are pinned to exact versions"
+        else fail "no exact pins in requirements.txt"; fi
+    else
+        py_check "${VENV_PY}" REQ="${req}" <<'PY'
+import os, re
+from importlib import metadata
+pins = []
+for line in open(os.environ["REQ"]):
+    m = re.match(r"^([A-Za-z0-9._-]+)==([^\s#;]+)", line.strip())
+    if m:
+        pins.append(m.groups())
+if not pins:
+    print("FAIL no exact pins in /opt/maze/requirements.txt")
+for name, want in pins:
+    try:
+        have = metadata.version(name)
+    except metadata.PackageNotFoundError:
+        print(f"FAIL {name} {want} is pinned but not installed in the venv")
+        continue
+    print(("OK" if have == want else "FAIL") + f" {name} {have}" + ("" if have == want else f" (pinned {want})"))
+PY
+    fi
+fi
+
+# ========================================================== 9. maze-guard =====
+section "9. Maze Guard — MAC block consent, window opens"
+if need maze-guard 2.19.0-3; then
+    py_check "${VENV_PY:-${SYS_PY}}" PYTHONPATH="${P}/opt/maze-guard" <<'PY'
+from maze.helper import _needs_consent
+rm = "--remove-rich-rule"
+cases = [
+    ([rm, 'rule family="ipv4" source mac="aa:bb:cc:dd:ee:ff" drop'], True,  "removing a block by MAC address asks for authorisation"),
+    ([rm, 'rule family="ipv4" source address="10.0.0.9" drop'],       True,  "removing a block by IP address asks for authorisation"),
+    (["--list-all"],                                                   False, "harmless commands do not ask"),
+]
+for args, want, msg in cases:
+    got = bool(_needs_consent(args))
+    print(("OK " if got == want else "FAIL ") + msg)
+PY
+fi
+# Checked separately from the version gate above: this is the bug that kept
+# the window from ever opening, and it depends on what else is installed
+# (python-pyqt5), not only on the maze-guard version.
+if [[ -n "${PKGROOT}" ]] || pacman -Qq maze-guard >/dev/null 2>&1; then
+    py_check "${VENV_PY:-${SYS_PY}}" PYTHONPATH="${P}/opt/maze-guard" QT_QPA_PLATFORM=offscreen <<'PY'
+import maze.gui.app          # the GUI's real import order decides the binding
+import qasync
+if qasync.QtModuleName == "PyQt6":
+    print("OK Maze Guard's event loop runs on PyQt6 (the window and tray icon can appear)")
+else:
+    print(f"FAIL Maze Guard's event loop is bound to {qasync.QtModuleName}, not PyQt6 — the app hangs invisibly and never opens")
+    print("INFO fixed in maze-guard 2.19.0-4; after updating, end the stuck copy: pkill -f /opt/maze-guard/main.py")
+PY
+fi
+
+# ========================================================= 10. maze-cloak =====
+section "10. Maze Cloak — unpredictable MAC addresses"
+if need maze-cloak 1.3.0-3; then
+    py_check "${VENV_PY:-${SYS_PY}}" PYTHONPATH="${P}/opt/maze-cloak" <<'PY'
+import random
+from mazecloak.core import mac
+rng = getattr(mac, "_rng", None)
+print(("OK" if isinstance(rng, random.SystemRandom) else "FAIL") +
+      " addresses come from the OS CSPRNG (SystemRandom), not a predictable generator")
+cur = "3c:52:82:11:22:33"
+for strat in (mac.FULL_RANDOM, mac.KEEP_VENDOR, mac.RANDOM_VENDOR):
+    seen = {mac.random_mac(strat, cur) for _ in range(300)}
+    bad = [a for a in seen if not mac.is_valid(a) or int(a[:2], 16) & 0x03 != 0x02]
+    ok = not bad and len(seen) > 290
+    print(("OK " if ok else "FAIL ") + f"{strat}: 300 addresses, {len(seen)} distinct, all valid locally-administered unicast"
+          + ("" if not bad else f" — bad: {bad[:3]}"))
+PY
+    file_has "${P}/opt/maze-cloak/mazecloak/core/interfaces.py" '"link", "set", "dev"' \
+        "interface names are passed with 'dev' (a name like 'up' cannot be misread)"
+fi
+
+# ===================================================== 11. entropy-shield =====
+section "11. Entropy Shield — onion server and panic"
+if need entropy-shield 4.1.3-3; then
+    ES="${P}/opt/entropy-shield/core"
+    py_check "${SYS_PY}" SRC="${ES}/onion_server.py" <<'PY'
+# Only the pure helper is executed, lifted out of the module with ast: the
+# module itself pulls in the app's config machinery.
+import ast, os, tempfile
+src = open(os.environ["SRC"]).read()
+fn = next((n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "_public_share_dir"), None)
+if fn is None:
+    print("FAIL onion server has no Public-folder default")
+    raise SystemExit
+ns = {"os": os}
+exec(compile(ast.Module([fn], []), "onion_server", "exec"), ns)
+f = ns["_public_share_dir"]
+with tempfile.TemporaryDirectory() as home:
+    print(("OK" if f(home) == os.path.join(home, "Public") else "FAIL") + " default share folder is ~/Public, not the home directory")
+    os.makedirs(os.path.join(home, ".config"))
+    with open(os.path.join(home, ".config", "user-dirs.dirs"), "w") as fh:
+        fh.write('XDG_PUBLICSHARE_DIR="$HOME/Genel"\n')
+    print(("OK" if f(home) == os.path.join(home, "Genel") else "FAIL") + " a localised Public folder (e.g. ~/Genel) is honoured")
+print(("OK" if "Refusing to publish" in src else "FAIL") + " publishing the home directory (or anything above it) is refused")
+PY
+    file_has "${ES}/daemon.py" 'if firewall_backend() == "iptables":' \
+        "panic only flushes iptables when Entropy Shield itself uses iptables (Docker/VPN rules survive)"
+    if [[ -z "${PKGROOT}" ]]; then
+        cfgf="${REAL_HOME}/.config/entropy-shield/config.json"
+        if [[ -r "${cfgf}" ]]; then
+            sd="$("${SYS_PY}" -c 'import json,sys; print((json.load(open(sys.argv[1])).get("onion_server") or {}).get("serve_dir","") or "")' "${cfgf}" 2>/dev/null)"
+            if [[ -n "${sd}" ]]; then
+                rs="$(realpath -m "${sd}")"; rh="$(realpath -m "${REAL_HOME}")"
+                if [[ "${rh}" == "${rs}" || "${rh}" == "${rs%/}/"* ]]; then
+                    warn "your onion server folder is ${sd} — it contains your whole home and will now be refused" "choose a sharing folder in Entropy Shield → Settings → Onion Server"
+                else
+                    pass "your onion server folder (${sd}) does not expose your home directory"
+                fi
+            fi
+        fi
+    fi
+fi
+
+# =========================================================== 12. HazeDrop =====
+section "12. HazeDrop — link key required, truncated transfers rejected"
+if need hazedrop 1.5.0-2; then
+    file_has "${P}/opt/hazedrop/hazedrop/core/web_template.py" "body.key=" "browser page sends the key from the link's #fragment"
+    py_check "${VENV_PY:-${SYS_PY}}" PYTHONPATH="${P}/opt/hazedrop" <<'PY'
+# A real server on 127.0.0.1 with a random file, then the three requests that
+# matter. Nothing leaves the machine; Tor is not involved.
+import asyncio, base64, os, socket, tempfile
+import aiohttp
+from hazedrop.core import crypto
+from hazedrop.core.session import DropSession
+from hazedrop.core.server import TorDropServer
+
+def free_port():
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+
+async def web_test(path, data):
+    key = crypto.generate_key()
+    sess = DropSession(filepath=path, filename="selftest.bin", filesize=len(data), password=None,
+                       once=False, expire_seconds=None, salt=None, key=key, max_downloads=10)
+    port = free_port()
+    srv = TorDropServer(sess, port)
+    await srv.start()
+    try:
+        url = f"http://127.0.0.1:{port}/web-download"
+        async with aiohttp.ClientSession() as c:
+            async with c.post(url, json={}) as r:
+                print(("OK" if r.status == 403 else "FAIL") + f" download with only the .onion address is refused (HTTP {r.status})")
+            wrong = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+            async with c.post(url, json={"key": wrong}) as r:
+                print(("OK" if r.status == 403 else "FAIL") + f" download with a wrong key is refused (HTTP {r.status})")
+            frag = crypto.build_share_url("selftest.onion", key, False, "0" * 16).split("#", 1)[1]
+            async with c.post(url, json={"key": frag.split(":")[0]}) as r:
+                body = await r.read()
+                ok = r.status == 200 and body == data
+                print(("OK" if ok else "FAIL") + f" download with the key from the link works and is byte-identical (HTTP {r.status})")
+    finally:
+        await srv.stop()
+
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "selftest.bin")
+    data = os.urandom(200_000)                # 4 chunks of 64 KiB
+    with open(path, "wb") as f:
+        f.write(data)
+    asyncio.run(web_test(path, data))
+
+    key = crypto.generate_key()
+    parts = list(crypto.encrypt_file_chunked(path, key))
+    _, pt = crypto.decrypt_file_chunked(b"".join(parts), key)
+    print(("OK" if pt == data else "FAIL") + " a complete transfer decrypts to the original file")
+    cut = b"".join(parts[:3])                 # header + 2 of 4 chunks, cut on a chunk boundary
+    try:
+        crypto.decrypt_file_chunked(cut, key)
+        print("FAIL a transfer cut short is accepted as a complete file")
+    except ValueError as e:
+        print("OK a transfer cut short is rejected (" + str(e) + ")")
+PY
+fi
+
+# =============================================================== 13. haze =====
+section "13. Haze — nickname collisions"
+if need haze 2.12.0-2; then
+    file_has "${P}/opt/haze/haze/network/server.py" "while nick in self._clients or nick == self._host_nick:" \
+        "a duplicate nickname is renamed until it is unique (no identity takeover)"
+fi
+
+# =============================================================== 14. Qlam =====
+section "14. Qlam — privilege prompt"
+if need qlam 1.3.0-2; then
+    f="${P}/usr/share/qlam/core/database_manager.py"
+    file_has "${f}" '"/usr/bin/pkexec" if os.access' "database update calls /usr/bin/pkexec by absolute path (no fake pkexec from PATH)"
+    if [[ -r "${f}" ]] && grep -qF 'shutil.which("pkexec")' "${f}"; then fail "Qlam still looks pkexec up in PATH"; fi
+fi
+
+# ===================================================== 15. SentinAI / Linux Chan =====
+section "15. SentinAI and Linux Chan AI — API key files"
+if need sentinai 1.7.0-2; then
+    file_has "${P}/opt/sentinai/app.py" "def _writable_env_file" "settings are written through the .env symlink (they persist)"
+    if [[ -z "${PKGROOT}" ]]; then
+        e="${REAL_HOME}/.config/sentinai/.env"
+        if [[ -e "${e}" ]]; then
+            m="$(stat -Lc %a "${e}")"
+            if [[ "${m}" == 600 ]]; then pass "~/.config/sentinai/.env is private (600)"
+            else warn "~/.config/sentinai/.env is ${m}" "it becomes 600 the next time SentinAI saves a setting; now: chmod 600 ${e}"; fi
+        fi
+    fi
+fi
+if need linux-chan-ai 1.1.4-3; then
+    file_has "${P}/usr/share/Linux-Chan-AI/linux-chan.py" "0o600" "config with the Gemini key is written 600"
+    if [[ -z "${PKGROOT}" ]]; then
+        c="${REAL_HOME}/.config/linux-chan-ai/config.json"
+        if [[ -e "${c}" ]]; then
+            m="$(stat -Lc %a "${c}")"
+            if [[ "${m}" == 600 ]]; then pass "~/.config/linux-chan-ai/config.json is private (600)"
+            else warn "~/.config/linux-chan-ai/config.json is ${m}" "it becomes 600 on the next save; now: chmod 600 ${c}"; fi
+        fi
+    fi
+fi
+
+# ============================================================ 16. Maze AI =====
+section "16. Maze AI — commands that run without asking"
+if need maze-ai 1.17.1-2; then
+    sp="$(ls -d "${P}"/usr/lib/python3*/site-packages 2>/dev/null | head -1)"
+    py_check "${SYS_PY}" PYTHONPATH="${sp}" <<'PY'
+from maze_ai.agent.safety import is_readonly_command
+refuse = [
+    "rg --pre=/tmp/evil foo .", "rg --pre /tmp/evil foo",
+    "sort --compress-program=/tmp/evil -S 1 file.txt", "ag --pager=/tmp/evil foo",
+    "git diff --ext-diff", "git log -p --textconv", "git diff --output=/home/u/.bashrc",
+    "git branch -D main", "git branch -m old new", "git tag -d v1.0",
+    "git remote add evil https://evil.tld/repo.git", "git remote set-url origin https://evil.tld/repo.git",
+]
+allow = ["rg foo .", "ag foo", "git branch", "git branch -a", "git tag -l", "git remote -v", "git show HEAD", "ls -la"]
+bad = [c for c in refuse if is_readonly_command(c)]
+print(("OK" if not bad else "FAIL") + f" {len(refuse) - len(bad)}/{len(refuse)} dangerous commands need your approval")
+for c in bad:
+    print(f"FAIL runs without asking: {c}")
+bad = [c for c in allow if not is_readonly_command(c)]
+print(("OK" if not bad else "FAIL") + f" {len(allow) - len(bad)}/{len(allow)} ordinary read-only commands still run without a prompt")
+for c in bad:
+    print(f"WARN now asks for: {c}")
+PY
+fi
+
+# ==================================================== 17. installed system =====
+section "17. Installation — disk encryption key, leftovers"
+if [[ -n "${PKGROOT}" ]]; then
+    skip "installation checks only apply to the running system"
+else
+    rootsrc="$(findmnt -no SOURCE / 2>/dev/null)"; rootsrc="${rootsrc%%\[*}"
+    if [[ -n "${rootsrc}" ]] && lsblk -rsno TYPE "${rootsrc}" 2>/dev/null | grep -qx crypt; then
+        luks=1; info "root file system is encrypted (LUKS)"
+    else
+        luks=0; info "root file system is not encrypted — keyfile checks do not apply"
+    fi
+    if [[ "${luks}" -eq 1 ]]; then
+        hits="$(grep -lE '^[[:space:]]*FILES=\([^)]*crypto_keyfile\.bin' /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf 2>/dev/null)"
+        if [[ -n "${hits}" ]]; then fail "LUKS keyfile is listed in FILES=() of: ${hits//$'\n'/ }" "it ends up on the unencrypted ESP; remove it there, then: sudo maze-initramfs-rebuild"
+        else pass "the LUKS keyfile is not added to the boot image (mkinitcpio FILES)"; fi
+        if [[ "${IS_ROOT}" -ne 1 ]]; then
+            skip "looking inside the boot images needs root"
+        elif ! has objcopy || ! has lsinitcpio; then
+            skip "objcopy/lsinitcpio missing — cannot look inside the boot images"
+        elif esp="$(find_esp)"; then
+            shopt -s nullglob
+            imgs=("${esp}"/EFI/Linux/*.efi "${esp}"/EFI/BOOT/grubx64.efi*)
+            shopt -u nullglob
+            checked=0
+            for img in "${imgs[@]}"; do
+                [[ -f "${img}" ]] || continue
+                case "${img}" in *.maze-kver|*.kver) continue ;; esac
+                ird="${TMP}/initrd"
+                rm -f "${ird}"
+                objcopy -O binary --only-section=.initrd "${img}" "${ird}" 2>/dev/null && [[ -s "${ird}" ]] || continue
+                list="$(lsinitcpio -l "${ird}" 2>/dev/null)" || continue
+                checked=$((checked + 1))
+                if grep -qxE '(\./)?crypto_keyfile\.bin' <<<"${list}"; then
+                    fail "$(basename "${img}") on the ESP CONTAINS the LUKS keyfile" "the disk can be unlocked without your passphrase; check /etc/mkinitcpio.conf FILES=(), then: sudo maze-initramfs-rebuild"
+                fi
+            done
+            rm -f "${TMP}/initrd"
+            if [[ "${checked}" -gt 0 ]]; then pass "checked ${checked} boot image(s) on the ESP: no LUKS keyfile inside"
+            else info "no boot image with an initrd found on the ESP"; fi
+        fi
+    fi
+    if pacman -Qq cloud-init >/dev/null 2>&1; then
+        warn "cloud-init is installed (from an older ISO); Maze does not use it" "remove: sudo pacman -Rns cloud-init"
+    else
+        pass "cloud-init is not installed"
+    fi
+    # What the installer itself recorded (maze-installer >= 2.0.0-33 writes it).
+    _sum=/var/log/maze-install-summary.txt
+    if [[ -r "${_sum}" ]]; then
+        if grep -q '^CRITICAL' "${_sum}"; then
+            fail "the installer recorded CRITICAL problems on this machine" "see ${_sum}"
+            sed -n '/^CRITICAL/,/^$/p' "${_sum}" | sed -n '2,6p' | grep -v '^$' | while IFS= read -r l; do detail "${l}"; done
+        else
+            _nw="$(sed -n 's/^Warnings (\([0-9]*\)).*/\1/p' "${_sum}")"
+            if [[ -n "${_nw}" && "${_nw}" -gt 0 ]]; then
+                info "the installer finished with ${_nw} warning(s) — see ${_sum}"
+            else
+                pass "the installer finished without warnings"
+            fi
+        fi
+    else
+        info "no installer summary (installed with an older Maze installer)"
+    fi
+    if [[ -f /var/log/maze-kernel-install.log ]]; then
+        if grep -qE -- '-> exit [1-9]' /var/log/maze-kernel-install.log 2>/dev/null; then
+            warn "the installer logged a failed kernel-install" "see /var/log/maze-kernel-install.log"
+        else
+            pass "installer's kernel-install log shows no failures"
+        fi
+    else
+        info "no /var/log/maze-kernel-install.log (installed with an older installer — nothing to check)"
+    fi
+fi
+
+# ============================================================== summary =====
+printf '\n%s== Summary ==%s\n' "${C_BOLD}" "${C_0}"
+printf '  %s%d OK%s   %s%d WARN%s   %s%d FAIL%s   %s%d SKIP%s\n' \
+    "${C_G}" "${N_PASS}" "${C_0}" "${C_Y}" "${N_WARN}" "${C_0}" "${C_R}" "${N_FAIL}" "${C_0}" "${C_M}" "${N_SKIP}" "${C_0}"
+if [[ -n "${FAILS}" ]]; then printf '\n%sFailed:%s\n%s' "${C_R}" "${C_0}" "${FAILS}"; fi
+if [[ -n "${WARNS}" ]]; then printf '\n%sWarnings:%s\n%s' "${C_Y}" "${C_0}" "${WARNS}"; fi
+if [[ "${N_SKIP}" -gt 0 ]]; then
+    printf '\nSKIP means the package is not updated yet (or the check needs root); update and run again.\n'
+fi
+[[ "${N_FAIL}" -eq 0 ]]

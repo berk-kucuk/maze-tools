@@ -8,6 +8,30 @@ Type=simple
 ExecStart=/usr/local/bin/maze-guardd
 Restart=on-failure
 RestartSec=3
+# Sandbox (2026-09). What the broker really does stays possible: modprobe for the
+# camera kill switch (so no ProtectKernelModules, @module allowed), /dev/rfkill
+# and /dev/snd (no PrivateDevices), /proc/sys/vm/drop_caches and
+# /sys/bus/usb/*/authorized (no ProtectKernelTunables), the user's PipeWire
+# socket under /run/user and `runuser` into their session (no ProtectHome, no
+# NoNewPrivileges), writes under /etc and /var/log (ProtectSystem=true, not full).
+# Taken away: /usr and /boot writes, the clock, hostname, kernel log, cgroups,
+# realtime, new namespaces, setuid files, foreign-ABI syscalls, and every
+# syscall outside the service set (EPERM, not a kill).
+# Verify: sudo maze-sandbox-check   Relax locally: sudo systemctl edit maze-guardd
+ProtectSystem=true
+PrivateTmp=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallFilter=@system-service @module
+SystemCallErrorNumber=EPERM
 # NOTE: no RuntimeDirectory=maze — /run/maze is shared with the Maze Sentinel
 # daemon (it writes /run/maze/sentinel-triggered there), and RuntimeDirectory would
 # wipe that dir on every guardd restart. The daemon creates /run/maze itself.

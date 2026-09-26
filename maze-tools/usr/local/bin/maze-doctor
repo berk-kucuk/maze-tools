@@ -363,17 +363,36 @@ fi
 MKC=/etc/mkinitcpio.conf
 if [ -r "$MKC" ]; then
     hooks="$(sed -n 's/^[[:space:]]*HOOKS=[(]\(.*\)[)].*/\1/p' "$MKC")"
-    for h in plymouth kms; do
-        case " $hooks " in
-            *" $h "*) ok "mkinitcpio HOOKS has $h" ;;
-            *) warn "mkinitcpio HOOKS is missing '$h'" "Boot splash / early KMS will not work." ;;
-        esac
-    done
-    if pacman -Qq 2>/dev/null | grep -q '^nvidia'; then
-        mods="$(sed -n 's/^[[:space:]]*MODULES=[(]\(.*\)[)].*/\1/p' "$MKC")"
+    case " $hooks " in
+        *" plymouth "*) ok "mkinitcpio HOOKS has plymouth" ;;
+        *) warn "mkinitcpio HOOKS is missing 'plymouth'" "Boot splash / graphical LUKS prompt will not work." ;;
+    esac
+    # `kms` is deliberately ABSENT on two kinds of machine: hybrid laptops (the
+    # installer puts the panel's own driver in MODULES instead) and desktops on
+    # the proprietary nvidia driver (kms would only add blacklisted nouveau plus
+    # ~110 MB of its firmware to every UKI). Only an open-driver box with an
+    # empty MODULES really lost early KMS.
+    mods="$(sed -n 's/^[[:space:]]*MODULES=[(]\(.*\)[)].*/\1/p' "$MKC")"
+    case " $hooks " in
+        *" kms "*)
+            if pacman -Qq nvidia-utils >/dev/null 2>&1; then
+                warn "mkinitcpio HOOKS has 'kms' but the proprietary nvidia driver is installed" "kms only adds blacklisted nouveau + ~110 MB firmware to the UKI (slow firmware/loader phase). Fix: sudo maze-gpu-driver --nvidia, or drop 'kms' from HOOKS and run sudo maze-initramfs-rebuild"
+            else
+                ok "mkinitcpio HOOKS has kms"
+            fi ;;
+        *)
+            if pacman -Qq nvidia-utils >/dev/null 2>&1; then
+                ok "mkinitcpio HOOKS has no kms (by design with the proprietary nvidia driver)"
+            elif [ -n "$(echo "$mods" | tr -d ' ')" ]; then
+                ok "mkinitcpio HOOKS has no kms; MODULES=($mods) carries the panel driver"
+            else
+                warn "mkinitcpio HOOKS is missing 'kms' and MODULES is empty" "Early KMS is off: splash and LUKS prompt run on simpledrm until root is mounted."
+            fi ;;
+    esac
+    if pacman -Qq nvidia-utils >/dev/null 2>&1; then
         case " $mods " in
-            *nvidia*) ok "mkinitcpio MODULES includes nvidia" ;;
-            *) warn "NVIDIA installed but not in mkinitcpio MODULES" "Early KMS falls back to the framebuffer." ;;
+            *nvidia*) warn "nvidia modules are in mkinitcpio MODULES" "That drags the ~214 MB GSP firmware tree into every UKI. Maze loads nvidia from the real root; remove them and run sudo maze-initramfs-rebuild" ;;
+            *) ok "nvidia is not in mkinitcpio MODULES (loads from root; keeps the UKI small)" ;;
         esac
     fi
 fi
@@ -611,7 +630,7 @@ fi
 
 for r in core extra multilib mazelinux; do
     c=$(pacman -Sl "$r" 2>/dev/null | wc -l)
-    [ "$c" -gt 0 ] && ok "Repo [$r]: $c packages" || warn "Repo [$r] is empty or unreachable" "Run: sudo pacman -Syy"
+    [ "$c" -gt 0 ] && ok "Repo [$r]: $c packages" || warn "Repo [$r] is empty or unreachable" "Run: sudo pacman -Syu"
 done
 
 # --------------------------------------------------------- 6. storage & space
@@ -716,11 +735,38 @@ fi
 # ----------------------------------------------------------------- 9. systemd
 section "Services"
 
+# systemd >= 262 can only set up NvPCRs (extra PCRs in TPM NV memory) from a
+# systemd-based initrd with a signed PCR policy in the UKI. Maze boots a classic
+# mkinitcpio initrd, so systemd-tpm2-setup-early / systemd-pcrproduct /
+# systemd-pcrlogin@ fail on every boot of a TPM machine. maze-secureboot
+# (>= 1.2.0-18) ships drop-ins that skip them; if they still fail, those
+# drop-ins are missing. Harmless either way — nothing in Maze uses NvPCRs —
+# but it reads like a broken system, so name it and say how to fix it.
+nvpcr_unit_failure() {   # $1 = unit
+    case "$1" in systemd-tpm2-setup*|systemd-pcr*) ;; *) return 1 ;; esac
+    journalctl -b -u "$1" --no-pager -q 2>/dev/null | grep -q 'NvPCR'
+}
+nvpcr_clear_hint() {
+    printf '%s' "systemd >= 262 NvPCRs need a systemd initrd, which Maze does not use; harmless. Fix: update maze-secureboot (>= 1.2.0-18 skips these units), then reboot"
+}
+
 failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')"
 if [ -n "$failed" ]; then
+    nv_units=""; setup_units=""; other_units=""
     for u in $failed; do
+        if nvpcr_unit_failure "$u"; then
+            nv_units="$nv_units $u"
+        else
+            case "$u" in systemd-tpm2-setup*) setup_units="$setup_units $u" ;; *) other_units="$other_units $u" ;; esac
+        fi
+    done
+    # systemd-tpm2-setup-early does not always name the NvPCR in its own log;
+    # it is part of the same problem when a systemd-pcr* unit failed on one.
+    if [ -n "$nv_units" ]; then nv_units="$nv_units$setup_units"; else other_units="$other_units$setup_units"; fi
+    for u in $other_units; do
         fail "Failed unit: $u" "Inspect with: systemctl status $u"
     done
+    [ -n "$nv_units" ] && warn "TPM NvPCR units fail (unsupported on Maze's initrd):$nv_units" "$(nvpcr_clear_hint)"
 else
     ok "No failed systemd units"
 fi

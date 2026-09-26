@@ -83,6 +83,25 @@ debounced() {
     return 1
 }
 
+# Is this writer one of the expected admin tools? Deciding on `comm` alone (as
+# this used to) is spoofable by anything: comm is just the executable's file
+# name, so `cp /bin/sh /tmp/pacman` — or prctl(PR_SET_NAME) — silenced every
+# alert while it rewrote /etc/passwd or sudoers. So the kernel-reported exe
+# must ALSO be an absolute path to a binary owned by an installed package, and
+# its name (as comm shows it — audit truncates to 15 chars, which is why the
+# config lists "systemd-sysuser") must be in BENIGN_WRITERS.
+benign_writer() {
+    local exe="$1" comm="$2" name
+    [[ "${exe}" == /* && -x "${exe}" ]] || return 1
+    name="${exe##*/}"; name="${name:0:15}"
+    [[ "${name}" == "${comm}" ]] || return 1
+    case " ${BENIGN_WRITERS} " in
+        *" ${name} "*) ;;
+        *) return 1 ;;
+    esac
+    pacman -Qqo "${exe}" >/dev/null 2>&1
+}
+
 # React to a file-change audit SYSCALL record for one of our watched keys.
 react_audit() {
     local raw="$1" key="$2"
@@ -94,11 +113,10 @@ react_audit() {
     prog="${exe##*/}"; [[ -n "${prog}" ]] || prog="${comm:-a program}"
 
     # Expected admin tooling (you ran it)? Log, do not alert.
-    case " ${BENIGN_WRITERS} " in
-        *" ${comm} "*)
-            log "expected change [${key}] by ${comm} (${user}) — no alert"
-            return 0 ;;
-    esac
+    if benign_writer "${exe}" "${comm}"; then
+        log "expected change [${key}] by ${exe} (${user}) — no alert"
+        return 0
+    fi
 
     # One notification per change-type per burst.
     debounced "${key}" && { log "debounced [${key}] by ${prog} (${user})"; return 0; }
@@ -134,6 +152,19 @@ react_audit() {
 # ---- periodic baseline scan: new SUID/SGID-root binaries and root accounts ----
 scan_suid()          { find ${SUID_SCAN_DIRS} -xdev -type f -perm /6000 2>/dev/null | sort -u; }
 scan_root_accounts() { awk -F: '$3==0 {print $1}' /etc/passwd 2>/dev/null | sort -u; }
+# Every SSH authorized_keys file, as "<path> (sha256 <prefix>)". The audit watches armed
+# by maze-sentinel-setup only cover files that existed on first boot — and a
+# fresh install has none — so creating ~/.ssh/authorized_keys, the classic way
+# to plant remote access, was never reported. A new file or changed content
+# shows up here as a new line.
+scan_authkeys() {
+    local f
+    for f in /root/.ssh/authorized_keys /root/.ssh/authorized_keys2 \
+             /home/*/.ssh/authorized_keys /home/*/.ssh/authorized_keys2; do
+        [[ -f "${f}" ]] || continue
+        sha256sum "${f}" 2>/dev/null | awk '{ printf "%s (sha256 %s)\n", $2, substr($1, 1, 16) }'
+    done | sort -u
+}
 
 # Emit an alert for every line that is in $2 (current) but not in the baseline
 # file $1, then adopt the current set as the new baseline (so each item alerts
@@ -156,9 +187,11 @@ diff_and_alert() {
 baseline_loop() {
     local suid_base="${STATE_DIR}/suid.list"
     local acct_base="${STATE_DIR}/root-accounts.list"
+    local keys_base="${STATE_DIR}/authorized-keys.list"
     # Seed baselines on first run (silently — this is the trusted initial state).
     [[ -f "${suid_base}" ]] || scan_suid          > "${suid_base}" 2>/dev/null || true
     [[ -f "${acct_base}" ]] || scan_root_accounts > "${acct_base}" 2>/dev/null || true
+    [[ -f "${keys_base}" ]] || scan_authkeys      > "${keys_base}" 2>/dev/null || true
     while sleep "${SCAN_INTERVAL}"; do
         diff_and_alert "${suid_base}" "$(scan_suid)" "new-suid" \
             "Maze Sentinel: a new root-privileged program appeared" \
@@ -166,6 +199,9 @@ baseline_loop() {
         diff_and_alert "${acct_base}" "$(scan_root_accounts)" "new-root-account" \
             "Maze Sentinel: a new administrator account was created" \
             "A new account with full root privileges now exists: " "critical"
+        diff_and_alert "${keys_base}" "$(scan_authkeys)" "ssh-authorized-keys" \
+            "Maze Sentinel: an SSH remote-access key was added or changed" \
+            "Such a key lets someone log into this computer over the network. If this was not you, remove it and change your passwords. File: " "critical"
     done
 }
 

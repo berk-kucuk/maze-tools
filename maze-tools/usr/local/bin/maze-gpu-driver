@@ -44,6 +44,53 @@ esac
 
 has_nvidia_gpu() { lspci -nn 2>/dev/null | grep -iE 'VGA|3D|Display' | grep -qi 'NVIDIA'; }
 
+# True when the GPU that owns the panel (firmware's boot_vga) is the NVIDIA card
+# — i.e. a desktop / no-iGPU box. On hybrid laptops the panel is on i915/amdgpu
+# and the installer already settled the initramfs around that; nothing here
+# should touch HOOKS there.
+panel_is_nvidia() {
+    local pd drv=""
+    for pd in /sys/bus/pci/devices/*; do
+        [[ "$(cat "${pd}/boot_vga" 2>/dev/null)" == "1" ]] || continue
+        drv="$(basename "$(readlink -f "${pd}/driver" 2>/dev/null)" 2>/dev/null)"
+        [[ -n "${drv}" ]] && break
+        # bound to nothing (blacklisted nouveau, driver not yet built): go by vendor
+        [[ "$(cat "${pd}/vendor" 2>/dev/null)" == "0x10de" ]] && drv="nvidia"
+        break
+    done
+    case "${drv}" in nvidia|nouveau) return 0 ;; *) return 1 ;; esac
+}
+
+# The `kms` mkinitcpio hook only knows IN-TREE DRM drivers. With the proprietary
+# driver installed it therefore adds NOUVEAU (matched by the PCI alias) and the
+# whole /usr/lib/firmware/nvidia tree — ~110 MB — and the nvidia-utils blacklist
+# that `modconf` copies in alongside then forbids nouveau from ever loading.
+# Measured on a Ryzen 5700X + RTX 5060 desktop: 150 MB UKI with `kms`, of which
+# 112 MB was that never-read firmware; Plymouth and the LUKS box were drawn on
+# simpledrm the whole time and nvidia-drm only came up from the real root. So
+# with nvidia on the panel, `kms` costs ~10 s of firmware+loader time per boot
+# and buys nothing. With nouveau on the panel it is what puts the splash on the
+# real GPU, so it goes back in when reverting.
+drop_kms_hook() {
+    [[ -f /etc/mkinitcpio.conf ]] || return 0
+    grep -qE '^[[:space:]]*HOOKS=\([^)]*\bkms\b' /etc/mkinitcpio.conf || return 0
+    sed -i -E '/^[[:space:]]*HOOKS=/ s/[[:space:]]*\bkms\b//' /etc/mkinitcpio.conf \
+        && log "removed 'kms' from mkinitcpio HOOKS (would only add blacklisted nouveau + ~110 MB firmware to the UKI)" \
+        || warn "could not remove 'kms' from mkinitcpio HOOKS"
+}
+restore_kms_hook() {
+    [[ -f /etc/mkinitcpio.conf ]] || return 0
+    grep -qE '^[[:space:]]*HOOKS=\([^)]*\bkms\b' /etc/mkinitcpio.conf && return 0
+    # Canonical Arch position: right after `microcode`, before `modconf`.
+    if grep -qE '^[[:space:]]*HOOKS=\([^)]*\bmodconf\b' /etc/mkinitcpio.conf; then
+        sed -i -E '/^[[:space:]]*HOOKS=/ s/\bmodconf\b/kms modconf/' /etc/mkinitcpio.conf \
+            && log "restored 'kms' in mkinitcpio HOOKS (nouveau draws the splash on the real GPU)" \
+            || warn "could not restore 'kms' in mkinitcpio HOOKS"
+    else
+        warn "mkinitcpio HOOKS has no 'modconf' anchor — 'kms' not restored, splash stays on simpledrm"
+    fi
+}
+
 # Rebuild the actual booted UKI(s) for every installed kernel. Maze ships
 # layout=uki (/etc/kernel/install.conf), so the real boot artifact lives at
 # $ESP/EFI/Linux/<machine-id>-<kver>.efi and is built ONLY by `kernel-install
@@ -83,7 +130,7 @@ rebuild_ukis() {
 # NO module loads at all — vfat included, which is why /boot cannot even be
 # mounted afterwards to diagnose it.
 verify_boot_chain() {
-    local kver esp uki grub gk f rc=0
+    local kver esp uki grub gk f rc=0 pin
     kver="$(for f in /usr/lib/modules/*/; do
                 [[ -f "${f}vmlinuz" ]] || continue
                 f="${f%/}"; printf '%s\n' "${f##*/}"
@@ -102,7 +149,26 @@ verify_boot_chain() {
         return 1
     fi
 
-    # 1) The ESP must carry a UKI for the kernel that is actually installed.
+    # The kernel grubx64.efi is SUPPOSED to carry: the one pinned with the
+    # Kernel Switcher (/etc/maze/kernel-default), if that kernel is installed and
+    # has a UKI — the same rule maze-sb-sign applies — otherwise the newest.
+    # Comparing against the newest unconditionally reported every machine with
+    # linux-lts pinned as "DO NOT REBOOT" after a perfectly good driver install.
+    pin=""
+    [[ -r /etc/maze/kernel-default ]] && pin="$(tr -d '[:space:]' < /etc/maze/kernel-default)"
+    if [[ -n "${pin}" ]]; then
+        for f in /usr/lib/modules/*/pkgbase; do
+            [[ -r "${f}" && "$(cat "${f}")" == "${pin}" ]] || continue
+            f="${f%/pkgbase}"; f="${f##*/}"
+            if [[ -f "/usr/lib/modules/${f}/vmlinuz" ]] && compgen -G "${esp}/EFI/Linux/*${f}.efi" >/dev/null; then
+                kver="${f}"
+                log "verify: boot default is pinned to '${pin}' (${kver})"
+            fi
+            break
+        done
+    fi
+
+    # 1) The ESP must carry a UKI for the kernel that is expected to boot.
     uki=""
     for f in "${esp}"/EFI/Linux/*"${kver}".efi; do
         if [[ -f "${f}" ]]; then uki="${f}"; fi
@@ -144,15 +210,6 @@ verify_boot_chain() {
     return "${rc}"
 }
 
-secure_boot_active() {
-    # mokutil is the most reliable; fall back to the efivar.
-    if command -v mokutil >/dev/null 2>&1; then
-        mokutil --sb-state 2>/dev/null | grep -qi 'enabled' && return 0
-    fi
-    [[ -d /sys/firmware/efi ]] && \
-        grep -qi '\x01$' /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null && return 0
-    return 1
-}
 # We set up signing whenever a per-machine MOK key exists (i.e. the installer
 # configured Secure Boot), even if SB happens to be OFF right now — so enabling
 # it later just works.
@@ -177,8 +234,20 @@ fi
 # ---------------------------------------------------------------------------
 revert_to_open() {
     log "Removing the proprietary NVIDIA driver (reverting to open-source)"
-    pacman -Rns --noconfirm nvidia-dkms nvidia-utils lib32-nvidia-utils cuda ollama-cuda 2>/dev/null || \
-        warn "could not remove some nvidia packages (maybe not installed)"
+    # Only what is actually installed: one missing name ("target not found")
+    # makes pacman abort the WHOLE -Rns — and cuda/ollama-cuda are best-effort
+    # extras that are often absent — so the driver stayed installed while the
+    # rest of this function went on to delete its configuration.
+    local _nv=() _p
+    for _p in nvidia-dkms nvidia-utils lib32-nvidia-utils cuda ollama-cuda; do
+        pacman -Qq "${_p}" >/dev/null 2>&1 && _nv+=("${_p}")
+    done
+    if ((${#_nv[@]})); then
+        pacman -Rns --noconfirm "${_nv[@]}" \
+            || die "could not remove ${_nv[*]} — nothing else was changed. Check the pacman output above."
+    else
+        log "no proprietary NVIDIA packages are installed"
+    fi
     rm -f /etc/modprobe.d/nvidia.conf
     # Drop nvidia from initramfs MODULES.
     if [[ -f /etc/mkinitcpio.conf ]]; then
@@ -187,6 +256,9 @@ revert_to_open() {
         sed -i -E '/^[[:space:]]*MODULES=/ s/[[:space:]]*nvidia(_modeset|_uvm|_drm)?\??//g' \
             /etc/mkinitcpio.conf || true
     fi
+    # Back on nouveau: if it owns the panel, `kms` is the only thing that puts
+    # the splash on the real GPU again (the install path removed it).
+    panel_is_nvidia && restore_kms_hook
     mkinitcpio -P || warn "mkinitcpio rebuild failed"
     rebuild_ukis
     # command -v, not a hardcoded path: the packaged binary lives at
@@ -286,6 +358,10 @@ if [[ -f /etc/mkinitcpio.conf ]]; then
     sed -i -E '/^[[:space:]]*MODULES=/ s/[[:space:]]*\b(nouveau|nvidia(_modeset|_uvm|_drm)?)\b\??//g' \
         /etc/mkinitcpio.conf || warn "could not clean mkinitcpio MODULES"
 fi
+# On a desktop where the NVIDIA card IS the panel, the installer (which ran on
+# the nouveau live medium) kept `kms`; now that nouveau is blacklisted the hook
+# is ~110 MB of dead weight in every UKI — see drop_kms_hook().
+panel_is_nvidia && drop_kms_hook
 # nvidia-hibernate.service is intentionally left out: Maze cannot hibernate.
 # There is no swap partition (the installer does not offer one), so no `resume`
 # hook and no `resume=` on the cmdline, and the everyday swap is zram — which

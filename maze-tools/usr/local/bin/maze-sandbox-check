@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+#
+# maze-sandbox-check — prove that the sandboxed Maze services can still do
+# their jobs.
+#
+# Maze's root daemons (maze-guard, maze-cloak, maze-guardd, maze-sentinel,
+# entropy-shield) run under systemd sandboxing: no module loading where it is
+# not needed, a syscall allow-list, no new namespaces, private /tmp, and so on.
+# A directive that is one step too strict does not crash anything — it makes
+# one feature fail quietly (the firewall toggle, the camera kill switch, ...).
+# This tool finds that before a user does:
+#
+#   for each service, its sandbox directives are read from `systemctl cat`
+#   (i.e. what is really installed, drop-ins and local edits included), and
+#   every operation that daemon performs is run twice — once plainly, once
+#   under exactly those directives via `systemd-run`. Plain OK + sandboxed FAIL
+#   = the sandbox breaks that feature.
+#
+# Every probe is harmless: reads, a file created and removed at once, a sysctl
+# written back to the value it already has, signal 0.
+#
+# Usage:
+#   sudo maze-sandbox-check [--no-color] [--dry-run]
+#     --dry-run   print the directives and probes, run nothing
+#
+# Exit code: 0 = no sandbox-caused failure, 1 = at least one, 2 = cannot run.
+
+set -u
+COLOR=1; DRY=0
+for a in "$@"; do
+    case "$a" in
+        --no-color) COLOR=0 ;;
+        --dry-run)  DRY=1 ;;
+        -h|--help)  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "maze-sandbox-check: unknown option: $a" >&2; exit 2 ;;
+    esac
+done
+[[ -t 1 ]] || COLOR=0
+if [[ "${COLOR}" -eq 1 ]]; then
+    G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; C=$'\e[36m'; B=$'\e[1;34m'; M=$'\e[35m'; N=$'\e[0m'
+else G=""; R=""; Y=""; C=""; B=""; M=""; N=""; fi
+
+if [[ "${DRY}" -eq 0 && "$(id -u)" -ne 0 ]]; then
+    echo "maze-sandbox-check: run as root (sudo) — it starts probes as system services." >&2
+    exit 2
+fi
+
+N_OK=0; N_FAIL=0; N_NA=0
+FAILS=""
+
+# The desktop user the probes act on (runuser/sudo/PipeWire).
+USR="${SUDO_USER:-}"
+[[ -n "${USR}" && "${USR}" != root ]] || USR="$(awk -F: '$3>=1000 && $3<65000 {print $1; exit}' /etc/passwd)"
+UID_="$(id -u "${USR}" 2>/dev/null || echo 1000)"
+
+# Sandbox-relevant directives of an installed unit, as systemd-run -p arguments.
+SANDBOX_KEYS='^(Protect[A-Za-z]*|Private[A-Za-z]*|Restrict[A-Za-z]*|NoNewPrivileges|LockPersonality|MemoryDenyWriteExecute|SystemCall[A-Za-z]*|CapabilityBoundingSet|AmbientCapabilities|DevicePolicy|DeviceAllow|ReadWritePaths|ReadOnlyPaths|InaccessiblePaths|UMask|ProcSubset)='
+PROPS=()
+load_props() {
+    PROPS=()
+    local line
+    while IFS= read -r line; do
+        PROPS+=(-p "${line}")
+    done < <(systemctl cat "$1" 2>/dev/null \
+             | awk '/^\[/{s=($0=="[Service]")} s' \
+             | grep -E "${SANDBOX_KEYS}")
+}
+
+# probe <description> <command...>
+probe() {
+    local desc="$1"; shift
+    if [[ "${DRY}" -eq 1 ]]; then
+        printf '    %s%s%s\n        %s\n' "${C}" "${desc}" "${N}" "$*"
+        return
+    fi
+    if ! timeout 20 "$@" </dev/null >/dev/null 2>&1; then
+        N_NA=$((N_NA + 1))
+        printf '  %s[ -- ]%s %s %s(fails without the sandbox too — not applicable here)%s\n' "${M}" "${N}" "${desc}" "${M}" "${N}"
+        return
+    fi
+    local err
+    if err="$(timeout 40 systemd-run --quiet --wait --pipe --collect "${PROPS[@]}" -- "$@" </dev/null 2>&1 >/dev/null)"; then
+        N_OK=$((N_OK + 1))
+        printf '  %s[ OK ]%s %s\n' "${G}" "${N}" "${desc}"
+    else
+        N_FAIL=$((N_FAIL + 1))
+        FAILS+="  - ${UNIT}: ${desc}"$'\n'
+        printf '  %s[FAIL]%s %s — the sandbox blocks it\n' "${R}" "${N}" "${desc}"
+        [[ -n "${err}" ]] && printf '%s\n' "${err}" | tail -n 3 | sed 's/^/         | /'
+    fi
+}
+
+# unit <name> — start a section; false when the unit is not installed.
+unit() {
+    UNIT="$1"
+    printf '\n%s== %s ==%s\n' "${B}" "${UNIT}" "${N}"
+    if ! systemctl cat "${UNIT}" >/dev/null 2>&1; then
+        printf '  %s[ -- ]%s not installed\n' "${M}" "${N}"
+        return 1
+    fi
+    load_props "${UNIT}"
+    printf '  %s%d sandbox directive(s)%s\n' "${C}" "$(( ${#PROPS[@]} / 2 ))" "${N}"
+    [[ "${DRY}" -eq 1 ]] && printf '        %s\n' "${PROPS[@]}" | grep -v -- '^        -p$'
+    return 0
+}
+
+tmpfile_probe() {  # create and remove a file in $1
+    bash -c 'd="$1"; [ -d "$d" ] || exit 1; f="$d/.maze-sandbox-probe"; : > "$f" && rm -f "$f"' _ "$1"
+}
+export -f tmpfile_probe 2>/dev/null || true
+MANAGE_UNIT=(systemctl kill --signal=0 --kill-whom=main systemd-journald.service)
+
+printf '%sMaze sandbox check%s — desktop user: %s\n' "${B}" "${N}" "${USR}"
+
+if unit maze-guard.service; then
+    probe "read a sysctl the fingerprint module changes" sysctl -n net.ipv4.ip_default_ttl
+    probe "write it back unchanged" bash -c 'v=$(sysctl -n net.ipv4.ip_default_ttl) && sysctl -qw net.ipv4.ip_default_ttl="$v"'
+    probe "open a packet-capture socket (AF_PACKET)" /opt/maze/venv/bin/python3 -c 'import socket; socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0x0300).close()'
+    probe "ask firewalld over D-Bus" firewall-cmd --state
+    probe "manage a systemd unit over D-Bus (signal 0, no effect)" "${MANAGE_UNIT[@]}"
+    probe "see which process owns a connection (another user's /proc/PID/fd)" \
+        bash -c 'for p in /proc/[0-9]*; do [ "$(stat -c %u "$p" 2>/dev/null)" = "'"${UID_}"'" ] || continue; ls "$p/fd" >/dev/null 2>&1 && exit 0; done; exit 1'
+fi
+
+if unit maze-cloak.service; then
+    probe "change a link over netlink (lo up — already up)" ip link set dev lo up
+    probe "list interfaces and addresses" ip -o addr show
+    probe "ask NetworkManager to reload its config (D-Bus)" nmcli general reload conf
+    probe "write /etc/NetworkManager/conf.d" bash -c 'f=/etc/NetworkManager/conf.d/.maze-sandbox-probe; : > "$f" && rm -f "$f"'
+    probe "manage a systemd unit over D-Bus (signal 0, no effect)" "${MANAGE_UNIT[@]}"
+fi
+
+if unit maze-guardd.service; then
+    probe "radio kill switches (rfkill)" rfkill list
+    probe "microphone mixer (ALSA)" amixer -c 0 scontrols
+    probe "write /etc/modprobe.d (camera kill switch)" bash -c 'f=/etc/modprobe.d/.maze-sandbox-probe; : > "$f" && rm -f "$f"'
+    probe "USB authorize switches are writable" bash -c 'f=$(ls /sys/bus/usb/devices/*/authorized 2>/dev/null | head -1); [ -n "$f" ] && [ -w "$f" ]'
+    probe "drop_caches is writable (panic)" test -w /proc/sys/vm/drop_caches
+    probe "act as the desktop user (runuser)" runuser -u "${USR}" -- true
+    probe "reach the user's PipeWire (microphone kill)" runuser -u "${USR}" -- env XDG_RUNTIME_DIR="/run/user/${UID_}" wpctl status
+    probe "read the journal (panic cleanup)" journalctl -n 1 -q
+    probe "list login sessions" loginctl list-sessions --no-legend
+    probe "manage a systemd unit over D-Bus (signal 0, no effect)" "${MANAGE_UNIT[@]}"
+fi
+
+if unit maze-sentinel.service; then
+    probe "query the audit subsystem" auditctl -s
+    probe "read the audit log" test -r /var/log/audit/audit.log
+    probe "ask pacman who owns a file" pacman -Qqo /usr/bin/bash
+    probe "notify the desktop user (sudo -u)" sudo -n -u "${USR}" true
+    probe "write its baseline directory" bash -c 'f=/var/lib/maze/.maze-sandbox-probe; : > "$f" && rm -f "$f"'
+fi
+
+if unit entropy-shield.service; then
+    probe "firewall tables (nft)" nft list tables
+    probe "iptables rules" iptables -S
+    probe "routing table" ip route show
+    probe "resolved over D-Bus" resolvectl status
+    probe "act as the desktop user (runuser, onion share)" runuser -u "${USR}" -- true
+    probe "act as the desktop user (su)" su -s /bin/sh "${USR}" -c true
+    probe "write /etc/profile.d (proxy environment)" bash -c 'f=/etc/profile.d/.maze-sandbox-probe; : > "$f" && rm -f "$f"'
+    probe "run tor" tor --version
+    probe "manage a systemd unit over D-Bus (signal 0, no effect)" "${MANAGE_UNIT[@]}"
+fi
+
+# The open question for tightening further: could these daemons drop
+# CAP_SYS_ADMIN? They manage units over D-Bus, and systemd may require that
+# capability of a caller before it trusts uid 0.
+printf '\n%s== could the daemons give up CAP_SYS_ADMIN? ==%s\n' "${B}" "${N}"
+if [[ "${DRY}" -eq 1 ]]; then
+    printf '    %s\n' "${MANAGE_UNIT[*]}  (with CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW)"
+elif timeout 40 systemd-run --quiet --wait --pipe --collect \
+        -p "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW" -- "${MANAGE_UNIT[@]}" </dev/null >/dev/null 2>&1; then
+    printf '  %s[info]%s yes — systemd accepts unit management from root without CAP_SYS_ADMIN;\n' "${C}" "${N}"
+    printf '         the capability bounding sets can be narrowed in a next step\n'
+else
+    printf '  %s[info]%s no — systemd needs CAP_SYS_ADMIN from a unit-managing caller;\n' "${C}" "${N}"
+    printf '         the daemons that start/stop services must keep it\n'
+fi
+
+[[ "${DRY}" -eq 1 ]] && exit 0
+printf '\n%s== Summary ==%s\n  %s%d OK%s   %s%d FAIL%s   %s%d not applicable%s\n' \
+    "${B}" "${N}" "${G}" "${N_OK}" "${N}" "${R}" "${N_FAIL}" "${N}" "${M}" "${N_NA}" "${N}"
+if [[ "${N_FAIL}" -gt 0 ]]; then
+    printf '\n%sBlocked by the sandbox:%s\n%s' "${R}" "${N}" "${FAILS}"
+    printf '\nRelax the directive for that service with: sudo systemctl edit <service>\n'
+    printf 'and please report which one it was.\n'
+    exit 1
+fi
+exit 0

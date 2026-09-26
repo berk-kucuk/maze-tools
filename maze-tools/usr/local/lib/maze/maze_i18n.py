@@ -89,6 +89,7 @@ _TR: dict[str, str] = {
     "Secure Boot enabled": "Güvenli Önyükleme etkin",
     "Kernel/network hardening (sysctl)": "Çekirdek/ağ sıkılaştırma (sysctl)",
     "VPN or Tor active": "VPN veya Tor etkin",
+    "VPN active": "VPN etkin",
     # -- Control Center: shell / nav -------------------------------------
     "Control Center": "Kontrol Merkezi",
     "Overview": "Genel Bakış",

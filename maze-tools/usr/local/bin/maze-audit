@@ -131,7 +131,14 @@ section "1. Identity"
 . /etc/os-release 2>/dev/null || true
 [[ "${ID:-}" == "mazelinux" && "${NAME:-}" == "Maze Linux" ]] \
     && pass "os-release: ${PRETTY_NAME:-?} (ID=${ID:-?})" \
-    || fail "os-release is not Maze (ID=${ID:-?}, NAME=${NAME:-?})" "deploy copies /usr/local/share/maze/os-release -> /usr/lib/os-release"
+    || fail "os-release is not Maze (ID=${ID:-?}, NAME=${NAME:-?})" "maze-branding's zz-maze-os-release.hook copies /usr/share/maze/os-release -> /usr/lib/os-release (reinstall maze-branding)"
+# The packaged copy is the source of truth (maze-branding >= 1.6.1-2); after a
+# filesystem upgrade its hook must have put it back.
+if [[ -f /usr/share/maze/os-release ]]; then
+    cmp -s /usr/lib/os-release /usr/share/maze/os-release \
+        && pass "/usr/lib/os-release matches maze-branding's copy" \
+        || fail "/usr/lib/os-release differs from /usr/share/maze/os-release" "a filesystem upgrade reverted it and the hook did not run — sudo pacman -S maze-branding"
+fi
 if [[ -L /etc/os-release ]]; then pass "/etc/os-release is a symlink -> $(readlink /etc/os-release)"; else warn "/etc/os-release is not a symlink"; fi
 if [[ -n "${SRC}" && -f "${SRC}/MazeLinux/airootfs/usr/local/share/maze/os-release" ]]; then
     cmp -s /usr/lib/os-release "${SRC}/MazeLinux/airootfs/usr/local/share/maze/os-release" \
@@ -164,25 +171,63 @@ for p in quiet splash bgrt_disable logo.nologo "lsm=landlock,lockdown,yama,integ
     if grep -qwF -- "$p" <<<"${CMDLINE}"; then pass "cmdline has ${p}"; else fail "cmdline lacks ${p}" "deploy appends it to /etc/kernel/cmdline before the UKI build"; fi
 done
 grep -qE '(^| )root=' <<<"${CMDLINE}" && pass "root= present" || fail "root= missing from cmdline"
-grep -qE 'rootflags=subvol=/?@( |$)' <<<"${CMDLINE}" && pass "rootflags=subvol=@ (Calamares btrfs layout)" || info "no rootflags=subvol=@ (rollback mode via btrfs default subvolume, or non-btrfs)"
+# maze-installer >= 2.0.0-31 enables rollback mode at install (maze-enable-rollback):
+# no subvol pin, root comes from the btrfs default subvolume.
+if grep -qE 'rootflags=[^ ]*subvol=' <<<"${CMDLINE}"; then
+    warn "root is pinned to a subvolume on the cmdline — 'maze-rollback' cannot take effect" "enable: sudo maze-enable-rollback --apply (then reboot once)"
+else
+    pass "no subvolume pin on the cmdline (rollback mode: root = btrfs default subvolume)"
+fi
 if grep -q 'cryptdevice=' <<<"${CMDLINE}"; then
     grep -qE 'cryptdevice=[^ ]*:allow-discards' <<<"${CMDLINE}" && pass "cryptdevice carries allow-discards (TRIM through dm-crypt)" || warn "cryptdevice= without allow-discards — TRIM will not reach the SSD"
     ROOT_IS_LUKS=1
 else
     ROOT_IS_LUKS=0; info "no cryptdevice= — root is not LUKS"
 fi
+# The cmdline sealed in the image shim actually boots (grubx64.efi, a UKI).
+# It tells "the UKI is stale" apart from "the UKI is already rebuilt and only a
+# reboot is pending" — right after maze-gpu-driver or any cmdline change, the
+# running cmdline differs from /etc/kernel/cmdline in BOTH cases, and only the
+# first one needs action.
+_cmd_set() { tr -s ' \n' '\n\n' | grep -v -e '^systemd\.machine_id=' -e '^$' | sort -u; }
+_UKI_CMD=""
+if has objcopy; then
+    _esp_c="$(bootctl --print-esp-path 2>/dev/null || true)"
+    for _e in "${_esp_c}" /efi /boot /boot/efi; do
+        [[ -n "${_e}" && -r "${_e}/EFI/BOOT/grubx64.efi" ]] || continue
+        _t="$(mktemp)"
+        objcopy -O binary --only-section=.cmdline "${_e}/EFI/BOOT/grubx64.efi" "${_t}" 2>/dev/null \
+            && _UKI_CMD="$(tr -d '\0' < "${_t}")"
+        rm -f "${_t}"
+        break
+    done
+fi
 if pacman -Qq nvidia nvidia-dkms nvidia-open nvidia-open-dkms nvidia-lts 2>/dev/null | grep -q .; then
-    grep -q 'nvidia' <<<"${CMDLINE}" && pass "NVIDIA installed and nvidia params on cmdline" || warn "NVIDIA driver installed but no nvidia params on cmdline"
+    if grep -q 'nvidia' <<<"${CMDLINE}"; then
+        pass "NVIDIA installed and nvidia params on cmdline"
+    elif grep -q 'nvidia' <<<"${_UKI_CMD}"; then
+        info "NVIDIA params are sealed in the boot image — they take effect at the next reboot"
+    else
+        warn "NVIDIA driver installed but no nvidia params on cmdline" "re-run: sudo maze-gpu-driver"
+    fi
 fi
 if [[ -f /etc/kernel/cmdline ]]; then
     _etc="$(tr -s ' \n' '  ' < /etc/kernel/cmdline | sed 's/ *$//')"
     _proc="$(sed -E 's/ systemd\.machine_id=[0-9a-f]+//; s/ *$//' <<<"${CMDLINE}")"
-    if [[ "$(tr ' ' '\n' <<<"${_etc}" | sort)" == "$(tr ' ' '\n' <<<"${_proc}" | sort)" ]]; then
+    if [[ "$(_cmd_set <<<"${_etc}")" == "$(_cmd_set <<<"${_proc}")" ]]; then
         pass "/etc/kernel/cmdline matches the running cmdline (UKI is current)"
+    elif [[ -n "${_UKI_CMD}" && "$(_cmd_set <<<"${_etc}")" == "$(_cmd_set <<<"${_UKI_CMD}")" ]]; then
+        info "new boot parameters are already sealed in the signed UKI — reboot to apply them"
+        _added="$(comm -13 <(_cmd_set <<<"${_proc}") <(_cmd_set <<<"${_etc}") | tr '\n' ' ')"
+        _gone="$(comm -23 <(_cmd_set <<<"${_proc}") <(_cmd_set <<<"${_etc}") | tr '\n' ' ')"
+        [[ -n "${_added// }" ]] && detail "added  : ${_added}"
+        [[ -n "${_gone// }" ]] && detail "removed: ${_gone}"
     else
-        warn "/etc/kernel/cmdline differs from /proc/cmdline (next UKI build changes the boot params)"
+        warn "/etc/kernel/cmdline differs from the boot image's cmdline (next UKI build changes the boot params)" \
+             "rebuild + re-sign now: sudo maze-initramfs-rebuild"
         detail "etc : ${_etc}"
         detail "proc: ${_proc}"
+        [[ -n "${_UKI_CMD}" ]] && detail "uki : $(tr -s ' \n' '  ' <<<"${_UKI_CMD}" | sed 's/ *$//')"
     fi
 else
     fail "/etc/kernel/cmdline missing — kernel-install cannot build a correct UKI"
@@ -194,9 +239,29 @@ section "3. Initramfs configuration and Plymouth"
 MKCONF=/etc/mkinitcpio.conf
 HOOKS="$(grep -E '^[[:space:]]*HOOKS=' "${MKCONF}" 2>/dev/null | tail -1)"
 info "${HOOKS:-HOOKS= <missing>}"
-for h in base udev autodetect microcode kms modconf keyboard block plymouth filesystems; do
+for h in base udev autodetect microcode modconf keyboard block plymouth filesystems; do
     grep -qE "\b${h}\b" <<<"${HOOKS}" && pass "hook ${h}" || warn "hook ${h} not in HOOKS"
 done
+# `kms` is machine-dependent: absent by design on hybrid laptops (panel driver
+# goes into MODULES) and on proprietary-nvidia desktops (it would only add
+# blacklisted nouveau + ~110 MB firmware to the UKI).
+if grep -qE '\bkms\b' <<<"${HOOKS}"; then
+    if pacman -Qq nvidia-utils >/dev/null 2>&1; then
+        warn "hook kms present with the proprietary nvidia driver — ~110 MB of unused nouveau firmware in every UKI (slow firmware/loader phase)" \
+             "fix: drop 'kms' from HOOKS in ${MKCONF}, then: sudo maze-initramfs-rebuild"
+    else
+        pass "hook kms"
+    fi
+else
+    _mods="$(sed -nE 's/^[[:space:]]*MODULES=\(([^)]*)\).*/\1/p' "${MKCONF}" 2>/dev/null | tail -1 | tr -d ' ')"
+    if pacman -Qq nvidia-utils >/dev/null 2>&1; then
+        pass "hook kms absent (by design with the proprietary nvidia driver)"
+    elif [[ -n "${_mods}" ]]; then
+        pass "hook kms absent; MODULES carries the panel driver (${_mods})"
+    else
+        warn "hook kms absent and MODULES empty — early KMS is off (splash/LUKS box on simpledrm until root)"
+    fi
+fi
 grep -qE '\bfsck\b' <<<"${HOOKS}" || info "no fsck hook (fine on btrfs; Calamares omits it there)"
 if [[ "${ROOT_IS_LUKS}" -eq 1 ]]; then
     grep -qE '\bencrypt\b' <<<"${HOOKS}" && pass "hook encrypt (LUKS root will prompt)" || fail "LUKS root but no 'encrypt' hook — the machine could not unlock its disk after the next rebuild"
@@ -400,7 +465,13 @@ done
 # NOPASSWD anywhere?
 _np="$(grep -rlsE '^[[:space:]]*[^#[:space:]].*NOPASSWD' /etc/sudoers /etc/sudoers.d 2>/dev/null)"
 [[ -n "${_np}" ]] && fail "active NOPASSWD sudo rule(s): $(tr '\n' ' ' <<<"${_np}")" || pass "no passwordless sudo"
-if [[ -f /etc/sudoers.d/10-maze-wheel ]] && grep -qE '^%wheel ALL=\(ALL:ALL\) ALL' /etc/sudoers.d/10-maze-wheel; then pass "/etc/sudoers.d/10-maze-wheel: wheel with password"; else warn "/etc/sudoers.d/10-maze-wheel missing or unexpected"; fi
+# maze-hardening >= 1.0.0-8 ships the rule as 00-maze-wheel; older installs
+# have the installer-written 10-maze-wheel.
+_wr=""
+for _w in /etc/sudoers.d/00-maze-wheel /etc/sudoers.d/10-maze-wheel; do
+    [[ -f "$_w" ]] && grep -qE '^%wheel ALL=\(ALL:ALL\) ALL' "$_w" && { _wr="$_w"; break; }
+done
+if [[ -n "$_wr" ]]; then pass "${_wr}: wheel with password"; else warn "no wheel sudo rule (00-maze-wheel / 10-maze-wheel) — missing or unexpected"; fi
 for f in /etc/sudoers.d/*; do [[ -f "$f" ]] && { m="$(stat -c %a "$f")"; [[ "$m" == "440" || "$m" == "400" ]] || warn "$f mode ${m} (sudo wants 0440)"; }; done
 visudo -c >/dev/null 2>&1 && pass "visudo -c: sudoers parse OK" || fail "visudo -c reports a syntax error"
 [[ -e /etc/skel/.config/autostart/maze-welcome.desktop ]] && pass "skel has the first-login Maze Welcome autostart (installed-system only)" || warn "skel lacks maze-welcome.desktop autostart"
@@ -411,6 +482,24 @@ if grep -qs 'maze-calamares' /etc/skel/.config/plasma-org.kde.plasma.desktop-app
 else pass "installer launcher stripped from skel panel"; fi
 
 # ============================================================ 6. root/users =
+# What the installer itself recorded (maze-installer >= 2.0.0-33 writes it).
+_sum=/var/log/maze-install-summary.txt
+if [[ -r "${_sum}" ]]; then
+    if grep -q '^CRITICAL' "${_sum}"; then
+        fail "the installer recorded CRITICAL problems on this machine" "see ${_sum}"
+        sed -n '/^CRITICAL/,/^$/p' "${_sum}" | sed -n '2,6p' | grep -v '^$' | while IFS= read -r l; do detail "${l}"; done
+    else
+        _nw="$(sed -n 's/^Warnings (\([0-9]*\)).*/\1/p' "${_sum}")"
+        if [[ -n "${_nw}" && "${_nw}" -gt 0 ]]; then
+            info "the installer finished with ${_nw} warning(s) — see ${_sum}"
+        else
+            pass "the installer finished without warnings"
+        fi
+    fi
+else
+    info "no installer summary (installed with an older Maze installer)"
+fi
+
 section "6. Root account, users, shells, homes"
 _rf="$(awk -F: '$1=="root"{print $2}' /etc/shadow)"
 case "${_rf}" in
@@ -548,7 +637,7 @@ _kr=/etc/pacman.d/gnupg/pubring.gpg
 if [[ -f "${_kr}" && "$(stat -c %s "${_kr}")" -gt 10240 ]]; then pass "pacman keyring populated ($(stat -c %s "${_kr}") bytes)"; else fail "pacman keyring missing/empty — every signed package install fails"; fi
 pacman-key --list-keys 2>/dev/null | grep -qi 'maze' && pass "Maze signing key in pacman keyring" || fail "no Maze key in the pacman keyring (mazelinux-keyring not populated?)"
 mountpoint -q /etc/pacman.d/gnupg && fail "/etc/pacman.d/gnupg is a mountpoint (live tmpfs shadowing the keyring)" || pass "/etc/pacman.d/gnupg is on disk"
-pacman -Sl mazelinux >/dev/null 2>&1 && pass "[mazelinux] sync db present ($(pacman -Sl mazelinux 2>/dev/null | wc -l) pkgs)" || warn "[mazelinux] sync db not downloaded yet (pacman -Sy)"
+pacman -Sl mazelinux >/dev/null 2>&1 && pass "[mazelinux] sync db present ($(pacman -Sl mazelinux 2>/dev/null | wc -l) pkgs)" || warn "[mazelinux] sync db not downloaded yet (pacman -Syu)"
 _upd="$(checkupdates 2>/dev/null | wc -l)"; has checkupdates && info "pending official/[mazelinux] updates: ${_upd}"
 pkg_installed plasma-welcome && warn "plasma-welcome still installed (deploy removes it so only Maze Welcome runs)" || pass "KDE plasma-welcome removed"
 # pacman hooks of the maze packages present?
@@ -576,10 +665,10 @@ if [[ -n "${SRC}" && -d "${SRC}" ]]; then
             tr ' ' '\n' <<<"${diffs}" | grep . | head -12 | sed 's/^/         | /'
         fi
     done
-    # The build-time overlay files that stay on the target
-    for f in /etc/audit/rules.d/maze.rules /etc/fail2ban/jail.d/sshd.conf /etc/ssh/sshd_config.d/00-maze-hardening.conf /etc/opensnitchd/default-config.json \
-             /etc/systemd/zram-generator.conf /etc/systemd/oomd.conf.d/10-maze.conf /etc/kernel/install.conf /etc/maze/sentinel.conf /etc/pam.d/passwd \
-             /usr/share/sddm/themes/breeze/theme.conf.user; do
+    # The build-time overlay files that stay on the target. (The rest moved into
+    # packages in 2026-09 — maze-hardening, maze-branding, maze-plasma-config,
+    # maze-tools, maze-secureboot — where pacman -Qkk checks them.)
+    for f in /etc/opensnitchd/default-config.json /etc/pam.d/passwd; do
         s="${SRC}/MazeLinux/airootfs${f}"
         [[ -f "$s" ]] || continue
         if [[ ! -e "$f" ]]; then warn "airootfs file missing on target: $f"; elif cmp -s "$s" "$f"; then pass "airootfs file identical: $f"; else warn "airootfs file differs from source: $f"; fi
@@ -590,7 +679,7 @@ fi
 
 # ============================================================== 9. services =
 section "9. systemd units"
-EXP_ENABLED=(apparmor auditd firewalld fail2ban opensnitchd tor maze-guardd maze-cloak ollama acpid power-profiles-daemon smartd systemd-oomd
+EXP_ENABLED=(apparmor auditd firewalld opensnitchd tor maze-guardd maze-cloak ollama acpid power-profiles-daemon smartd systemd-oomd
              fwupd-refresh.timer reflector.timer maze-flatpak-setup maze-sentinel maze-sentinel-setup fstrim.timer bluetooth cups clamav-freshclam
              NetworkManager display-manager systemd-resolved systemd-timesyncd
              maze-sb-resign.path maze-sb-resign.service maze-boot-guard.path maze-boot-check.timer
@@ -620,8 +709,32 @@ for u in "${EXP_DISABLED[@]}"; do
 done
 [[ "$(systemctl get-default)" == "graphical.target" ]] && pass "default target graphical" || fail "default target is $(systemctl get-default)"
 _dm="$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null)"; [[ "${_dm}" == *sddm* ]] && pass "display-manager -> sddm" || warn "display-manager -> ${_dm:-none}"
-_failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
-[[ -n "${_failed}" ]] && fail "failed units: ${_failed}" || pass "no failed units"
+# systemd >= 262 can only set up NvPCRs from a systemd initrd with a signed PCR
+# policy in the UKI; on Maze's mkinitcpio initrd systemd-tpm2-setup-early and
+# systemd-pcr* fail on every boot unless maze-secureboot's drop-ins skip them.
+# Harmless (nothing in Maze uses NvPCRs), so a WARN with the fix, not a FAIL.
+# systemd-tpm2-setup-early does not always name the NvPCR in its own log, so it
+# counts as part of the same problem when a systemd-pcr* unit failed on one.
+_failed=""; _nv=""; _setup=""
+for _u in $(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}'); do
+    if [[ "${_u}" == systemd-tpm2-setup* || "${_u}" == systemd-pcr* ]] \
+       && journalctl -b -u "${_u}" --no-pager -q 2>/dev/null | grep -q 'NvPCR'; then
+        _nv+="${_u} "
+    elif [[ "${_u}" == systemd-tpm2-setup* ]]; then
+        _setup+="${_u} "
+    else
+        _failed+="${_u} "
+    fi
+done
+[[ -n "${_nv}" ]] && _nv+="${_setup}" || _failed+="${_setup}"
+[[ -n "${_failed}" ]] && fail "failed units: ${_failed}" || pass "no failed units (other than the TPM NvPCR ones)"
+[[ -n "${_nv}" ]] && warn "TPM NvPCR units fail — systemd >= 262 needs a systemd initrd for them, Maze uses mkinitcpio: ${_nv}" \
+    "harmless for Maze. Fix: update maze-secureboot (>= 1.2.0-18 skips these units), then reboot"
+if [[ -f /usr/lib/systemd/system/systemd-tpm2-setup-early.service.d/10-maze-no-nvpcr.conf ]]; then
+    [[ -e /etc/maze/nvpcr.enable ]] \
+        && info "NvPCR units opted back in (/etc/maze/nvpcr.enable) — they need a systemd initrd with PCR-signed UKIs" \
+        || pass "NvPCR units skipped by maze-secureboot (unsupported on Maze's initrd; ordinary PCR measurements still run)"
+fi
 _uf="$(systemctl --user -M "$(awk -F: '$3>=1000 && $3<65000{print $1; exit}' /etc/passwd)@" --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
 [[ -n "${_uf}" ]] && warn "failed USER units: ${_uf}" || pass "no failed user units"
 info "boot time: $(systemd-analyze 2>/dev/null | head -1)"
@@ -707,7 +820,7 @@ if [[ "${_rfs}" == "btrfs" ]]; then
     findmnt -no OPTIONS / | grep -q 'compress=zstd' && pass "root mounted with compress=zstd" || warn "root not mounted with compress=zstd:1"
     findmnt -no OPTIONS / | grep -q 'noatime' && pass "root noatime" || info "root without noatime"
     _def="$(btrfs subvolume get-default / 2>/dev/null)"; info "btrfs default subvolume: ${_def}"
-    if grep -qE '^ID 5 ' <<<"${_def}"; then info "default subvolume is the top level (ID 5); cmdline rootflags pins @ — Calamares layout, rollback mode not enabled"
+    if grep -qE '^ID 5 ' <<<"${_def}"; then info "default subvolume is the top level (ID 5): rollback mode not enabled (sudo maze-enable-rollback --apply)"
     elif grep -qE ' path @$' <<<"${_def}"; then pass "default subvolume is @"
     else info "default subvolume is a snapshot/other (maze-enable-rollback applied, or rollback pending)"; fi
     show "btrfs filesystem usage -h / 2>/dev/null | grep -E 'Device size|Used|Free \(estimated\)|Data ratio'" 5
@@ -719,6 +832,13 @@ if [[ "${_rfs}" == "btrfs" ]]; then
         grep -qE '^TIMELINE_CREATE="?no"?' /etc/snapper/configs/root && pass "timeline snapshots off (by design)" || info "TIMELINE_CREATE not 'no'"
     else fail "no snapper config for / — maze-snapshots-setup.service did not run/succeed" "journalctl -u maze-snapshots-setup"; fi
     _err="$(btrfs device stats / 2>/dev/null | awk '$2!=0' | wc -l)"; [[ "${_err}" -eq 0 ]] && pass "btrfs device stats: no errors" || fail "btrfs device stats report errors"; show "btrfs device stats / | awk '\$2!=0'" 6
+    # deploy enables btrfs-progs' monthly scrub of / (maze-installer >= 2.0.0-30):
+    # without it a bad block is only noticed when something happens to read it.
+    if systemctl is-enabled --quiet btrfs-scrub@-.timer 2>/dev/null; then
+        pass "monthly btrfs scrub of / enabled (btrfs-scrub@-.timer)"
+    else
+        warn "monthly btrfs scrub of / not enabled" "enable: sudo systemctl enable --now btrfs-scrub@-.timer"
+    fi
     _scrub="$(btrfs scrub status / 2>/dev/null | grep -E 'Status|no stats|Error summary' | tr '\n' ' ')"; info "scrub: ${_scrub}"
 fi
 # fstab sanity
@@ -765,7 +885,7 @@ for s in /usr/local/bin/maze-guardd /usr/local/bin/maze-doctor /usr/bin/maze-sb-
 done
 pass "syntax check of core Maze scripts done"
 # The Maze apps
-for app in maze-guard maze-cloak entropy-shield qlam haze hazedrop maze-ai maze-connect said360; do
+for app in maze-guard maze-cloak entropy-shield qlam haze hazedrop maze-ai maze-connect; do
     pkg_installed "$app" && info "$(pacman -Q "$app")  files: $(pacman -Ql "$app" | wc -l)" || warn "app ${app} not installed"
 done
 for d in /etc/maze-cloak /etc/maze; do [[ -d "$d" ]] && info "$d: $(stat -c '%U:%G %a' "$d")"; done
@@ -873,7 +993,12 @@ if has mokutil; then
     info "MOK entries listed: ${_n} — Maze machine keys: ${_maze}, Maze live-ISO key: ${_iso} (MokListRT also shows shim's built-in vendor CA)"
     grep -E '^\s*Subject:' <<<"${_mok}" | sed 's/^ *//' | sort | uniq -c | sed 's/^/         | /'
     if [[ "${_maze}" -gt 1 ]]; then
-        warn "${_maze} Maze machine keys enrolled — earlier installs on this machine left theirs behind" "Each was per-install; its private half died with that install's disk, but it still signs for this firmware. Remove old ones: sudo mokutil --delete <old.cer> (needs the cert; or reset MOK from MokManager) — keep the current /var/lib/maze-secureboot/MOK.cer!"
+        # Not a risk: every machine key is per-install and its private half was
+        # on the disk that got reinstalled, so nobody can sign with the old one.
+        # Only clutter — say so plainly rather than alarm (a stale key with a
+        # missing private half signs nothing).
+        info "${_maze} Maze machine keys enrolled — earlier installs on this machine left theirs (harmless: their private keys were erased with those installs)"
+        detail "optional tidy-up: cd \$(mktemp -d) && sudo mokutil --export, find the MOK-*.der that is NOT /var/lib/maze-secureboot/MOK.cer (cmp), sudo mokutil --delete <that file>, confirm in MokManager on the next boot"
     elif [[ "${_maze}" -eq 1 ]]; then pass "exactly one Maze machine key enrolled"; fi
     _pending="$(mokutil --list-new 2>/dev/null | grep -c '^\[key ')"; [[ "${_pending}" -gt 0 ]] && warn "${_pending} MOK enrollment request(s) pending for next boot"
     _del="$(mokutil --list-delete 2>/dev/null | grep -c '^\[key ')"; [[ "${_del}" -gt 0 ]] && info "${_del} MOK deletion request(s) pending"
@@ -916,7 +1041,7 @@ for f in /usr/lib/sysusers.d/*.conf; do
 done
 [[ "${_bad}" -eq 0 ]] && pass "all ${_n} Maze sysusers.d entries applied" || fail "${_bad} of ${_n} Maze sysusers.d entries not applied"
 # Which Maze apps declare nothing at all (their scriptlet did the work — and never ran here)?
-for app in maze-guard maze-cloak entropy-shield qlam haze hazedrop maze-ai maze-connect said360; do
+for app in maze-guard maze-cloak entropy-shield qlam haze hazedrop maze-ai maze-connect; do
     pkg_installed "$app" || continue
     _decl="$(pacman -Ql "$app" | grep -cE '(tmpfiles|sysusers)\.d/')"
     _scr="$(pacman -Qi "$app" 2>/dev/null | sed -n 's/^Install Script *: //p')"
@@ -943,7 +1068,22 @@ else
         _vcfg="$(sed -n 's/^version *= *//p' "${_MV}/pyvenv.cfg" 2>/dev/null)"
         if [[ "${_vcfg%.*}" == "${_spy%.*}" ]]; then pass "venv built for Python ${_vcfg%.*}, system Python is ${_spy} (same minor — site-packages match)"
         else fail "venv built for Python ${_vcfg}, system Python is ${_spy} — rebuild/upgrade maze-python or nothing imports"; fi
-        grep -q '^include-system-site-packages *= *false' "${_MV}/pyvenv.cfg" 2>/dev/null && pass "venv is isolated from the system site-packages (one PyQt6, not two)" || warn "venv sees the system site-packages — two copies of Qt/PyQt6 can shadow each other"
+        # maze-python >= 1.1.0 builds the venv WITH --system-site-packages on
+        # purpose: PyQt6, numpy, cryptography, ... are pacman dependencies and
+        # only the pip-only libraries live in the venv. What must not happen is
+        # a SECOND PyQt6 inside the venv shadowing the system one (1.0.0 shipped
+        # pip's PyQt6 wheel with its own Qt runtime).
+        # A real package (__init__.py), not the empty PyQt6/__pycache__ husk an
+        # upgrade from 1.0.0 leaves behind — that one cannot shadow anything.
+        _vqt="$(ls -d "${_MV}"/lib/python3*/site-packages/PyQt6/__init__.py 2>/dev/null | head -1)"
+        _vqt="${_vqt%/__init__.py}"
+        if grep -q '^include-system-site-packages *= *false' "${_MV}/pyvenv.cfg" 2>/dev/null; then
+            pass "venv is isolated from the system site-packages (one PyQt6, not two)"
+        elif [[ -n "${_vqt}" ]]; then
+            warn "venv sees the system site-packages AND carries its own PyQt6 (${_vqt}) — two Qt copies can shadow each other" "reinstall maze-python: sudo pacman -S maze-python"
+        else
+            pass "venv uses the system PyQt6/Qt (no private Qt copy inside the venv)"
+        fi
         # The libraries the apps actually import, in one interpreter start.
         _imp="$("${_MV}/bin/python3" - 2>&1 <<'PY'
 import importlib, sys
@@ -1014,8 +1154,36 @@ fi
 if has aa-status; then
     _unc="$(aa-status --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); p=d.get("processes",{}); print(len([1 for k,v in p.items() for e in v if e.get("status")=="unconfined"]))' 2>/dev/null || echo '?')"
     info "AppArmor: $(aa-status 2>/dev/null | grep -m1 'profiles are loaded'); unconfined processes with a profile available: ${_unc}"
-    _mz="$(ls /etc/apparmor.d/ 2>/dev/null | grep -ciE 'maze|entropy|qlam|haze')"; [[ "${_mz}" -gt 0 ]] && pass "AppArmor profiles for Maze apps: ${_mz}" || info "no AppArmor profiles for any Maze app (only distro profiles: firefox, torbrowser, ...) — future work"
 fi
+# Maze's own profiles (Tor-facing apps). They ship in complain mode: nothing is
+# blocked, anything outside the profile is logged as apparmor="ALLOWED". Once a
+# profile has been used for a while with no such events, it can be enforced.
+for _ap in hazedrop haze; do
+    pkg_installed "${_ap}" || continue
+    if [[ ! -f "/etc/apparmor.d/${_ap}" ]]; then
+        info "${_ap}: no AppArmor profile (package older than the one that ships it)"; continue
+    fi
+    _mode="$(awk -v p="${_ap}" '$1==p {gsub(/[()]/,"",$2); print $2}' /sys/kernel/security/apparmor/profiles 2>/dev/null)"
+    if [[ -z "${_mode}" ]]; then
+        [[ -r /sys/kernel/security/apparmor/profiles ]] \
+            && warn "${_ap}: AppArmor profile installed but not loaded — sudo apparmor_parser -r /etc/apparmor.d/${_ap}" \
+            || info "${_ap}: AppArmor profile installed (run as root to see whether it is loaded)"
+        continue
+    fi
+    _ev="$(journalctl -k -q --since=-30d 2>/dev/null | grep -E "apparmor=\"(ALLOWED|DENIED)\"" | grep -cE "profile=\"${_ap}(//[^\"]*)?\"")"
+    if [[ "${_mode}" == complain ]]; then
+        if [[ "${_ev}" -eq 0 ]]; then
+            pass "${_ap}: AppArmor profile loaded (complain mode), no out-of-profile access in 30 days"
+            detail "if ${_ap} was really used in that time, it can be enforced: sudo aa-enforce /etc/apparmor.d/${_ap}"
+        else
+            info "${_ap}: AppArmor profile in complain mode logged ${_ev} out-of-profile access(es) in 30 days — keep it in complain mode:"
+            show "journalctl -k -q --since=-30d | grep -E 'profile=\"${_ap}(//[^\"]*)?\"' | sed -E 's/.*apparmor=\"([A-Z]+)\".*operation=\"([^\"]+)\".*profile=\"([^\"]+)\".*name=\"([^\"]*)\".*/\\1 \\3 \\2 \\4/' | sort | uniq -c | sort -rn | head -8" 8
+        fi
+    else
+        [[ "${_ev}" -eq 0 ]] && pass "${_ap}: AppArmor profile enforced, nothing blocked in 30 days" \
+            || warn "${_ap}: AppArmor profile (${_mode}) blocked ${_ev} access(es) in 30 days — if ${_ap} misbehaves: sudo aa-complain /etc/apparmor.d/${_ap}"
+    fi
+done
 if has opensnitchd; then
     _mode="$(python3 -c 'import json; print(json.load(open("/etc/opensnitchd/default-config.json"))["DefaultAction"])' 2>/dev/null)"
     info "opensnitch DefaultAction=${_mode:-?} (deploy ships allow = passive mode; user switches to deny in the UI)"

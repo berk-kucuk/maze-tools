@@ -791,12 +791,17 @@ fi
 section "5. PCI / USB / NVMe Runtime PM (udev)"
 
 UDEV_RUNTIME="/etc/udev/rules.d/50-${SCRIPT_NAME}-runtime-pm.rules"
+# Single backslashes at the line ends: this is a single-quoted shell string,
+# so it lands in the rules file verbatim. It used to carry doubled ones, which
+# made udev reject every multi-line rule here ("Invalid key '\TEST'") — none of
+# them ever applied, and the grep-based checks below could not notice. The file
+# is now also checked with `udevadm verify` right after it is written.
 UDEV_RUNTIME_BODY='
 # Let every PCI device suspend when idle (host bridges excluded)
-ACTION=="add", SUBSYSTEM=="pci", \\
-    TEST=="power/control", \\
-    ATTR{power/control}!="on", \\
-    ATTR{class}!="0x060000", \\
+ACTION=="add", SUBSYSTEM=="pci", \
+    TEST=="power/control", \
+    ATTR{power/control}!="on", \
+    ATTR{class}!="0x060000", \
     ATTR{power/control}="auto"
 
 # USB autosuspend (after 2 s).
@@ -810,29 +815,32 @@ ACTION=="add", SUBSYSTEM=="pci", \\
 # alone deliberately rather than half-fixed. Note this does NOT affect the
 # initramfs (the LUKS passphrase prompt): rules in /etc/udev/rules.d are not
 # part of the initramfs image.
-ACTION=="add", SUBSYSTEM=="usb", TEST=="power/control", \\
+ACTION=="add", SUBSYSTEM=="usb", TEST=="power/control", \
     ATTR{power/control}="auto"
-ACTION=="add", SUBSYSTEM=="usb", TEST=="power/autosuspend_delay_ms", \\
+ACTION=="add", SUBSYSTEM=="usb", TEST=="power/autosuspend_delay_ms", \
     ATTR{power/autosuspend_delay_ms}="2000"
-ACTION=="add", SUBSYSTEM=="usb_device", TEST=="power/control", \\
+ACTION=="add", SUBSYSTEM=="usb_device", TEST=="power/control", \
     ATTR{power/control}="auto"
 
 # NVMe APST (already the default, set explicitly for safety)
-ACTION=="add", SUBSYSTEM=="pci", ATTR{class}=="0x010802", \\
+ACTION=="add", SUBSYSTEM=="pci", ATTR{class}=="0x010802", \
     TEST=="power/control", ATTR{power/control}="auto"
 
 # SATA link power management (where supported)
-ACTION=="add", SUBSYSTEM=="scsi_host", KERNEL=="host*", \\
-    TEST=="link_power_management_policy", \\
+ACTION=="add", SUBSYSTEM=="scsi_host", KERNEL=="host*", \
+    TEST=="link_power_management_policy", \
     ATTR{link_power_management_policy}="min_power"
 
 # Audio codec auto suspend
-ACTION=="add", SUBSYSTEM=="sound", TEST=="power/control", \\
+ACTION=="add", SUBSYSTEM=="sound", TEST=="power/control", \
     ATTR{power/control}="auto"
 
-# Wi-Fi power_save (when the interface appears)
-ACTION=="add", SUBSYSTEM=="net", KERNEL=="wlan*", \\
-    RUN+="/usr/sbin/iw dev $name set power_save on 2>/dev/null"
+# Wi-Fi power_save (when the interface appears). Matched on phy80211, i.e.
+# "this is a wireless device", not on the name: systemd names Wi-Fi wlp2s0 &c.,
+# so the old KERNEL=="wlan*" never matched. udev RUN has no shell, so no
+# redirections here (a literal "2>/dev/null" became an extra argument to iw).
+ACTION=="add", SUBSYSTEM=="net", TEST=="phy80211", \
+    RUN+="/usr/bin/iw dev $name set power_save on"
 '
 
 if $CHECK_ONLY; then
@@ -844,6 +852,17 @@ else
     verify_file_contains "$UDEV_RUNTIME" 'SUBSYSTEM=="usb"' "udev USB rule" || true
     verify_file_contains "$UDEV_RUNTIME" 'autosuspend_delay_ms' "USB autosuspend" || true
     verify_file_contains "$UDEV_RUNTIME" 'link_power_management_policy' "SATA LPM" || true
+    # A rules file udev refuses is worse than none: it looks installed. grep
+    # only proves the text is there, so ask udev itself (systemd >= 253).
+    if udevadm verify --help >/dev/null 2>&1; then
+        if udevadm verify "$UDEV_RUNTIME" >/dev/null 2>&1; then
+            ok "  VERIFIED: udev accepts $UDEV_RUNTIME"
+            VERIFY_PASS=$((VERIFY_PASS+1))
+        else
+            err "  VERIFICATION FAILED: udev rejects $UDEV_RUNTIME (run: udevadm verify $UDEV_RUNTIME)"
+            VERIFY_FAIL=$((VERIFY_FAIL+1))
+        fi
+    fi
     udevadm control --reload-rules >/dev/null 2>&1 || true
     udevadm trigger --action=add --subsystem-match=pci --subsystem-match=usb --subsystem-match=net >/dev/null 2>&1 || true
     ok "udev rules reloaded and triggered"
@@ -957,8 +976,13 @@ fi
 section "8. Wi-Fi power_save"
 
 if command -v iw >/dev/null 2>&1; then
-    for dev in /sys/class/net/wlan*; do
-        [[ -e "$dev" ]] || continue
+    wifi_found=0
+    for dev in /sys/class/net/*; do
+        # Wireless = has a phy80211 link. Not "named wlan*": with systemd's
+        # predictable names Wi-Fi is wlp2s0 and friends, so the old glob never
+        # matched on a current system and this step silently did nothing.
+        [[ -e "$dev/phy80211" ]] || continue
+        wifi_found=1
         iface="$(basename "$dev")"
         if $CHECK_ONLY; then
             echo "  $iface: (check) not set via iw"
@@ -977,7 +1001,7 @@ if command -v iw >/dev/null 2>&1; then
             fi
         fi
     done
-    [[ ! -e /sys/class/net/wlan0 ]] && warn "  No wlan* interface found"
+    [[ "$wifi_found" -eq 1 ]] || warn "  No Wi-Fi interface found"
 else
     warn "  'iw' is not installed. pacman -S iw"
 fi

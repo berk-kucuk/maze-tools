@@ -53,7 +53,6 @@ SECURITY_SERVICES: list[tuple[str, str]] = [
     ("AppArmor", "apparmor.service"),
     ("firewalld", "firewalld.service"),
     ("OpenSnitch", "opensnitchd.service"),
-    ("fail2ban", "fail2ban.service"),
     ("auditd", "auditd.service"),
 ]
 
@@ -575,8 +574,13 @@ def hardening_report() -> tuple[list[tuple[str, bool]], int]:
     checks.append((tr("MAC randomisation"), mac_randomization_enabled()))
     checks.append((tr("Kernel/network hardening (sysctl)"),
                    _sysctl_hardening_present()))
+    # Only a VPN counts here. Tor's SOCKS port is up on every Maze machine (the
+    # service is enabled for the apps that use it), but it carries only traffic
+    # from programs explicitly pointed at it — counting it made this check pass
+    # on every machine while everything else went out in the clear. Tor keeps
+    # its own row in network_info().
     vpn_on, _vpn_if = vpn_active()
-    checks.append((tr("VPN or Tor active"), vpn_on or tor_socks_reachable()))
+    checks.append((tr("VPN active"), vpn_on))
     passed = sum(1 for _, ok in checks if ok)
     score = round(100 * passed / len(checks)) if checks else 0
     return (checks, score)

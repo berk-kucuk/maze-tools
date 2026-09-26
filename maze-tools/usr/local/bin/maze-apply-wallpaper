@@ -10,8 +10,12 @@
 # "Image" wallpaper. Re-applying through Plasma scripting on each login, AFTER the
 # desktops exist, guarantees blur on ALL screens, including hot-plugged ones.
 #
-# Idempotent: a desktop that is already on a2n.blur is left untouched, so manual
-# per-desktop blur tweaks survive; only non-blur desktops are converted.
+# ONCE PER DESKTOP: each desktop Maze has handled is marked in its own config
+# ([MazeLinux] WallpaperApplied=1) and never touched again. This used to convert
+# every non-blur desktop on EVERY login, so a user who picked their own
+# wallpaper plugin (a photo via "Image", a slideshow…) had it silently put back
+# to Maze at the next login. A monitor plugged in later gets a NEW desktop with
+# no mark, so it is still converted — which is what this script exists for.
 set -u
 
 QDBUS=""
@@ -29,6 +33,8 @@ SCRIPT='
 var ds = desktops();
 for (var i = 0; i < ds.length; i++) {
     var d = ds[i];
+    d.currentConfigGroup = ["MazeLinux"];
+    var handled = (d.readConfig("WallpaperApplied", "") == "1");
     if (d.wallpaperPlugin == "a2n.blur") {
         // Already blurred — leave it, except for one migration: older Maze wrote
         // the raw PNG inside the package as Image. Plasma then lists that file as
@@ -41,16 +47,20 @@ for (var i = 0; i < ds.length; i++) {
             d.writeConfig("Image", "file:///usr/share/wallpapers/Maze/");
             d.reloadConfig();
         }
-        continue;
+    } else if (!handled) {
+        d.wallpaperPlugin = "a2n.blur";
+        d.currentConfigGroup = ["Wallpaper", "a2n.blur", "General"];
+        d.writeConfig("ActiveBlur", true);
+        d.writeConfig("Image", "file:///usr/share/wallpapers/Maze/");
+        d.writeConfig("BlurRadius", 50);
+        d.writeConfig("AnimationDuration", 250);
+        d.writeConfig("SlidePaths", "/usr/share/wallpapers/");
+        d.reloadConfig();
     }
-    d.wallpaperPlugin = "a2n.blur";
-    d.currentConfigGroup = ["Wallpaper", "a2n.blur", "General"];
-    d.writeConfig("ActiveBlur", true);
-    d.writeConfig("Image", "file:///usr/share/wallpapers/Maze/");
-    d.writeConfig("BlurRadius", 50);
-    d.writeConfig("AnimationDuration", 250);
-    d.writeConfig("SlidePaths", "/usr/share/wallpapers/");
-    d.reloadConfig();
+    if (!handled) {
+        d.currentConfigGroup = ["MazeLinux"];
+        d.writeConfig("WallpaperApplied", "1");
+    }
 }'
 
 "${QDBUS}" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${SCRIPT}" >/dev/null 2>&1 || true

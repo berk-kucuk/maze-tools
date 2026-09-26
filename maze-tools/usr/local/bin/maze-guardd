@@ -12,7 +12,8 @@ daemon instead exposes a NARROW, FIXED api over a wheel-only Unix socket:
     a hard-coded whitelist of verbs; the device/action arguments are checked
     against fixed enums and only ever passed as a literal argv list (no shell).
   * Callers are authorised by SO_PEERCRED: the peer must be a real user with an
-    ACTIVE local session (mirrors polkit allow_active) — not root, not remote.
+    ACTIVE session on a LOCAL seat per logind (mirrors polkit allow_active) —
+    not root, not remote/SSH, not a background/lingering user.
 
 Verbs:  PANIC | KILL <device> <on|off> | STATUS | PING
 """
@@ -283,10 +284,45 @@ def _peer_uid(conn):
     return uid
 
 
+def _has_local_active_session(uid):
+    """True if the user has a session that is on a local seat, not remote, and
+    in the foreground — logind's view of polkit's `allow_active`.
+
+    This used to be `os.path.isdir(f"/run/user/{uid}")`, which the comment
+    described as "an active local session" but is not one: that directory
+    exists for ANY login, including SSH sessions and lingering users. So any
+    process running as a `maze`-group user — a remote login, a malicious build
+    script, a compromised app — could send PANIC and have root truncate the
+    journal, audit.log, auth.log and wtmp/btmp: a one-line way to erase the
+    trail of the very intrusion it came from. Requiring a seat-attached, local,
+    foreground session keeps the panic button and kill switches working for the
+    person at the keyboard and closes them to everyone else.
+
+    Seatless sessions (SSH, and systemd >= 256's per-user "manager" session)
+    never qualify. Session ids come from logind and are validated before use."""
+    res = _run("loginctl", "show-user", str(uid), "-p", "Sessions", "--value")
+    if not res or res.returncode != 0:
+        return False
+    for sid in (res.stdout or "").split():
+        if not sid.isalnum():
+            continue
+        r = _run("loginctl", "show-session", sid,
+                 "-p", "Seat", "-p", "Remote", "-p", "Active", "-p", "Class")
+        if not r or r.returncode != 0:
+            continue
+        props = dict(line.split("=", 1) for line in (r.stdout or "").splitlines() if "=" in line)
+        if (props.get("Seat") and props.get("Remote") == "no"
+                and props.get("Active") == "yes"
+                and props.get("Class", "").startswith("user")):
+            return True
+    return False
+
+
 def _authorized(uid):
-    # Must be a real (non-root) user WITH an active local session — same intent as
-    # polkit allow_active. A remote/inactive compromise has no /run/user/<uid>.
-    return uid >= 1000 and os.path.isdir(f"/run/user/{uid}")
+    # A real (non-root, non-nobody) user whose active session is at this
+    # machine's own seat. See _has_local_active_session for why the old
+    # /run/user/<uid> test was not enough.
+    return 1000 <= uid < 65534 and _has_local_active_session(uid)
 
 
 # Serialises the actual privileged actions (PANIC/KILL/USB policy writes), not

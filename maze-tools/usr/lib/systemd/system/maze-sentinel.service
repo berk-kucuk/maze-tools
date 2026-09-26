@@ -8,6 +8,28 @@ Type=simple
 ExecStart=/usr/local/bin/maze-sentinel
 Restart=on-failure
 RestartSec=5
+# Sandbox (2026-09). It reads the audit log, keeps baselines in /var/lib/maze,
+# asks pacman who owns a file, and notifies the desktop user through `sudo -u`
+# (so no NoNewPrivileges — sudo refuses to run under it — and no ProtectHome:
+# the user's session bus lives in /run/user). Taken away: /usr and /boot
+# writes, kernel modules and tunables, the clock, hostname, cgroups, realtime,
+# namespaces, setuid files, foreign-ABI and non-service syscalls (EPERM).
+# Verify: sudo maze-sandbox-check   Relax locally: sudo systemctl edit maze-sentinel
+ProtectSystem=true
+PrivateTmp=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 # Runs as root: it reads the kernel audit log and uses `sudo -u <user> notify-send`
 # to alert each session, so it must keep full privileges (no NoNewPrivileges /
 # sandbox that would block the sudo drop to the user bus).

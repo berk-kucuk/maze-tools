@@ -13,7 +13,7 @@
 #     pacman -S --noconfirm blackarch-mirrorlist  (installs a package)
 # Everything strap needs to REGISTER the repo — fetch + trust the keyring (via
 # pacman-key), write the mirrorlist, add [blackarch] to pacman.conf — is kept.
-# The package database then syncs on the user's next `pacman -Sy`. This keeps us
+# The package database then syncs on the user's next `pacman -Syu`. This keeps us
 # on BlackArch's own, always-current setup logic with NOTHING for us to maintain.
 #
 # Trust model: identical to an official BlackArch install — the keyring is fetched
@@ -69,7 +69,7 @@ fi
 # strap.sh downloads with curl; make sure it is present (best-effort top-up).
 if ! run sh -c 'command -v curl >/dev/null 2>&1'; then
     log "Installing curl (needed to fetch strap.sh)"
-    run pacman -Sy --noconfirm --needed curl >/dev/null 2>&1 || warn "could not install curl"
+    run pacman -Syu --noconfirm --needed curl >/dev/null 2>&1 || warn "could not install curl"
 fi
 
 # The whole setup runs as ONE program inside the target, so strap's temp dir,
@@ -124,8 +124,10 @@ for _try in 1 2 3; do
 done
 
 if [[ "${ok}" -eq 1 ]]; then
+    # -Syu, never -Sy: syncing the databases and then installing without
+    # upgrading is a partial upgrade, which Arch does not support.
     log "BlackArch repository enabled. Sync + use it with:"
-    log "  sudo pacman -Sy"
+    log "  sudo pacman -Syu"
     log "  sudo pacman -S --needed blackarch-officials"
 else
     warn "Could not enable BlackArch. Retry later with:  sudo maze-enable-blackarch"
