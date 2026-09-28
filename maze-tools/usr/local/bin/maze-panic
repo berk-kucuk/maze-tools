@@ -1,50 +1,79 @@
 #!/bin/sh
 # maze-panic — Maze Panic mode (user-facing trigger).
 #
-# Bound to Ctrl+Alt+P and to the panic tray icon. Clears the CURRENT user's
-# traces, cuts networking, asks the maze-guardd broker (via the unprivileged
-# maze-guardctl client — no pkexec/setuid) to do the system-level wipe, then locks
-# the session. NON-DESTRUCTIVE: it clears history/traces and cuts the net —
-# it does NOT delete user data or break the system. You can re-enable the network
-# afterwards (rfkill unblock all; nmcli networking on).
+# Bound to Ctrl+Alt+P and to the panic tray icon. Cuts networking, locks the
+# session, asks the maze-guardd broker (via the unprivileged maze-guardctl
+# client — no pkexec/setuid) to do the system-level wipe, then clears the
+# CURRENT user's traces. NON-DESTRUCTIVE: it clears history/traces and cuts the
+# net — it does NOT delete user data or break the system. maze-panic-restore
+# (or the tray widget's "Restore network") brings the network back.
+#
+# ORDER: whoever presses this wants the machine off the network and the screen
+# locked NOW. Those two go first; the wipes, which can take a few seconds
+# (journal vacuum), run behind the lock screen.
 set -u
 
-# --- 1) This user's shell / tool history files ----------------------------
+# Only one run at a time — a double press must not interleave two wipes.
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/maze-panic.lock"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK" && flock -n 9 || exit 0
+fi
+
+# --- 1) Cut the network from the user side --------------------------------
+nmcli networking off >/dev/null 2>&1
+net_ok=$?
+
+# --- 2) Lock the session ----------------------------------------------------
+loginctl lock-session 2>/dev/null \
+    || qdbus6 org.freedesktop.ScreenSaver /ScreenSaver Lock >/dev/null 2>&1 \
+    || qdbus  org.kde.screensaver /ScreenSaver Lock >/dev/null 2>&1 \
+    || true
+
+# --- 3) System-level wipe (radios, journal, logs, caches) -----------------
+# Ask the privileged broker (maze-guardd) to do the root-only part. NO pkexec /
+# setuid in the path: maze-guardctl is unprivileged and can only send the fixed
+# "panic" verb to the maze-group daemon socket.
+maze-guardctl panic >/dev/null 2>&1
+sys_ok=$?
+
+# --- 4) This user's shell / tool history files ----------------------------
+# Note: a shell that is still open keeps its history in memory and may write
+# it back when it exits; the notification below says so.
 for h in "$HOME/.bash_history" "$HOME/.zsh_history" "$HOME/.histfile" \
          "$HOME/.local/share/fish/fish_history" "$HOME/.python_history" \
          "$HOME/.lesshst" "$HOME/.node_repl_history" "$HOME/.sqlite_history" \
          "$HOME/.wget-hsts" "$HOME/.viminfo"; do
-    [ -e "$h" ] && : > "$h" 2>/dev/null || true
+    # Never follow a symlink out of $HOME: truncating through one would empty
+    # whatever file it points at.
+    [ -f "$h" ] && [ ! -L "$h" ] && : > "$h" 2>/dev/null
 done
 
-# --- 2) Recently-used lists, thumbnails, clipboard ------------------------
-rm -f  "$HOME/.local/share/RecentDocuments/"*.desktop 2>/dev/null || true
-rm -f  "$HOME/.local/share/recently-used.xbel"        2>/dev/null || true
-rm -rf "$HOME/.cache/thumbnails/"*                    2>/dev/null || true
-# KDE Klipper clipboard history (Qt5 + Qt6 tool names).
-qdbus  org.kde.klipper /klipper clearClipboardHistory 2>/dev/null || true
-qdbus6 org.kde.klipper /klipper clearClipboardHistory 2>/dev/null || true
+# --- 5) Recently-used lists, thumbnails, clipboard ------------------------
+rm -f  "$HOME/.local/share/RecentDocuments/"*.desktop 2>/dev/null
+rm -f  "$HOME/.local/share/recently-used.xbel"        2>/dev/null
+rm -rf "$HOME/.cache/thumbnails/"*                    2>/dev/null
+# KDE Klipper clipboard history (Qt6 + Qt5 tool names).
+qdbus6 org.kde.klipper /klipper clearClipboardHistory >/dev/null 2>&1 \
+    || qdbus org.kde.klipper /klipper clearClipboardHistory >/dev/null 2>&1
 # Wayland clipboard, if the tool is present.
-command -v wl-copy >/dev/null 2>&1 && printf '' | wl-copy 2>/dev/null || true
+command -v wl-copy >/dev/null 2>&1 && wl-copy --clear >/dev/null 2>&1
 
-# --- 3) Cut the network from the user side --------------------------------
-nmcli networking off 2>/dev/null || true
-
-# --- 4) System-level wipe (radios, journal, logs, caches) -----------------
-# Ask the privileged broker (maze-guardd) to do the root-only part. NO pkexec /
-# setuid in the path: maze-guardctl is unprivileged and can only send the fixed
-# "panic" verb to the wheel-only daemon socket.
-maze-guardctl panic >/dev/null 2>&1 || true
-
-# --- 5) Tell the user, then lock the session ------------------------------
-notify-send -a "Maze Panic" -u critical -i security-high \
-    "Panic mode activated" \
-    "Network cut · logs & history wiped · session locked. (Re-enable net: rfkill unblock all && nmcli networking on)" \
-    2>/dev/null || true
-
-loginctl lock-session 2>/dev/null \
-    || qdbus  org.kde.screensaver /ScreenSaver Lock 2>/dev/null \
-    || qdbus6 org.freedesktop.ScreenSaver /ScreenSaver Lock 2>/dev/null \
-    || true
+# --- 6) Tell the user what ACTUALLY happened --------------------------------
+# This used to announce "logs wiped" unconditionally, even when maze-guardd was
+# down or refused the request and nothing system-side had been touched.
+if [ "$sys_ok" -eq 0 ] && [ "$net_ok" -eq 0 ]; then
+    notify-send -a "Maze Panic" -u critical -i security-high \
+        "Panic mode activated" \
+        "Network cut · system logs, history and clipboard wiped · session locked. Open shells may still write their history back when closed. Restore the network from the Maze Panic tray icon." \
+        2>/dev/null
+else
+    msg=""
+    [ "$net_ok" -ne 0 ] && msg="NetworkManager did not turn networking off. "
+    [ "$sys_ok" -ne 0 ] && msg="${msg}maze-guardd did not respond: Wi-Fi was NOT blocked and system logs were NOT wiped. "
+    notify-send -a "Maze Panic" -u critical -i dialog-warning \
+        "Panic mode only partly ran" \
+        "${msg}Your history and clipboard were cleared and the session is locked." \
+        2>/dev/null
+fi
 
 exit 0

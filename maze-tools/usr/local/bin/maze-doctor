@@ -538,11 +538,33 @@ fi
 # --------------------------------------------------------- 5. package system
 section "Package system"
 
+# What pacman -Qkk reports that is NOT a fault on Maze:
+#   * "backup file:" lines — files a package marks as configuration (fstab,
+#     passwd, hosts, cups' printers.conf, dkms' framework.conf …) are MEANT to
+#     be edited; pacman lists them for information only. They filled most of
+#     this section on every machine and buried anything real.
+#   * /boot "Permissions mismatch" — the ESP is mounted fmask/dmask=0077 on
+#     purpose (see maze-audit §4), so the mount point never matches 0755.
+#   * cups rewrites its own .conf modes at runtime.
+#   * /etc/resolv.conf is the systemd-resolved stub symlink (File type).
+#   * /etc/shadow and /etc/gshadow are tightened by maze-hardening.
+#   * /usr/lib/os-release is Maze's, put back by maze-branding's hook.
+_EXPECTED_SYS='^backup file:|: /boot \(Permissions mismatch\)|cups: /etc/cups/[^ ]+ \(Permissions mismatch\)|filesystem: /etc/resolv\.conf \(File type mismatch\)|filesystem: /etc/g?shadow \(Permissions mismatch\)|filesystem: /usr/lib/os-release \('
+
+# stderr only (2>&1 >/dev/null): pacman writes its per-package "N total files"
+# summary to stdout and the findings to stderr, unbuffered, and with both in
+# one pipe they were spliced mid-line ("…0 altewarning: cups: …"). A SHA256
+# mismatch on a file that is NOT a backup file is kept: that is a changed
+# binary or library, the one finding this check most exists to surface.
 if [ "$DEEP" = 1 ]; then
     detail "verifying every installed file against the database (slow)…"
-    bad="$(pacman -Qkk 2>&1 | grep -vE 'warning:.*(\.pacnew|No such file or directory.*(cache|log))' | grep -E '^(backup file|.*: .*(Size|Modification time|Permissions|Symlink) mismatch|.*: No such file)' | head -40)"
+    bad="$(pacman -Qkk 2>&1 >/dev/null \
+        | grep -vE 'warning:.*(\.pacnew|No such file or directory.*(cache|log))' \
+        | grep -E '(Size|Modification time|Permissions|Symlink|File type|SHA256 checksum) mismatch|: No such file' \
+        | grep -vE "$_EXPECTED_SYS" | head -40)"
 else
-    bad="$(pacman -Qkk $maze_pkgs 2>&1 | grep -E 'mismatch|No such file' | head -40)"
+    bad="$(pacman -Qkk $maze_pkgs 2>&1 >/dev/null | grep -E 'mismatch|No such file' \
+        | grep -vE "$_EXPECTED_SYS" | head -40)"
     detail "checked Maze packages only (use --deep for the whole system)"
 fi
 

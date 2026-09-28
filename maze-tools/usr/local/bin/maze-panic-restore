@@ -4,17 +4,29 @@
 # Panic cuts the network with rfkill (which systemd-rfkill keeps blocked even
 # after a reboot) and `nmcli networking off`. This brings both back, so the user
 # never has to touch a terminal. It does NOT restore wiped logs/history/clipboard
-# — those are gone on purpose; this only re-enables connectivity.
+# — those are gone on purpose; this only re-enables connectivity. Radios the user
+# had already switched off in Maze Hardware before the panic stay off.
 set -u
 
 # Radios: rfkill unblock is privileged -> ask the maze-guardd broker (no pkexec).
-maze-guardctl restore >/dev/null 2>&1 || true
+maze-guardctl restore >/dev/null 2>&1
+radio_ok=$?
 # NetworkManager: re-enable from the user side.
-nmcli networking on >/dev/null 2>&1 || true
+nmcli networking on >/dev/null 2>&1
+net_ok=$?
 
-notify-send -a "Maze Panic" -i security-high \
-    "Network restored" \
-    "Wi-Fi and mobile radios are back on. (Wiped logs and history stay cleared.)" \
-    2>/dev/null || true
+if [ "$radio_ok" -eq 0 ] && [ "$net_ok" -eq 0 ]; then
+    notify-send -a "Maze Panic" -i security-high \
+        "Network restored" \
+        "Networking is back on. (Wiped logs and history stay cleared.)" \
+        2>/dev/null
+else
+    msg=""
+    [ "$radio_ok" -ne 0 ] && msg="The radios could not be unblocked (maze-guardd did not respond). "
+    [ "$net_ok" -ne 0 ] && msg="${msg}NetworkManager did not turn networking back on."
+    notify-send -a "Maze Panic" -u critical -i dialog-warning \
+        "Network NOT fully restored" "$msg" 2>/dev/null
+    exit 1
+fi
 
 exit 0

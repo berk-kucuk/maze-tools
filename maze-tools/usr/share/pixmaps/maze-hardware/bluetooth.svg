@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Maze Hardware — Bluetooth rune. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <path d="M14.5 15 33 32l-9 8.5v-33l9 8.5-18.5 17" fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="10" cy="24" r="1.8" fill="#ffffff" fill-opacity="0.6"/>
+  <circle cx="38" cy="24" r="1.8" fill="#ffffff" fill-opacity="0.6"/>
+</svg>

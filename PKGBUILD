@@ -14,8 +14,8 @@
 # package a drop-in replacement for the files currently in airootfs.
 
 pkgname=maze-tools
-pkgver=1.1.0
-pkgrel=54
+pkgver=2.0.2
+pkgrel=1
 pkgdesc="Maze Linux in-house utility suite (mazelinux, welcome, control center, kernel switcher, guard, sentinel, panic, MAC/GPU helpers, system doctor, maze-audit, maze-exercise, maze-selftest)"
 arch=('any')
 url="https://mazelinux.berkkucukk.com.tr"

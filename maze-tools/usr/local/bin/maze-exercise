@@ -192,7 +192,8 @@ sleep 1
 [[ -S /run/maze/guard.sock ]] && pass "guard.sock recreated ($(stat -c '%U:%G %a' /run/maze/guard.sock))" || fail "guard.sock missing after restart"
 [[ -S /run/maze/maze.sock ]] && pass "maze.sock present ($(stat -c '%U:%G %a' /run/maze/maze.sock))" || info "maze.sock not present (maze-guard helper not running)"
 [[ -f /run/maze/status/maze-cloak.json ]] && { grep -q '"running": *true' /run/maze/status/maze-cloak.json && pass "maze-cloak republished its status (running)" || warn "maze-cloak status says not running"; } || warn "maze-cloak status file missing after restart"
-for i in $(ls /sys/class/net | grep -vE '^(lo|p2p|tun|wg|docker|virbr|veth)'); do
+for i in /sys/class/net/*; do
+    i="${i##*/}"; [[ "$i" =~ ^(lo|p2p|tun|wg|docker|virbr|veth) ]] && continue
     a="$(cat /sys/class/net/$i/address)"; p="$(ethtool -P "$i" 2>/dev/null | awk '{print $3}')"
     [[ -n "$p" && "$p" != "00:00:00:00:00:00" ]] && { [[ "$a" != "$p" ]] && pass "$i MAC randomised ($a ≠ permanent)" || info "$i using permanent MAC (no connection yet, or excluded)"; }
 done
@@ -238,7 +239,8 @@ fi
 # ============================================================== 5. audit =====
 if [[ "${AUDIT_RUN}" -eq 1 && -n "${AUDIT}" && -x "${AUDIT}" ]]; then
     section "5. Full audit after exercising (maze-audit --deep)"
-    "${AUDIT}" --deep $([[ "${LYNIS}" -eq 1 ]] && echo --lynis) $([[ "${COLOR}" -eq 0 ]] && echo --no-color) 2>&1 | sed 's/^/   /'
+    _aargs=(--deep); [[ "${LYNIS}" -eq 1 ]] && _aargs+=(--lynis); [[ "${COLOR}" -eq 0 ]] && _aargs+=(--no-color)
+    "${AUDIT}" "${_aargs[@]}" 2>&1 | sed 's/^/   /'
     _arc=${PIPESTATUS[0]}
     [[ "${_arc}" -eq 0 ]] && pass "audit: no FAIL" || fail "audit reported FAIL(s) — see above"
 fi

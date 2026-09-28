@@ -12,11 +12,30 @@
 #   * KMS (nvidia-drm.modeset=1 + fbdev on the cmdline, modprobe.d options) so
 #     the desktop comes up cleanly on the NVIDIA GPU. The modules are NOT put in
 #     the initramfs — see the note at the MODULES step below.
-#   * Secure Boot: NVIDIA's kernel modules are DKMS-built and UNSIGNED, so under
-#     kernel lockdown (which Secure Boot enables) they are refused. This wires
-#     DKMS to sign every module it builds with THIS machine's MOK key (the same
-#     key maze-sb-sign / the installer enrolled), so nvidia loads under Secure
-#     Boot and stays signed across kernel updates.
+#   * The kernel module. Arch builds nvidia-open (for `linux`) and
+#     nvidia-open-lts (for `linux-lts`) itself, released minutes after each
+#     kernel by the kernel's own packager. When every installed kernel is one of
+#     those two, that is what gets installed: nothing is compiled on this
+#     machine, no kernel headers are needed, and "the module did not build for
+#     the new kernel" cannot happen. Any other kernel (zen, hardened, custom)
+#     has no prebuilt module, so then — and only then — nvidia-open-dkms builds
+#     it locally, signed with THIS machine's MOK key.
+#
+#     Module signatures: the Arch kernel does not enter lockdown under Secure
+#     Boot and Maze does not set module.sig_enforce, so unsigned modules load
+#     (measured: lockdown [none], sig_enforce N). The prebuilt modules are
+#     therefore not MOK-signed. What Secure Boot protects here is the boot chain
+#     on the unencrypted ESP, which this does not touch. If Maze ever enforces
+#     module signatures, the prebuilt path needs a signing step first.
+#   * GPU generation. Since driver 590 Arch ships ONLY the open kernel modules,
+#     which need a Turing (RTX 20xx / GTX 16xx) or newer GPU. On Pascal and
+#     older the module does not bind — and nvidia-utils still blacklists
+#     nouveau, so the result is a black screen. Those cards are refused here
+#     and stay on nouveau.
+#
+#   A machine installed with the older DKMS-only version of this script is
+#   moved onto the prebuilt modules by simply running it again (interactively:
+#   `--nvidia` also installs CUDA without asking).
 #
 # Usage:
 #   sudo maze-gpu-driver            # interactive
@@ -43,6 +62,58 @@ case "${1:-}" in
 esac
 
 has_nvidia_gpu() { lspci -nn 2>/dev/null | grep -iE 'VGA|3D|Display' | grep -qi 'NVIDIA'; }
+
+# Sort the NVIDIA display controllers into ones the open kernel modules drive
+# (Turing and newer) and ones they do not (Volta, Pascal, Maxwell, …). NVIDIA
+# assigned PCI device IDs by generation: Turing starts at 0x1e00 (TU102 0x1e0x,
+# TU104 0x1e8x, TU106 0x1f0x, TU117 0x1f9x, TU116 0x218x), everything after it is
+# higher, and every earlier generation is below it (GP102 0x1b0x, GP107 0x1c8x,
+# GV100 0x1dbx). PCI_DEVICES is overridable for tests.
+PCI_DEVICES="${MAZE_PCI_DEVICES:-/sys/bus/pci/devices}"
+nv_supported=(); nv_legacy=()
+classify_nvidia_gpus() {
+    local pd dev
+    for pd in "${PCI_DEVICES}"/*; do
+        [[ "$(cat "${pd}/vendor" 2>/dev/null)" == "0x10de" ]] || continue
+        [[ "$(cat "${pd}/class" 2>/dev/null)" == 0x03* ]] || continue   # display controllers only
+        dev="$(cat "${pd}/device" 2>/dev/null)"
+        [[ -n "${dev}" ]] || continue
+        if (( dev >= 0x1e00 )); then nv_supported+=("${pd##*/} ${dev}")
+        else nv_legacy+=("${pd##*/} ${dev}")
+        fi
+    done
+}
+
+# Which module package(s) this machine needs. Prebuilt when every installed
+# kernel is `linux` or `linux-lts` (the two Arch builds nvidia-open for);
+# otherwise nvidia-open-dkms for all of them — mixing the two is not an option,
+# nvidia-open-dkms conflicts with nvidia-open.
+NV_MODE=""; nv_pkgs=(); nv_hdrs=()
+plan_module_packages() {
+    local d pb prebuilt=1 bases=()
+    for d in /usr/lib/modules/*/; do
+        [[ -f "${d}pkgbase" && -f "${d}vmlinuz" ]] || continue
+        pb="$(cat "${d}pkgbase" 2>/dev/null || true)"
+        [[ -n "${pb}" ]] || continue
+        bases+=("${pb}")
+        case "${pb}" in linux|linux-lts) ;; *) prebuilt=0 ;; esac
+    done
+    ((${#bases[@]})) || die "no installed kernel found under /usr/lib/modules"
+    mapfile -t bases < <(printf '%s\n' "${bases[@]}" | sort -u)
+    if ((prebuilt)); then
+        NV_MODE="prebuilt"
+        for pb in "${bases[@]}"; do
+            case "${pb}" in
+                linux)     nv_pkgs+=(nvidia-open) ;;
+                linux-lts) nv_pkgs+=(nvidia-open-lts) ;;
+            esac
+        done
+    else
+        NV_MODE="dkms"
+        nv_pkgs=(nvidia-open-dkms dkms)
+        for pb in "${bases[@]}"; do nv_hdrs+=("${pb}-headers"); done
+    fi
+}
 
 # True when the GPU that owns the panel (firmware's boot_vga) is the NVIDIA card
 # — i.e. a desktop / no-iGPU box. On hybrid laptops the panel is on i915/amdgpu
@@ -168,6 +239,24 @@ verify_boot_chain() {
         done
     fi
 
+    # maze-sb-sign never hands shim a kernel without the nvidia module: it boots
+    # the newest kernel that has the module and a UKI instead (transiently). The
+    # expectation here has to follow the same rule, or that correct fallback
+    # would be reported as "DO NOT REBOOT".
+    if [[ -f /usr/lib/modprobe.d/nvidia-utils.conf ]] && ! modinfo -k "${kver}" -n nvidia >/dev/null 2>&1; then
+        for f in $(for gk in /usr/lib/modules/*/; do
+                       [[ -f "${gk}vmlinuz" ]] || continue
+                       gk="${gk%/}"; printf '%s\n' "${gk##*/}"
+                   done | sort -rV); do
+            [[ "${f}" == "${kver}" ]] && continue
+            modinfo -k "${f}" -n nvidia >/dev/null 2>&1 || continue
+            compgen -G "${esp}/EFI/Linux/*${f}.efi" >/dev/null || continue
+            log "verify: ${kver} has no NVIDIA module — expecting maze-sb-sign's fallback ${f}"
+            kver="${f}"
+            break
+        done
+    fi
+
     # 1) The ESP must carry a UKI for the kernel that is expected to boot.
     uki=""
     for f in "${esp}"/EFI/Linux/*"${kver}".efi; do
@@ -228,18 +317,23 @@ if [[ "${MODE}" == "ask" ]]; then
     echo "  Maze uses OPEN-SOURCE drivers by default (recommended)."
     echo
     read -rp "Install the NVIDIA proprietary driver now? [y/N] " ans
-    case "${ans}" in [yY]*) MODE="nvidia" ;; *) log "Keeping open-source drivers. Nothing to do."; exit 0 ;; esac
+    case "${ans}" in [yY]*) MODE="nvidia"; MODE_ASKED=1 ;; *) log "Keeping open-source drivers. Nothing to do."; exit 0 ;; esac
 fi
 
 # ---------------------------------------------------------------------------
 revert_to_open() {
+    local exit_code="${1:-0}"
     log "Removing the proprietary NVIDIA driver (reverting to open-source)"
     # Only what is actually installed: one missing name ("target not found")
     # makes pacman abort the WHOLE -Rns — and cuda/ollama-cuda are best-effort
     # extras that are often absent — so the driver stayed installed while the
     # rest of this function went on to delete its configuration.
     local _nv=() _p
-    for _p in nvidia-dkms nvidia-utils lib32-nvidia-utils cuda ollama-cuda; do
+    # nvidia-open-dkms is what pacman actually installs for Turing and newer
+    # (it provides nvidia-dkms). `pacman -Q nvidia-dkms` does not resolve a
+    # provider, so with only the old name here the kernel module package was
+    # silently left installed — and with it nvidia-utils' nouveau blacklist.
+    for _p in nvidia-open nvidia-open-lts nvidia-open-dkms nvidia-dkms nvidia-utils lib32-nvidia-utils cuda ollama-cuda; do
         pacman -Qq "${_p}" >/dev/null 2>&1 && _nv+=("${_p}")
     done
     if ((${#_nv[@]})); then
@@ -259,7 +353,6 @@ revert_to_open() {
     # Back on nouveau: if it owns the panel, `kms` is the only thing that puts
     # the splash on the real GPU again (the install path removed it).
     panel_is_nvidia && restore_kms_hook
-    mkinitcpio -P || warn "mkinitcpio rebuild failed"
     rebuild_ukis
     # command -v, not a hardcoded path: the packaged binary lives at
     # /usr/bin/maze-sb-sign (maze-secureboot). /usr/local/bin/maze-sb-sign is
@@ -272,7 +365,7 @@ revert_to_open() {
     # after every driver revert.
     command -v maze-sb-sign >/dev/null 2>&1 && maze-sb-sign --force-bootloader || true
     log "Reverted to open-source drivers. Reboot to apply."
-    exit 0
+    exit "${exit_code}"
 }
 [[ "${MODE}" == "open" ]] && revert_to_open
 
@@ -280,52 +373,145 @@ revert_to_open() {
 # NVIDIA proprietary install.
 has_nvidia_gpu || warn "no NVIDIA GPU detected — installing anyway as requested"
 
-# 1) Secure Boot: configure DKMS to sign modules with this machine's MOK key
-#    BEFORE building nvidia, so the modules are signed the moment they're built.
-if mok_present; then
-    log "Secure Boot key found — configuring DKMS to sign modules with the MOK"
-    install -d -m755 /etc/dkms
-    # dkms (>=3.0) reads these from framework.conf and signs every built module.
-    if ! grep -q '^mok_signing_key=' /etc/dkms/framework.conf 2>/dev/null; then
-        {
-            echo "# Maze Linux: sign DKMS modules with the per-machine Secure Boot MOK key"
-            echo "mok_signing_key=\"${MOK_KEY}\""
-            echo "mok_certificate=\"${MOK_CRT}\""
-        } >> /etc/dkms/framework.conf
+# 0) Can the open kernel modules drive this card at all? Checked before
+#    anything is installed or configured, so a refusal changes nothing.
+classify_nvidia_gpus
+if ((${#nv_legacy[@]})) && ((${#nv_supported[@]} == 0)); then
+    die "this NVIDIA GPU is older than Turing (PCI ${nv_legacy[*]}).
+
+Since driver 590 Arch ships only NVIDIA's open kernel modules, which need an
+RTX 20xx / GTX 16xx or newer card. On this one the driver would not load, and
+nvidia-utils would still blacklist nouveau: a black screen after the reboot.
+Nothing was changed — the open-source driver (nouveau) stays in use.
+
+The last branch that supports this card is the legacy 580xx driver in the AUR
+(nvidia-580xx-dkms). Maze does not install it: it is not maintained by Arch,
+and future kernels will stop building it."
+fi
+if ((${#nv_legacy[@]})); then
+    warn "an older NVIDIA GPU is also present and will NOT be driven: ${nv_legacy[*]}"
+fi
+
+plan_module_packages
+
+# 1) Secure Boot: only the DKMS path builds modules on this machine, so only it
+#    is configured to sign them with the MOK — BEFORE building, so they are
+#    signed the moment they are built. The prebuilt modules come from Arch.
+if [[ "${NV_MODE}" == "dkms" ]]; then
+    if mok_present; then
+        log "Secure Boot key found — configuring DKMS to sign modules with the MOK"
+        install -d -m755 /etc/dkms
+        # dkms (>=3.0) reads these from framework.conf and signs every built module.
+        if ! grep -q '^mok_signing_key=' /etc/dkms/framework.conf 2>/dev/null; then
+            {
+                echo "# Maze Linux: sign DKMS modules with the per-machine Secure Boot MOK key"
+                echo "mok_signing_key=\"${MOK_KEY}\""
+                echo "mok_certificate=\"${MOK_CRT}\""
+            } >> /etc/dkms/framework.conf
+        fi
+    else
+        warn "no per-machine MOK key (${MOK_KEY}); DKMS modules will be UNSIGNED."
+    fi
+fi
+
+# 2) Install the module package(s) + userspace.
+#    -Syu (FULL sync) not -Sy: the module and the kernel must match, and a
+#    partial upgrade (-Sy + install) is the classic way to break Arch.
+if [[ "${NV_MODE}" == "prebuilt" ]]; then
+    log "Installing the NVIDIA driver: ${nv_pkgs[*]} (prebuilt by Arch for each kernel — nothing is compiled here)"
+else
+    log "Installing the NVIDIA driver via DKMS (a non-Arch kernel is installed): ${nv_pkgs[*]} ${nv_hdrs[*]}"
+fi
+
+if [[ "${NV_MODE}" == "prebuilt" ]] && pacman -Qq nvidia-open-dkms >/dev/null 2>&1; then
+    # Moving a DKMS install onto the prebuilt modules. nvidia-open-dkms
+    # conflicts with nvidia-open, and `pacman --noconfirm` answers a conflict
+    # question with "no", so a plain -S aborts. Done in steps that each leave a
+    # working system: bring everything current and DOWNLOAD the new packages
+    # first (a network failure changes nothing), then swap from the cache, and
+    # put the DKMS package straight back if the swap does not go through.
+    log "Switching from DKMS to the prebuilt modules"
+    pacman -Syu --noconfirm \
+        || die "system update failed (need internet / a full mirror). Nothing was switched."
+    pacman -Sw --noconfirm "${nv_pkgs[@]}" \
+        || die "could not download ${nv_pkgs[*]}. Nothing was switched; the DKMS driver stays."
+    pacman -Rdd --noconfirm nvidia-open-dkms \
+        || die "could not remove nvidia-open-dkms. Nothing was switched."
+    if ! pacman -S --noconfirm "${nv_pkgs[@]}"; then
+        warn "installing ${nv_pkgs[*]} failed — restoring nvidia-open-dkms"
+        pacman -S --noconfirm nvidia-open-dkms \
+            || die "could NOT restore nvidia-open-dkms either. DO NOT REBOOT. Run: sudo pacman -S nvidia-open-dkms"
+        die "switch to the prebuilt modules failed; the DKMS driver was restored."
+    fi
+    # Mark the userspace as explicitly wanted, as a fresh install would.
+    pacman -S --needed --noconfirm nvidia-utils lib32-nvidia-utils \
+        || warn "nvidia-utils / lib32-nvidia-utils could not be (re)confirmed"
+    if [[ -z "$(dkms status 2>/dev/null)" ]]; then
+        log "no DKMS modules remain; dkms and the kernel headers are no longer needed by the driver"
+        log "  (remove them if nothing else uses them: sudo pacman -Rns dkms linux-headers linux-lts-headers)"
     fi
 else
-    warn "no per-machine MOK key (${MOK_KEY}); modules will be UNSIGNED."
-    warn "if you enable Secure Boot later, nvidia will fail to load until signed."
+    pacman -Syu --needed --noconfirm "${nv_pkgs[@]}" nvidia-utils lib32-nvidia-utils "${nv_hdrs[@]}" \
+        || die "package install failed (need internet / a full mirror). Nothing changed permanently."
 fi
 
-# 2) Install the driver + DKMS + headers for every installed kernel, plus the
-#    CUDA toolkit and ollama-cuda so Maze's bundled ollama (CPU-only by
-#    default, see packages.x86_64) picks up GPU acceleration on this machine.
-#    ollama-cuda depends on both ollama and cuda, so this is best-effort added
-#    on top rather than required (a slow/offline mirror should not fail the
-#    whole NVIDIA driver install over a ~2.2 GiB extra download).
-log "Installing NVIDIA proprietary driver (nvidia-dkms + utils + headers)"
-# Headers for EVERY installed kernel (linux, linux-lts, linux-zen, ...), so DKMS
-# can build the nvidia module against each one — now and on future kernels.
-hdrs=()
-for kver in /usr/lib/modules/*/; do
-    [[ -f "${kver}/pkgbase" ]] || continue
-    pkgbase="$(cat "${kver}/pkgbase" 2>/dev/null || true)"
-    [[ -n "${pkgbase}" ]] && hdrs+=("${pkgbase}-headers")
+# 2b) Is the module really there for every kernel? pacman reports success when
+#     the packages are installed, whatever DKMS did afterwards — and
+#     nvidia-utils blacklists nouveau regardless. On the prebuilt path a gap
+#     means Arch has not yet rebuilt the module for a just-released kernel.
+nv_built=(); nv_failed=()
+for _d in /usr/lib/modules/*/; do
+    [[ -f "${_d}pkgbase" && -f "${_d}vmlinuz" ]] || continue
+    _k="${_d%/}"; _k="${_k##*/}"
+    if modinfo -k "${_k}" nvidia >/dev/null 2>&1; then
+        nv_built+=("${_k}")
+    else
+        nv_failed+=("${_k}")
+    fi
 done
-# de-duplicate (guard the empty case so we never pass "" to pacman)
-if ((${#hdrs[@]})); then
-    mapfile -t hdrs < <(printf '%s\n' "${hdrs[@]}" | sort -u)
+
+show_dkms_log() {
+    [[ "${NV_MODE}" == "dkms" ]] || return 0
+    local log_file
+    log_file="$(ls -t /var/lib/dkms/nvidia/*/build/make.log 2>/dev/null | head -1)"
+    [[ -n "${log_file}" ]] || return 0
+    warn "last lines of ${log_file}:"
+    tail -n 12 "${log_file}" | sed 's/^/    /' >&2
+}
+
+if ((${#nv_built[@]} == 0)); then
+    warn "the NVIDIA module is not available for ANY installed kernel (${nv_failed[*]})."
+    show_dkms_log
+    warn "Leaving it installed would blacklist nouveau with nothing to replace it,"
+    warn "so the open-source driver is being restored. Try again after the next"
+    warn "nvidia or kernel update: sudo maze-gpu-driver"
+    revert_to_open 1
 fi
-# -Syu (FULL sync) not -Sy: the nvidia driver and the running kernel must match,
-# and a partial upgrade (-Sy + install) is the classic way to break Arch.
-pacman -Syu --needed --noconfirm nvidia-dkms nvidia-utils lib32-nvidia-utils dkms "${hdrs[@]}" \
-    || die "package install failed (need internet / a full mirror). Nothing changed permanently."
+
+if ((${#nv_failed[@]})); then
+    warn "the NVIDIA module is not available for: ${nv_failed[*]}"
+    show_dkms_log
+    # No pin is written any more. maze-sb-sign boots the newest kernel that has
+    # the module until this one gets it, then moves back by itself — a pin
+    # written here used to keep the machine on the older kernel for good.
+    log "maze-sb-sign boots a kernel that has the module (${nv_built[*]}) until it"
+    log "  is available for ${nv_failed[*]}, then switches back automatically."
+fi
 
 # CUDA + ollama-cuda (best-effort, separate call): a slow mirror or offline
-# build should not fail the NVIDIA driver install itself over this ~2.2 GiB
-# extra download. Without it, ollama silently keeps running CPU-only.
-if pacman -Syu --needed --noconfirm cuda ollama-cuda; then
+# build should not fail the NVIDIA driver install itself over this extra
+# download. Without it, ollama silently keeps running CPU-only.
+#
+# Asked separately when interactive: it is ~3 GB to download and ~6.5 GB on
+# disk, and on a small card (2-4 GB VRAM) the speed-up for Maze AI is modest.
+want_cuda="y"
+if [[ -t 0 && "${MODE_ASKED:-0}" == 1 ]]; then
+    read -rp "Also install CUDA + ollama-cuda so Maze AI runs on the GPU (~3 GB download, ~6.5 GB on disk)? [Y/n] " want_cuda
+    want_cuda="${want_cuda:-y}"
+fi
+if [[ "${want_cuda}" != [yY]* ]]; then
+    log "skipping CUDA; Maze AI stays on the CPU (later: sudo pacman -S cuda ollama-cuda)"
+elif pacman -Syu --needed --noconfirm cuda ollama-cuda; then
     log "CUDA + ollama-cuda installed — ollama will use the GPU"
 else
     warn "cuda/ollama-cuda install failed (offline/slow mirror?); ollama stays CPU-only for now"
@@ -388,8 +574,9 @@ fi
 # 5) Rebuild the initramfs content AND the actual booted UKI (mkinitcpio -P
 #    alone only touches the unused plain /boot/initramfs-*.img — see
 #    rebuild_ukis() above), then re-sign for Secure Boot.
-log "Rebuilding initramfs and UKI"
-mkinitcpio -P || warn "mkinitcpio rebuild failed"
+log "Rebuilding the boot images (UKI) for every installed kernel"
+# kernel-install builds the initramfs itself; a separate `mkinitcpio -P` does
+# nothing on Maze (empty presets) except print two misleading warnings.
 rebuild_ukis
 
 # What the signature check below actually established. Three states, because
@@ -403,6 +590,10 @@ NV_SIGNED_STATE="unknown"
 if mok_present && command -v maze-sb-sign >/dev/null 2>&1; then
     log "Re-signing boot artifacts for Secure Boot"
     maze-sb-sign --force-bootloader || warn "maze-sb-sign reported problems"
+fi
+if [[ "${NV_MODE}" == "prebuilt" ]]; then
+    NV_SIGNED_STATE="prebuilt"
+elif mok_present; then
     # Confirm the freshly built nvidia modules carry a signature.
     #
     # Asked per INSTALLED kernel with -k, never for the RUNNING one. Step 2 of
@@ -456,6 +647,9 @@ if verify_boot_chain; then
         case "${NV_SIGNED_STATE}" in
             signed)
                 log "Secure Boot: modules are signed with your MOK; nothing else to enroll." ;;
+            prebuilt)
+                log "Secure Boot: the boot chain is signed with your MOK. The prebuilt NVIDIA modules"
+                log "  are Arch's (not MOK-signed); Maze does not enforce module signatures, so they load." ;;
             unsigned)
                 warn "Secure Boot: at least one nvidia module is NOT signed (see above)."
                 warn "  With Secure Boot on, that kernel will boot without the driver."

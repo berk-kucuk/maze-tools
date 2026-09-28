@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Maze Hardware — Wi-Fi. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <g fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round">
+    <path d="M5.5 18.5c10.5-9.5 26.5-9.5 37 0"/>
+    <path d="M11.5 25c7-6 18-6 25 0"/>
+    <path d="M17.5 31.5c3.8-3 9.2-3 13 0"/>
+  </g>
+  <circle cx="24" cy="38" r="3" fill="#ffffff"/>
+</svg>

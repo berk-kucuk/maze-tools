@@ -30,6 +30,13 @@ SOCK = "/run/maze/guard.sock"
 DEVICES = ("camera", "microphone", "bluetooth", "wifi", "usb")
 CAM_BL = "/etc/modprobe.d/maze-killswitch-camera.conf"
 CAM_MODS = ("uvcvideo", "gspca_main")
+# Which network radios PANIC itself blocked, so RESTORE gives back exactly those
+# and never re-enables a radio the user had switched off with a kill switch.
+# Under /var (not /run): systemd-rfkill keeps the block across a reboot, so the
+# record has to survive one too.
+PANIC_RADIOS = "/var/lib/maze/panic-radios"
+USBGUARD = "/usr/bin/usbguard"
+USBGUARD_RULES = "/etc/usbguard/rules.conf"
 
 
 def _run(*argv):
@@ -67,13 +74,32 @@ def _run_user(uid, *argv):
 
 
 # ---------------------------------------------------------------- panic ----
+def _rfkill_state(kind):
+    """'on' (some device unblocked), 'off' (all soft-blocked) or 'none'."""
+    res = _run("rfkill", "list", kind)
+    text = (res.stdout or "") if res else ""
+    if not text.strip():
+        return "none"
+    return "on" if "Soft blocked: no" in text else "off"
+
+
 def do_panic():
     # Cut the NETWORK radios (Wi-Fi + mobile) hard. Deliberately NOT bluetooth —
     # blocking BT would disconnect a BT mouse/keyboard and could strand the user
     # at the lock screen with no input. (nmcli on the client side also drops
     # ethernet + every NetworkManager connection.)
-    _run("rfkill", "block", "wifi")
-    _run("rfkill", "block", "wwan")
+    was_on = [k for k in ("wifi", "wwan") if _rfkill_state(k) == "on"]
+    for k in ("wifi", "wwan"):
+        _run("rfkill", "block", k)
+    # A second PANIC before a RESTORE finds everything blocked already; keep
+    # the first record rather than overwriting it with an empty one.
+    if was_on or not os.path.exists(PANIC_RADIOS):
+        try:
+            os.makedirs(os.path.dirname(PANIC_RADIOS), exist_ok=True)
+            with open(PANIC_RADIOS, "w") as fh:
+                fh.write(" ".join(was_on) + "\n")
+        except OSError:
+            pass
     _run("journalctl", "--rotate")
     _run("journalctl", "--vacuum-time=1s")
     for d in ("/var/log/journal", "/run/log/journal"):
@@ -92,6 +118,10 @@ def do_panic():
                 open(f, "w").close()
         except OSError:
             pass
+    # journald still holds the files just unlinked above and would keep
+    # writing into those deleted inodes — logging silently lost until the next
+    # reboot. Rotating again makes it close them and open fresh ones.
+    _run("journalctl", "--rotate")
     _run("systemctl", "kill", "--signal=SIGHUP", "auditd")
     # Flush page cache / dentries (cheap, non-disruptive). We deliberately do NOT
     # cycle swap (swapoff/swapon): on a low-RAM box swapoff can trigger the OOM
@@ -110,8 +140,23 @@ def do_restore():
     # Undo the REVERSIBLE part of panic: un-block the network radios. rfkill state
     # is persisted by systemd-rfkill across reboots, so without this the radios
     # would stay dead even after a restart. (Logs/history stay wiped — by design.)
-    _run("rfkill", "unblock", "wifi")
-    _run("rfkill", "unblock", "wwan")
+    # Only the radios PANIC itself switched off: Wi-Fi the user had killed in
+    # Maze Hardware beforehand stays off. No record (panic from an older
+    # version) falls back to the old behaviour of unblocking both.
+    try:
+        with open(PANIC_RADIOS) as fh:
+            kinds = [k for k in fh.read().split() if k in ("wifi", "wwan")]
+    except OSError:
+        kinds = ["wifi", "wwan"]
+    for k in kinds:
+        _run("rfkill", "unblock", k)
+    try:
+        os.remove(PANIC_RADIOS)
+    except OSError:
+        pass
+    still = [k for k in kinds if _rfkill_state(k) == "off"]
+    if still:
+        return "ERR restore-failed " + ",".join(still)
     return "OK restored"
 
 
@@ -122,6 +167,10 @@ def _camera(action):
             fh.write("# Maze killswitch: camera disabled\nblacklist uvcvideo\nblacklist gspca_main\n")
         for m in CAM_MODS:
             _run("modprobe", "-r", m)
+        # modprobe -r fails while an app has the camera open. This used to
+        # report success anyway and the UI said "Off" over a live webcam.
+        if any(_mod_loaded(m) for m in CAM_MODS):
+            return "ERR camera-in-use"
     else:
         try:
             os.remove(CAM_BL)
@@ -129,6 +178,7 @@ def _camera(action):
             pass
         for m in CAM_MODS:
             _run("modprobe", m)
+    return None
 
 
 def _mic(action, uid):
@@ -170,13 +220,26 @@ def _radio(dev, action):
 
 def _usb(action):
     if action == "off":
-        res = _run("usbguard", "generate-policy")
-        if res and res.returncode == 0:
-            try:
-                with open("/etc/usbguard/rules.conf", "w") as fh:
-                    fh.write(res.stdout)
-            except OSError:
-                pass
+        if not os.path.exists(USBGUARD):
+            return "ERR usb-unavailable"
+        # The allow-list for everything plugged in RIGHT NOW. If it cannot be
+        # produced, stop: enabling usbguard with ImplicitPolicyTarget=block and
+        # an empty or stale rule file de-authorises the keyboard and mouse too.
+        res = _run(USBGUARD, "generate-policy")
+        if not res or res.returncode != 0 or "allow" not in (res.stdout or ""):
+            return "ERR usb-policy-failed"
+        try:
+            # usbguard-daemon refuses a rules file readable by others; write
+            # 0600 into a temp file and rename, so a crash never leaves a
+            # half-written allow-list behind.
+            tmp = USBGUARD_RULES + ".maze-new"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(res.stdout)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, USBGUARD_RULES)
+        except OSError:
+            return "ERR usb-policy-failed"
         _set_usbguard_block()
         _run("systemctl", "enable", "--now", "usbguard")
     else:
@@ -187,6 +250,7 @@ def _usb(action):
         # the UI shows USB "on". Re-authorize every USB device + the per-port
         # default so hot-plug/mount works again.
         _usb_reauthorize()
+    return None
 
 
 def _usb_reauthorize():
@@ -229,44 +293,83 @@ def _set_usbguard_block():
 def do_kill(device, action, uid):
     if device not in DEVICES or action not in ("on", "off"):
         return "ERR bad-args"
+    err = None
     if device == "camera":
-        _camera(action)
+        err = _camera(action)
     elif device == "microphone":
         _mic(action, uid)
     elif device in ("bluetooth", "wifi"):
         _radio(device, action)
     elif device == "usb":
-        _usb(action)
+        err = _usb(action)
+    if err:
+        return err
+    # Report what the device IS now, not what was asked for: every step above
+    # can fail quietly (a busy module, rfkill with no permission, PipeWire not
+    # up), and a privacy switch that says "off" over a working device is worse
+    # than one that admits it failed.
+    now = _device_state(device, uid)
+    if now not in (action, "none"):
+        return f"ERR {device}-not-applied"
     return f"OK {device} {action}"
 
 
-def do_status(uid):
-    out = []
-    out.append("camera=off" if (os.path.exists(CAM_BL) or not _mod_loaded("uvcvideo")) else "camera=on")
-    # Mic state must come from PipeWire (the layer the kill now acts on); fall back
-    # to ALSA only when there is no user session (e.g. status queried very early).
-    mic = None
-    if uid is not None:
-        res = _run_user(uid, "wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@")
-        text = (res.stdout or "") if res else ""
-        if "MUTED" in text:
-            mic = "off"
-        elif text.strip():
-            mic = "on"
-    if mic is None:
+def _has_video_device():
+    """A USB Video Class interface is present (class 0e), camera driver or not."""
+    base = "/sys/bus/usb/devices"
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return False
+    for e in entries:
+        if ":" not in e:
+            continue
+        try:
+            with open(os.path.join(base, e, "bInterfaceClass")) as fh:
+                if fh.read().strip().lower() == "0e":
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _device_state(dev, uid):
+    """'on' | 'off' | 'none' for one device — what it actually is right now."""
+    if dev == "camera":
+        # The driver being loaded is what makes the camera usable, so that
+        # decides "on" even when the blacklist exists (unload failed). The
+        # old rule called a camera with no driver loaded "off" on a machine
+        # that has no camera at all.
+        if any(_mod_loaded(m) for m in CAM_MODS):
+            return "on"
+        if os.path.exists(CAM_BL) or _has_video_device():
+            return "off"
+        return "none"
+    if dev == "microphone":
+        # From PipeWire (the layer the kill acts on); ALSA only when there is
+        # no user session (e.g. status queried very early).
+        if uid is not None:
+            res = _run_user(uid, "wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@")
+            text = (res.stdout or "") if res else ""
+            if "MUTED" in text:
+                return "off"
+            if text.strip():
+                return "on"
         res = _run("amixer", "-c", "0", "get", "Capture")
-        mic = "off" if (res and "[off]" in (res.stdout or "")) else "on"
-    out.append(f"microphone={mic}")
-    for dev in ("bluetooth", "wifi"):
-        res = _run("rfkill", "list", dev)
-        text = (res.stdout or "") if res else ""
-        if not text.strip():
-            out.append(f"{dev}=none")        # no such device (e.g. a VM)
-        else:
-            out.append(f"{dev}=off" if "Soft blocked: yes" in text else f"{dev}=on")
-    res = _run("systemctl", "is-active", "usbguard")
-    out.append("usb=off" if (res and (res.stdout or "").strip() == "active") else "usb=on")
-    return "OK " + " ".join(out)
+        return "off" if (res and "[off]" in (res.stdout or "")) else "on"
+    if dev in ("bluetooth", "wifi"):
+        # "none": no such device (e.g. a VM). Any unblocked adapter is "on".
+        return _rfkill_state(dev)
+    if dev == "usb":
+        if not os.path.exists(USBGUARD):
+            return "none"
+        res = _run("systemctl", "is-active", "usbguard")
+        return "off" if (res and (res.stdout or "").strip() == "active") else "on"
+    return "none"
+
+
+def do_status(uid):
+    return "OK " + " ".join(f"{d}={_device_state(d, uid)}" for d in DEVICES)
 
 
 def _mod_loaded(name):

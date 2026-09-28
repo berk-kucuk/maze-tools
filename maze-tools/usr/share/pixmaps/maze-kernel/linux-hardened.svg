@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Maze Kernel Switcher — linux-hardened: a shield with a keyhole. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <path d="M24 4.5 39 9.8v11.4c0 10.2-6.4 17.3-15 21.3-8.6-4-15-11.1-15-21.3V9.8z" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-width="2.4" stroke-linejoin="round"/>
+  <circle cx="24" cy="20.5" r="4" fill="#ffffff"/>
+  <path d="M22 22.5h4l1.2 9.5h-6.4z" fill="#ffffff"/>
+</svg>

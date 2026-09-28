@@ -279,6 +279,26 @@ for pre in /etc/mkinitcpio.d/*.preset; do
     [[ -f "$pre" ]] || continue
     if grep -q 'PRESETS=()' "$pre"; then pass "$(basename "$pre"): empty preset (UKI layout, as calamares-mount-api.sh writes)"; else warn "$(basename "$pre") is not the Maze empty preset — mkinitcpio -P would write loose images"; fi
 done
+# One UKI build path: Arch's preset-driven hooks masked (maze-secureboot's
+# mkinitcpio-hooks) exactly when every preset is the Maze empty one.
+_mkh=/usr/lib/maze-secureboot/mkinitcpio-hooks
+_allempty=1; _npre=0
+for pre in /etc/mkinitcpio.d/*.preset; do
+    [[ -f "$pre" ]] || continue
+    _npre=$((_npre+1)); grep -qE '^[[:space:]]*PRESETS=\(\)[[:space:]]*$' "$pre" || _allempty=0
+done
+[[ "${_npre}" -gt 0 ]] || _allempty=0
+if [[ ! -x "${_mkh}" ]]; then
+    info "maze-secureboot predates mkinitcpio hook masking (no ${_mkh})"
+else
+    _mks="$("${_mkh}" status 2>/dev/null)"
+    case "${_allempty}:${_mks}" in
+        1:masked)   pass "Arch mkinitcpio preset hooks disabled — the UKI has one build path (85-maze-kernel-install)" ;;
+        1:*)        warn "Arch mkinitcpio preset hooks ${_mks:-?} although every preset is empty (duplicate build path, warnings on every update)" "fix: sudo ${_mkh} apply" ;;
+        0:unmasked) pass "Arch mkinitcpio preset hooks active (a preset builds images, so they are needed)" ;;
+        *)          fail "Arch mkinitcpio preset hooks ${_mks:-?} but a preset is not the Maze empty one — its images would never be built" "fix: sudo ${_mkh} apply" ;;
+    esac
+fi
 if [[ -f /etc/plymouth/plymouthd.conf ]] && grep -qE '^Theme=maze' /etc/plymouth/plymouthd.conf; then pass "plymouthd.conf Theme=maze"; else fail "plymouthd.conf does not set Theme=maze"; fi
 grep -qE '^ShowDelay=0' /etc/plymouth/plymouthd.conf 2>/dev/null && pass "plymouth ShowDelay=0" || warn "plymouth ShowDelay not 0"
 [[ -d /usr/share/plymouth/themes/maze ]] && pass "plymouth theme dir present" || fail "/usr/share/plymouth/themes/maze missing"
@@ -347,7 +367,12 @@ else
         else
             fail "no UKI on the ESP for installed kernel ${kv} (${pb})" "sudo kernel-install add ${kv} /usr/lib/modules/${kv}/vmlinuz"
         fi
-        [[ -d "/usr/lib/modules/${kv}/build" ]] && pass "headers present for ${kv}" || warn "no headers for ${kv} (DKMS modules cannot build against it)"
+        # Headers matter only to DKMS. Maze no longer needs them by default
+        # (prebuilt nvidia-open; broadcom-wl only on Broadcom Wi-Fi), and the
+        # installer removes them when no DKMS module is left.
+        if [[ -d "/usr/lib/modules/${kv}/build" ]]; then pass "headers present for ${kv}"
+        elif has dkms && [[ -n "$(dkms status 2>/dev/null)" ]]; then warn "no headers for ${kv}, but DKMS modules are installed — they cannot build for this kernel" "sudo pacman -S ${pb}-headers"
+        else info "no headers for ${kv} (not needed: no DKMS modules)"; fi
     done
     # Stale UKIs (kernel gone)
     for u in "${ESP}"/EFI/Linux/*.efi; do
@@ -512,7 +537,8 @@ grep -q 'SULOGIN_FORCE=1' /usr/lib/systemd/system/rescue.service.d/10-maze-sulog
 _maze_groups="$(for f in /usr/lib/sysusers.d/*.conf; do case "$f" in */maze*|*/entropy*|*/qlam*|*/haze*|*/sentin*) awk '/^g /{print $2}' "$f";; esac; done 2>/dev/null | sort -u | tr '\n' ' ')"
 info "Maze app groups declared by sysusers.d: ${_maze_groups:-<none>}"
 for g in ${_maze_groups}; do getent group "$g" >/dev/null && pass "group $g exists" || fail "group $g declared in sysusers.d but missing (systemd-sysusers did not run?)"; done
-while IFS=: read -r u _ uid gid _ home shell; do
+# shellcheck disable=SC2088  # "~/..." below is display text, not a path
+while IFS=: read -r u _ uid _ _ home shell; do
     [[ "${uid}" -ge 1000 && "${uid}" -lt 65000 ]] || continue
     printf '  %s-- user %s (uid %s, home %s)%s\n' "${C_BOLD}" "$u" "$uid" "$home" "${C_0}"
     [[ "${shell}" == "/usr/bin/zsh" ]] && pass "shell zsh" || warn "shell is ${shell} (deploy sets zsh)"
@@ -744,7 +770,7 @@ for f in /etc/systemd/system/multi-user.target.wants/sshd.service /etc/systemd/s
          /etc/systemd/system/sysinit.target.wants/systemd-time-wait-sync.service /etc/systemd/system/network-online.target.wants/NetworkManager-wait-online.service; do
     [[ -L "$f" ]] && fail "wants symlink still present: $f"
 done
-for l in $(find /etc/systemd/system -xtype l 2>/dev/null); do warn "dangling unit symlink: $l"; done
+while IFS= read -r l; do warn "dangling unit symlink: $l"; done < <(find /etc/systemd/system -xtype l 2>/dev/null)
 # firewalld services
 if systemctl is-active firewalld >/dev/null 2>&1 && has firewall-cmd; then
     _fs="$(firewall-cmd --list-services 2>/dev/null)"; info "firewalld default zone: $(firewall-cmd --get-default-zone 2>/dev/null) services: ${_fs}"
@@ -912,6 +938,45 @@ fi
 journalctl -b -k -q 2>/dev/null | grep -q 'Unpatched return thunk in use' && warn "kernel: 'Unpatched return thunk in use' — an out-of-tree module (wl) defeated the return-thunk mitigation"
 _uc="$(journalctl -b -k -q 2>/dev/null | grep -m1 -iE 'microcode: (updated|Current revision)')"; [[ -n "${_uc}" ]] && pass "microcode: ${_uc#*]: }" || info "no microcode update line in dmesg"
 [[ -f /etc/modprobe.d/broadcom-wl.conf ]] && info "broadcom-wl modprobe conf present (from airootfs)"
+# Broadcom wl is only worth its DKMS builds where a Broadcom WIRELESS controller
+# (vendor 14e4, class 0280) exists — the installer removes it everywhere else.
+_bcmw=0
+for _pd in /sys/bus/pci/devices/*; do
+    [[ "$(cat "${_pd}/vendor" 2>/dev/null)" == 0x14e4 && "$(cat "${_pd}/class" 2>/dev/null)" == 0x0280* ]] && { _bcmw=1; break; }
+done
+if pkg_installed broadcom-wl-dkms; then
+    if [[ "${_bcmw}" -eq 1 ]]; then
+        pass "broadcom-wl-dkms installed for the Broadcom wireless controller"
+        for _h in linux-headers linux-lts-headers; do
+            pkg_installed "${_h}" || continue
+            pacman -Qqdt 2>/dev/null | grep -qx "${_h}" \
+                && warn "${_h} is an orphan dependency, but broadcom-wl-dkms builds against it (removing orphans would leave that kernel without Wi-Fi)" "fix: sudo pacman -D --asexplicit ${_h}"
+        done
+    else
+        warn "broadcom-wl-dkms installed but there is no Broadcom wireless controller — DKMS compiles it for every kernel on every update" "fix: sudo pacman -Rns broadcom-wl-dkms"
+    fi
+fi
+# NVIDIA: prebuilt (nvidia-open / nvidia-open-lts) on Arch kernels, DKMS only
+# for others; open modules only drive Turing and newer (maze-gpu-driver).
+if pkg_installed nvidia-utils; then
+    _nonarch=0
+    for _d in /usr/lib/modules/*/; do
+        [[ -f "${_d}pkgbase" && -f "${_d}vmlinuz" ]] || continue
+        case "$(cat "${_d}pkgbase")" in linux|linux-lts) ;; *) _nonarch=1 ;; esac
+    done
+    if pkg_installed nvidia-open-dkms; then
+        if [[ "${_nonarch}" -eq 1 ]]; then pass "NVIDIA via DKMS (a non-Arch kernel is installed, no prebuilt module exists for it)"
+        else warn "NVIDIA via DKMS although only Arch kernels are installed — compiled on every kernel update" "fix: sudo maze-gpu-driver   (answer y; switches to the prebuilt nvidia-open modules)"; fi
+    elif pkg_installed nvidia-open || pkg_installed nvidia-open-lts; then
+        pass "NVIDIA via Arch's prebuilt modules ($(pacman -Qq nvidia-open nvidia-open-lts 2>/dev/null | tr '\n' ' '))"
+    fi
+    _nvleg=""
+    for _pd in /sys/bus/pci/devices/*; do
+        [[ "$(cat "${_pd}/vendor" 2>/dev/null)" == 0x10de && "$(cat "${_pd}/class" 2>/dev/null)" == 0x03* ]] || continue
+        _dv="$(cat "${_pd}/device" 2>/dev/null)"; [[ -n "${_dv}" ]] && (( _dv < 0x1e00 )) && _nvleg="${_nvleg} ${_pd##*/}(${_dv})"
+    done
+    [[ -n "${_nvleg}" ]] && fail "NVIDIA GPU older than Turing:${_nvleg} — the open kernel modules cannot drive it, and nvidia-utils blacklists nouveau" "fix: sudo maze-gpu-driver --open"
+fi
 _gpu="$(lspci -nnk 2>/dev/null | grep -A3 -iE 'VGA|3D|Display' | grep -E 'VGA|3D|Display|Kernel driver' | tr -s ' ' | tr '\n' ';')"; info "GPU: ${_gpu}"
 
 # =========================================================== 14. journal =====
@@ -1133,7 +1198,7 @@ PY
     else warn "old per-app venvs still on disk (dead weight, nothing uses them): ${_left[*]}"; fi
     # Runtime pycache under a pacman-owned tree is expected; anything else
     # untracked there means someone pip-installed into the shared venv by hand.
-    _stray="$(find "${_MV}/lib" -maxdepth 3 -path '*site-packages/*' ! -name __pycache__ 2>/dev/null | xargs -r pacman -Qo 2>&1 >/dev/null | sed -n 's/^error: No package owns //p' | head -5)"
+    _stray="$(find "${_MV}/lib" -maxdepth 3 -path '*site-packages/*' ! -name __pycache__ -print0 2>/dev/null | xargs -0 -r pacman -Qo 2>&1 >/dev/null | sed -n 's/^error: No package owns //p' | head -5)"
     [[ -z "${_stray}" ]] && pass "no hand-installed packages in the shared venv (everything is pacman-owned)" || { warn "untracked entries in the shared venv (pip install by hand? they vanish on the next maze-python upgrade):"; sed 's/^/         | /' <<<"${_stray}"; }
 fi
 
@@ -1225,7 +1290,8 @@ if [[ "${RUN_DOCTOR}" -eq 1 ]]; then
     fi
     section "23. maze-doctor --no-color$([[ "${DEEP}" -eq 1 ]] && echo ' --deep')"
     if [[ -x /usr/local/bin/maze-doctor ]]; then
-        _dout="$(/usr/local/bin/maze-doctor --no-color $([[ "${DEEP}" -eq 1 ]] && echo --deep) 2>&1)"
+        _dargs=(--no-color); [[ "${DEEP}" -eq 1 ]] && _dargs+=(--deep)
+        _dout="$(/usr/local/bin/maze-doctor "${_dargs[@]}" 2>&1)"
         sed 's/^/         | /' <<<"${_dout}"
         _df="$(grep -cE '^\s*\[FAIL\]' <<<"${_dout}")"; _dw="$(grep -cE '^\s*\[WARN\]' <<<"${_dout}")"
         [[ "${_df}" -eq 0 ]] && pass "maze-doctor: 0 FAIL, ${_dw} WARN" || fail "maze-doctor: ${_df} FAIL, ${_dw} WARN"

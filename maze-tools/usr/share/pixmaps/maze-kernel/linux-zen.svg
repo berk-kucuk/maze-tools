@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Maze Kernel Switcher — linux-zen: an ensō circle around a bolt (zen + speed). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <path d="M36.6 11.6A18 18 0 1 0 41.8 22" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+  <path d="M26.5 10.5 17.5 26h6.6l-3.1 11.5 10.5-16.2h-6.9z" fill="#ffffff" stroke="#ffffff" stroke-width="1.3" stroke-linejoin="round"/>
+</svg>

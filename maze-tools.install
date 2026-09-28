@@ -38,6 +38,13 @@ post_upgrade() {
     # choices across upgrades.
     systemctl daemon-reload >/dev/null 2>&1 || true
     _reload_udev
+    # maze-guardd is a long-running Python process: without a restart it keeps
+    # executing the OLD code until the next reboot, so a fixed kill switch or
+    # panic would not actually be fixed. try-restart leaves a disabled/stopped
+    # daemon alone; the socket is recreated within a second.
+    if [ -d /run/systemd/system ]; then
+        systemctl try-restart maze-guardd.service >/dev/null 2>&1 || true
+    fi
 }
 
 post_remove() {

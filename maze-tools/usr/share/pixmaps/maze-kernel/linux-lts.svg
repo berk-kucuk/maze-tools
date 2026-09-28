@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Maze Kernel Switcher — linux-lts: an hourglass (long-term support). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <g fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 5.5h24M12 42.5h24"/>
+    <path d="M15.5 5.5c0 8.5 8.5 12 8.5 18.5 0-6.5 8.5-10 8.5-18.5"/>
+    <path d="M15.5 42.5c0-8.5 8.5-12 8.5-18.5 0 6.5 8.5 10 8.5 18.5"/>
+  </g>
+  <path d="M18.6 39.6c1.6-3.6 3.5-5.4 5.4-5.4s3.8 1.8 5.4 5.4z" fill="#ffffff"/>
+  <path d="M20.2 12.2h7.6c-1 2.2-2.4 3.6-3.8 4.6-1.4-1-2.8-2.4-3.8-4.6z" fill="#ffffff" fill-opacity="0.35"/>
+  <path d="M24 26.5v5" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-dasharray="0.1 2.4"/>
+</svg>

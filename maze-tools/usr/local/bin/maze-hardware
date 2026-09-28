@@ -3,150 +3,552 @@
 
 One window with kernel/hardware-level kill switches for the camera, microphone,
 Bluetooth, Wi-Fi and USB. Reads/flips state with the unprivileged maze-killswitch,
-which forwards to the maze-guardd broker over its wheel-only socket — no pkexec /
+which forwards to the maze-guardd broker over its maze-group socket — no pkexec /
 setuid in the path.
+
+Every call runs asynchronously (QProcess): a USB policy change or a slow
+PipeWire answer used to freeze the whole window for up to a minute. And the
+state shown is only ever what the broker reported — when it cannot be reached,
+the switches say "unknown" instead of the old default of showing every device
+as "On", which for a privacy tool is the one wrong answer that matters.
 """
-import subprocess
+from __future__ import annotations
+
+import os
 import sys
 
-try:
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QIcon
-    from PySide6.QtWidgets import (
-        QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
-    )
-except Exception as exc:  # pragma: no cover
-    sys.stderr.write(f"maze-hardware: PySide6 unavailable: {exc}\n")
-    sys.exit(1)
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+sys.path.insert(0, "/usr/local/lib/maze")
+import maze_ui as ui  # noqa: E402
+from maze_i18n import current_language, set_language, tr  # noqa: E402
+
+from PySide6.QtCore import QPoint, QPointF, QProcess, QRectF, Qt, QTimer  # noqa: E402
+from PySide6.QtGui import (  # noqa: E402
+    QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QRadialGradient,
+)
+from PySide6.QtSvg import QSvgRenderer  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QAbstractButton,
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 KILL = "/usr/local/bin/maze-killswitch"
-ACCENT = "#e0443e"
-DEVICES = [
-    ("camera",     "Webcam",     "Unloads the uvcvideo kernel module"),
-    ("microphone", "Microphone", "Mutes every audio capture input"),
-    ("bluetooth",  "Bluetooth",  "rfkill block (persists across reboot)"),
-    ("wifi",       "Wi-Fi",      "rfkill block (persists across reboot)"),
-    ("usb",        "USB ports",  "USBGuard blocks NEW devices (current ones keep working)"),
-]
+APP_ICON = "/usr/share/pixmaps/maze-hardware.svg"
+# White line-art device icons drawn for this app (same house style as the
+# kernel switcher's); a blocked device gets a red slash painted over it.
+ICON_DIR = "/usr/share/pixmaps/maze-hardware"
+WIN_W, WIN_H = 720, 730
+POLL_MS = 5000   # the phone (Maze Connect) can flip a switch too — stay current
+
+DEVICES = (
+    ("camera", "Webcam", "camera.svg",
+     "Unloads the camera driver and keeps it from loading again."),
+    ("microphone", "Microphone", "microphone.svg",
+     "Mutes every audio capture input."),
+    ("bluetooth", "Bluetooth", "bluetooth.svg",
+     "rfkill block (persists across reboot)."),
+    ("wifi", "Wi-Fi", "wifi.svg",
+     "rfkill block (persists across reboot)."),
+    ("usb", "USB ports", "usb.svg",
+     "USBGuard blocks NEW devices (current ones keep working)."),
+)
+
+# maze-guardd error codes -> what the user should read.
+ERRORS = {
+    "camera-in-use": "The camera is in use by an app. Close it and try again.",
+    "usb-unavailable": "USBGuard is not installed, so USB cannot be locked.",
+    "usb-policy-failed": "Could not build the allow-list for the connected USB "
+                         "devices — nothing was changed.",
+    "unauthorized": "Refused: switches only work for the user at this "
+                    "machine (a member of the 'maze' group, local session).",
+    "bad-args": "The broker rejected the request.",
+}
 
 
-def read_status() -> dict:
-    # The broker returns ONE line: "OK camera=off microphone=on bluetooth=on ...".
-    out = {}
-    try:
-        res = subprocess.run([KILL, "status"], capture_output=True, text=True, timeout=10)
-        text = (res.stdout or "").strip()
-        if text.startswith("OK"):
-            text = text[2:].strip()
-        for tok in text.split():
-            if "=" in tok:
-                k, v = tok.split("=", 1)
-                out[k] = v   # "on" | "off" | "none"
-    except Exception:
-        pass
-    return out
+def _explain(reply: str) -> str:
+    code = reply[3:].strip().split(" ")[0] if reply.startswith("ERR") else ""
+    if code in ERRORS:
+        return tr(ERRORS[code])
+    if code.endswith("-not-applied"):
+        return tr("The change did not take effect — the device is unchanged.")
+    if not reply:
+        return tr("maze-guardd is not running. Start it with: "
+                  "sudo systemctl enable --now maze-guardd")
+    return tr("Unexpected answer from maze-guardd: {r}").format(r=reply)
+
+
+def _caps(text: str) -> str:
+    # str.upper() maps Turkish "i" to "I" ("GIZLILIK"); dotted İ first.
+    if current_language() == "tr":
+        text = text.replace("i", "İ")
+    return text.upper()
+
+
+def _pill_button(text: str, primary: bool = False) -> QPushButton:
+    btn = QPushButton(text)
+    btn.setCursor(Qt.PointingHandCursor)
+    btn.setFixedHeight(36)
+    if primary:
+        css = (f"QPushButton {{ color: #0a0a0c; background: {ui.ACCENT}; border: none;"
+               " border-radius: 10px; padding: 0 16px; font-size: 10pt; font-weight: bold; }"
+               f"QPushButton:hover {{ background: {ui.ACCENT_HOVER}; }}")
+    else:
+        css = (f"QPushButton {{ color: {ui.TEXT}; background: {ui.PILL_BG_HOVER};"
+               " border: none; border-radius: 10px; padding: 0 16px; font-size: 10pt; }"
+               "QPushButton:hover { background: rgba(255,255,255,0.20); }")
+    css += (f"QPushButton:disabled {{ color: {ui.FAINT}; background: {ui.PILL_BG}; }}")
+    btn.setStyleSheet(css)
+    return btn
+
+
+class DeviceEmblem(QWidget):
+    """Round glass medallion with the device icon; blocked = red ring + slash."""
+
+    def __init__(self, icon_file: str, size: int, state: str) -> None:
+        super().__init__()
+        self.setFixedSize(size, size)
+        self._svg = QSvgRenderer(os.path.join(ICON_DIR, icon_file), self)
+        self._state = state
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        blocked = self._state == "off"
+        quiet = self._state not in ("on", "off")
+        if quiet:
+            p.setOpacity(0.45)
+        r = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+        glow = QRadialGradient(QPointF(r.center().x(), r.top() + r.height() * 0.3),
+                               r.width() * 0.75)
+        if blocked:
+            glow.setColorAt(0.0, QColor(224, 102, 102, 46))
+            glow.setColorAt(1.0, QColor(224, 102, 102, 8))
+            ring = QColor(ui.BAD_RED)
+        else:
+            glow.setColorAt(0.0, QColor(255, 255, 255, 34))
+            glow.setColorAt(1.0, QColor(255, 255, 255, 6))
+            ring = QColor(255, 255, 255, 150 if self._state == "on" else 40)
+        p.setBrush(glow)
+        p.setPen(QPen(ring, 1.6))
+        p.drawEllipse(r)
+        s = r.width() * 0.48
+        box = QRectF(r.center().x() - s / 2, r.center().y() - s / 2, s, s)
+        if self._svg.isValid():
+            if blocked:
+                p.setOpacity(0.5)
+            self._svg.render(p, box)
+            p.setOpacity(1.0)
+        if blocked:
+            # A dark gap under the slash keeps it legible over the icon.
+            a = QPointF(box.left() - 2, box.top() - 2)
+            b = QPointF(box.right() + 2, box.bottom() + 2)
+            p.setPen(QPen(QColor(0, 0, 0, 230), 6.5, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(a, b)
+            p.setPen(QPen(QColor(ui.BAD_RED), 2.6, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(a, b)
+        p.end()
+
+
+class Switch(QAbstractButton):
+    """An iOS-style switch. It only DRAWS the reported state: clicking asks
+    the broker, and the switch moves once the broker confirms the change."""
+
+    def __init__(self, allowed: bool, enabled: bool) -> None:
+        super().__init__()
+        self._allowed = allowed
+        self.setFixedSize(56, 30)
+        self.setEnabled(enabled)
+        self.setCursor(Qt.PointingHandCursor if enabled else Qt.ArrowCursor)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if not self.isEnabled():
+            p.setOpacity(0.35)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        track = QPainterPath()
+        track.addRoundedRect(r, r.height() / 2, r.height() / 2)
+        hover = self.underMouse() and self.isEnabled()
+        if self._allowed:
+            p.fillPath(track, QColor(255, 255, 255, 255 if hover else 235))
+            knob_x, knob = r.right() - r.height() + 3, QColor(10, 10, 12)
+        else:
+            p.fillPath(track, QColor(224, 102, 102, 70 if hover else 45))
+            p.setPen(QPen(QColor(224, 102, 102, 150), 1.2))
+            p.drawPath(track)
+            knob_x, knob = r.left() + 3, QColor(ui.TEXT)
+        p.setPen(Qt.NoPen)
+        p.setBrush(knob)
+        d = r.height() - 6
+        p.drawEllipse(QRectF(knob_x, r.top() + 3, d, d))
+        p.end()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.update()
+        super().leaveEvent(event)
 
 
 class Row(QFrame):
-    def __init__(self, dev, title, desc, parent):
+    """One device: emblem, name, live state, description, and its switch."""
+
+    def __init__(self, dev: str, title: str, icon: str, desc: str, state: str,
+                 applying: bool, locked: bool, on_toggle) -> None:
         super().__init__()
-        self._dev = dev
-        self._parent = parent
         self.setObjectName("row")
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(16, 12, 16, 12)
-        text = QVBoxLayout()
-        t = QLabel(title); t.setObjectName("title")
-        d = QLabel(desc);  d.setObjectName("desc")
-        text.addWidget(t); text.addWidget(d)
-        lay.addLayout(text, 1)
-        self.btn = QPushButton("…")
-        self.btn.setObjectName("toggle")
-        self.btn.setFixedWidth(110)
-        self.btn.clicked.connect(self._toggle)
-        lay.addWidget(self.btn)
+        border = "rgba(224,102,102,0.30)" if state == "off" else "rgba(255,255,255,0.07)"
+        self.setStyleSheet(
+            "QFrame#row { background: rgba(255,255,255,0.04);"
+            f" border: 1px solid {border}; border-radius: 18px; }}")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(16, 12, 20, 12)
+        row.setSpacing(16)
+        row.addWidget(DeviceEmblem(icon, 56, state), 0, Qt.AlignVCenter)
 
-    def set_state(self, state: str):
-        # state is "on" | "off" | "none" (device not present, e.g. a VM has no Wi-Fi)
-        self._state = state
-        if state == "none":
-            self.btn.setText("N/A")
-            self.btn.setEnabled(False)
-            self.btn.setToolTip("No such device on this machine")
-            self.btn.setProperty("on", "none")
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        name = QLabel(tr(title))
+        name.setStyleSheet(f"color: {ui.TEXT}; background: transparent;")
+        name.setFont(QFont("Sans Serif", 13, QFont.Bold))
+        head.addWidget(name)
+        if applying:
+            st_text, st_color = tr("Applying…"), ui.DIM
         else:
-            self._on = (state == "on")
-            self.btn.setEnabled(True)
-            self.btn.setToolTip("")
-            self.btn.setText("On" if self._on else "Off")
-            self.btn.setProperty("on", "yes" if self._on else "no")
-        self.btn.style().unpolish(self.btn); self.btn.style().polish(self.btn)
+            st_text, st_color = {
+                "on": (tr("Allowed"), ui.OK_GREEN),
+                "off": (tr("Blocked"), ui.BAD_RED),
+                "none": (tr("Not present"), ui.FAINT),
+            }.get(state, (tr("Unknown"), ui.UNK_GRAY))
+        st = QLabel("●  " + st_text)
+        st.setStyleSheet(f"color: {st_color}; background: transparent;")
+        st.setFont(QFont("Sans Serif", 9, QFont.Bold))
+        head.addWidget(st)
+        head.addStretch(1)
+        col.addLayout(head)
+        d = QLabel(tr(desc))
+        d.setWordWrap(True)
+        d.setStyleSheet(f"color: {ui.DIM}; background: transparent;")
+        d.setFont(QFont("Sans Serif", 9))
+        col.addWidget(d)
+        row.addLayout(col, 1)
 
-    def _toggle(self):
-        if getattr(self, "_state", "") == "none":
-            return
-        action = "off" if getattr(self, "_on", True) else "on"
-        try:
-            # maze-killswitch is unprivileged: it forwards to the maze-guardd
-            # broker over its wheel-only socket. No pkexec / setuid in the path.
-            subprocess.run([KILL, self._dev, action], timeout=60)
-        except Exception:
-            pass
-        self._parent.refresh()
+        sw = Switch(allowed=state == "on",
+                    enabled=state in ("on", "off") and not locked)
+        sw.setToolTip(tr("Block") if state == "on" else tr("Allow") if state == "off" else "")
+        sw.clicked.connect(lambda: on_toggle(dev, "off" if state == "on" else "on"))
+        row.addWidget(sw, 0, Qt.AlignVCenter)
 
 
 class Hardware(QWidget):
-    KEYMAP = {"camera": "camera", "microphone": "microphone",
-              "bluetooth": "bluetooth", "wifi": "wifi", "usb": "usb"}
-
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Maze Hardware")
-        self.resize(520, 460)
-        self.setStyleSheet(f"""
-            QWidget {{ background:#0a0a0c; color:#f2f2f7;
-                       font-family:'Segoe UI','Noto Sans',sans-serif; }}
-            QLabel#h1 {{ font-size:20px; font-weight:700; }}
-            QLabel#sub {{ color:#9a9aa6; font-size:12px; }}
-            QFrame#row {{ background:#101015; border-radius:12px; }}
-            QLabel#title {{ font-size:15px; font-weight:600; }}
-            QLabel#desc {{ color:#8a8a94; font-size:11px; }}
-            QPushButton#toggle {{ border:none; border-radius:9px; padding:9px;
-                                  font-weight:700; background:#2a2a30; color:#fff; }}
-            QPushButton#toggle[on="yes"] {{ background:#2f7d32; color:#fff; }}
-            QPushButton#toggle[on="no"]  {{ background:{ACCENT}; color:#fff; }}
-            QPushButton#toggle[on="none"] {{ background:#222226; color:#5a5a62; }}
-            QPushButton#toggle:disabled {{ background:#222226; color:#5a5a62; }}
-        """)
-        col = QVBoxLayout(self)
-        col.setContentsMargins(20, 18, 20, 18)
-        col.setSpacing(10)
-        h = QLabel("Hardware privacy controller"); h.setObjectName("h1")
-        s = QLabel("Cut power-hungry sensors and radios at the kernel level — no physical switch needed.")
-        s.setObjectName("sub"); s.setWordWrap(True)
-        col.addWidget(h); col.addWidget(s); col.addSpacing(6)
-        self._rows = {}
-        for dev, title, desc in DEVICES:
-            r = Row(dev, title, desc, self)
-            self._rows[dev] = r
-            col.addWidget(r)
-        col.addStretch(1)
-        self.refresh()
+        self._drag: QPoint | None = None
+        self._state: dict[str, str] = {}
+        self._reachable: bool | None = None   # None = not asked yet
+        self._message = ("", ui.DIM)
+        self._busy = False                    # a KILL is in flight
+        self._applying = ""                   # which device it is for
+        self._queue: list[tuple[str, str]] = []
+        self._status_proc: QProcess | None = None
+        self._kill_proc: QProcess | None = None
 
-    def refresh(self):
-        st = read_status()
-        for dev, row in self._rows.items():
-            row.set_state(st.get(self.KEYMAP[dev], "on"))
+        self.setWindowTitle("Maze Hardware")
+        self.setWindowIcon(QIcon(APP_ICON))
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(WIN_W, WIN_H)
+
+        self._root = ui.Glass(ui.make_watermark(), self)
+        self._root.setGeometry(0, 0, WIN_W, WIN_H)
+        self._outer = QVBoxLayout(self._root)
+        self._outer.setContentsMargins(30, 22, 30, 22)
+        self._outer.setSpacing(0)
+        self._build()
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll)
+        self._timer.start(POLL_MS)
+        self._poll()
+
+    # -- broker I/O (async) ---------------------------------------------------
+    def _poll(self) -> None:
+        # Never overlap: a status query while one (or a KILL) is still running
+        # would just queue behind the broker's action lock.
+        if self._busy or self._status_proc is not None:
+            return
+        p = QProcess(self)
+        p.setProcessChannelMode(QProcess.MergedChannels)
+        p.finished.connect(lambda code, _s, p=p: self._status_done(p, code))
+        p.errorOccurred.connect(
+            lambda err, p=p: self._status_done(p, -1)
+            if err == QProcess.FailedToStart else None)
+        self._status_proc = p
+        p.start(KILL, ["status"])
+
+    def _status_done(self, p: QProcess, code: int) -> None:
+        if self._status_proc is not p:
+            return
+        self._status_proc = None
+        out = bytes(p.readAll()).decode("utf-8", "replace").strip()
+        p.deleteLater()
+        line = next((ln for ln in out.splitlines() if ln.startswith(("OK", "ERR"))), "")
+        new: dict[str, str] = {}
+        if code == 0 and line.startswith("OK"):
+            for tok in line[2:].split():
+                k, _, v = tok.partition("=")
+                if v in ("on", "off", "none"):
+                    new[k] = v
+            reachable = True
+        else:
+            reachable = False
+            self._message = (_explain(line), ui.BAD_RED)
+        if reachable and self._reachable is False:
+            self._message = ("", ui.DIM)
+        changed = new != self._state or reachable != self._reachable
+        self._state, self._reachable = new, reachable
+        if changed:
+            self._build()
+
+    def _toggle(self, dev: str, action: str) -> None:
+        if self._busy:
+            return
+        self._queue = [(dev, action)]
+        self._run_next()
+
+    def _block_cam_mic(self) -> None:
+        if self._busy:
+            return
+        self._queue = [(d, "off") for d in ("camera", "microphone")
+                       if self._state.get(d) == "on"]
+        self._run_next()
+
+    def _run_next(self) -> None:
+        if not self._queue:
+            return
+        dev, action = self._queue.pop(0)
+        self._busy = True
+        self._applying = dev
+        self._message = ("", ui.DIM)
+        self._build()
+        p = QProcess(self)
+        p.setProcessChannelMode(QProcess.MergedChannels)
+        p.finished.connect(lambda code, _s, p=p: self._kill_done(p, code))
+        p.errorOccurred.connect(
+            lambda err, p=p: self._kill_done(p, -1)
+            if err == QProcess.FailedToStart else None)
+        self._kill_proc = p
+        p.start(KILL, [dev, action])
+
+    def _kill_done(self, p: QProcess, code: int) -> None:
+        if self._kill_proc is not p:
+            return
+        self._kill_proc = None
+        out = bytes(p.readAll()).decode("utf-8", "replace").strip()
+        p.deleteLater()
+        line = next((ln for ln in out.splitlines() if ln.startswith(("OK", "ERR"))), "")
+        ok = code == 0 and line.startswith("OK")
+        if ok:
+            self._message = ("✓  " + tr("Done."), ui.OK_GREEN)
+        else:
+            self._message = ("✕  " + _explain(line), ui.BAD_RED)
+            self._queue.clear()   # stop a multi-step action at the first failure
+        self._busy = False
+        self._applying = ""
+        if ok and self._queue:
+            self._run_next()
+            return
+        self._build()
+        self._poll()   # show what the device actually is now
+
+    # -- UI -------------------------------------------------------------------
+    def _build(self) -> None:
+        ui_clear(self._outer)
+        self._outer.addLayout(self._header())
+        self._outer.addSpacing(16)
+        self._outer.addWidget(self._banner())
+        self._outer.addSpacing(12)
+        for dev, title, icon, desc in DEVICES:
+            state = self._state.get(dev, "unknown") if self._reachable else "unknown"
+            self._outer.addWidget(
+                Row(dev, title, icon, desc, state, dev == self._applying,
+                    self._busy, self._toggle))
+            self._outer.addSpacing(8)
+        self._outer.addStretch(1)
+        self._outer.addLayout(self._footer())
+
+    def _banner(self) -> QWidget:
+        """Everything at a glance, plus the one action people reach for most."""
+        frame = QFrame()
+        frame.setObjectName("banner")
+        frame.setMinimumHeight(118)
+        frame.setStyleSheet(
+            "QFrame#banner { background: rgba(255,255,255,0.05);"
+            " border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; }")
+        lay = QHBoxLayout(frame)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(16)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        cap = QLabel(_caps(tr("Privacy status")))
+        cap.setStyleSheet(f"color: {ui.FAINT}; background: transparent;")
+        cap.setFont(QFont("Sans Serif", 8, QFont.Bold))
+        present = [d for d, *_ in DEVICES if self._state.get(d) in ("on", "off")]
+        blocked = [d for d in present if self._state.get(d) == "off"]
+        if not self._reachable:
+            text = tr("Unknown — maze-guardd is not answering")
+        elif not blocked:
+            text = tr("Everything is allowed")
+        elif len(blocked) == len(present):
+            text = tr("Everything is blocked")
+        else:
+            text = tr("{n} of {total} blocked").format(n=len(blocked), total=len(present))
+        val = QLabel(text)
+        val.setStyleSheet(f"color: {ui.TEXT}; background: transparent;")
+        val.setFont(QFont("Sans Serif", 14, QFont.Bold))
+        col.addWidget(cap)
+        col.addWidget(val)
+        minis = QHBoxLayout()
+        minis.setSpacing(6)
+        for dev, _t, icon, _d in DEVICES:
+            st = self._state.get(dev, "unknown") if self._reachable else "unknown"
+            minis.addWidget(DeviceEmblem(icon, 28, st))
+        minis.addStretch(1)
+        col.addSpacing(4)
+        col.addLayout(minis)
+        lay.addLayout(col, 1)
+        cam_mic_on = any(self._state.get(d) == "on" for d in ("camera", "microphone"))
+        # "&&": a single & is a Qt mnemonic marker and would vanish.
+        quick = _pill_button(tr("Block camera & mic").replace("&", "&&"), primary=True)
+        quick.setEnabled(bool(self._reachable) and cam_mic_on and not self._busy)
+        quick.clicked.connect(self._block_cam_mic)
+        lay.addWidget(quick, 0, Qt.AlignVCenter)
+        return frame
+
+    def _header(self) -> QHBoxLayout:
+        bar = QHBoxLayout()
+        logo = QLabel()
+        logo.setStyleSheet("background: transparent;")
+        pm = ui.logo_pixmap()
+        if not pm.isNull():
+            logo.setPixmap(pm.scaled(36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        bar.addWidget(logo, 0, Qt.AlignVCenter)
+        bar.addSpacing(12)
+        titles = QVBoxLayout()
+        titles.setSpacing(1)
+        t = QLabel(tr("Hardware privacy"))
+        t.setStyleSheet(f"color: {ui.TEXT}; background: transparent;")
+        t.setFont(QFont("Sans Serif", 17, QFont.Bold))
+        s = QLabel(tr("Kernel-level kill switches — no physical switch needed."))
+        s.setStyleSheet(f"color: {ui.DIM}; background: transparent;")
+        s.setFont(QFont("Sans Serif", 10))
+        titles.addWidget(t)
+        titles.addWidget(s)
+        bar.addLayout(titles)
+        bar.addStretch(1)
+        bar.addWidget(ui.language_toggle(self._set_language), 0, Qt.AlignTop)
+        bar.addSpacing(8)
+        close = QPushButton("✕")
+        close.setCursor(Qt.PointingHandCursor)
+        close.setFixedSize(30, 30)
+        close.setStyleSheet(
+            f"QPushButton {{ color: {ui.DIM}; background: transparent; border: none;"
+            " font-size: 16px; border-radius: 15px; }"
+            "QPushButton:hover { color: white; background: rgba(224,68,68,0.25); }")
+        close.clicked.connect(self.close)
+        bar.addWidget(close, 0, Qt.AlignTop)
+        return bar
+
+    def _footer(self) -> QHBoxLayout:
+        f = QHBoxLayout()
+        text, color = self._message
+        if not text:
+            text = tr("Blocking Wi-Fi or Bluetooth survives a reboot. "
+                      "The camera stays off until you allow it again.")
+            color = ui.FAINT
+        msg = QLabel(text)
+        msg.setWordWrap(True)
+        msg.setStyleSheet(f"color: {color}; background: transparent;")
+        msg.setFont(QFont("Sans Serif", 9))
+        f.addWidget(msg, 1)
+        f.addSpacing(12)
+        refresh = _pill_button(f"⟳  {tr('Refresh')}")
+        refresh.setEnabled(not self._busy)
+        refresh.clicked.connect(self._poll)
+        f.addWidget(refresh, 0, Qt.AlignBottom)
+        return f
+
+    def _set_language(self, code: str) -> None:
+        set_language(code)
+        self._build()
+
+    # -- window behaviour -----------------------------------------------------
+    def show_centered(self) -> None:
+        screen = QApplication.primaryScreen().availableGeometry()
+        geo = self.frameGeometry()
+        geo.moveCenter(screen.center())
+        self.move(geo.topLeft())
+        self.show()
+        ui.enable_kde_blur(int(self.winId()))
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        # Let an in-flight switch finish: killing maze-killswitch mid-request
+        # leaves the user not knowing whether the device was blocked.
+        if self._busy:
+            event.ignore()
+            return
+        self._timer.stop()
+        super().closeEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton and event.position().y() < 70:
+            self._drag = event.globalPosition().toPoint() - self.pos()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag = None
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+
+def ui_clear(lay) -> None:
+    """Empty a layout recursively (nested layouts included)."""
+    while lay.count():
+        it = lay.takeAt(0)
+        w = it.widget()
+        if w is not None:
+            w.setParent(None)
+            w.deleteLater()
+        elif it.layout() is not None:
+            ui_clear(it.layout())
+            it.layout().deleteLater()
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Maze Hardware")
     app.setDesktopFileName("maze-hardware")
-    app.setWindowIcon(QIcon("/usr/share/pixmaps/maze-hardware.svg"))
+    app.setWindowIcon(QIcon(APP_ICON))
     w = Hardware()
-    w.setWindowIcon(QIcon("/usr/share/pixmaps/maze-hardware.svg"))
-    w.show()
+    w.show_centered()
     return app.exec()
 
 

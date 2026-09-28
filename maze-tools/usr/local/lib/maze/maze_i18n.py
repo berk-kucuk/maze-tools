@@ -300,6 +300,79 @@ _TR: dict[str, str] = {
     "Finished with errors.": "Hatalarla tamamlandı.",
     "Could not start the privileged helper (authorisation cancelled?).":
         "Yetkili yardımcı başlatılamadı (yetkilendirme iptal mi edildi?).",
+    "Could not start pkexec — is polkit installed?":
+        "pkexec başlatılamadı — polkit kurulu mu?",
+    "Authorisation was cancelled or denied — nothing was changed.":
+        "Yetkilendirme iptal edildi ya da reddedildi — hiçbir şey değiştirilmedi.",
+    "Cancelled.": "İptal edildi.",
+    "Default · auto": "Varsayılan · otomatik",
+    "Always boot the newest kernel": "Her zaman en yeni çekirdeği aç",
+    "Clear the pinned default ({pkg}); the newest installed kernel will "
+    "boot from now on.":
+        "Sabitlenmiş varsayılanı ({pkg}) kaldırır; bundan sonra kurulu en "
+        "yeni çekirdek açılır.",
+    "Switching to the newest kernel…": "En yeni çekirdeğe geçiliyor…",
+    "Boots next": "Sonraki açılış",
+    "pinned by you": "sizin tarafınızdan sabitlendi",
+    "automatic: newest installed": "otomatik: kurulu en yeni",
+    "Use newest": "En yeniyi kullan",
+    # -- hardware privacy (maze-hardware) --------------------------------
+    "Hardware privacy": "Donanım gizliliği",
+    "Kernel-level kill switches — no physical switch needed.":
+        "Çekirdek düzeyinde kapatma anahtarları — fiziksel düğme gerekmez.",
+    "Webcam": "Kamera",
+    "Microphone": "Mikrofon",
+    "USB ports": "USB portları",
+    "Unloads the camera driver and keeps it from loading again.":
+        "Kamera sürücüsünü kaldırır ve yeniden yüklenmesini engeller.",
+    "Mutes every audio capture input.": "Tüm ses giriş kaynaklarını susturur.",
+    "rfkill block (persists across reboot).":
+        "rfkill ile engellenir (yeniden başlatmada da kalır).",
+    "USBGuard blocks NEW devices (current ones keep working).":
+        "USBGuard YENİ aygıtları engeller (takılı olanlar çalışmaya devam eder).",
+    "Blocked": "Engelli",
+    "Not present": "Yok",
+    "Unknown": "Bilinmiyor",
+    "Block": "Engelle",
+    "Allow": "İzin ver",
+    "Done.": "Tamam.",
+    "Applying…": "Uygulanıyor…",
+    "Allowed": "İzinli",
+    "Privacy status": "Gizlilik durumu",
+    "Unknown — maze-guardd is not answering": "Bilinmiyor — maze-guardd yanıt vermiyor",
+    "Everything is allowed": "Hepsine izin verildi",
+    "Everything is blocked": "Hepsi engellendi",
+    "{n} of {total} blocked": "{total} aygıttan {n} tanesi engelli",
+    "Block camera & mic": "Kamera ve mikrofonu engelle",
+    "Blocking Wi-Fi or Bluetooth survives a reboot. "
+    "The camera stays off until you allow it again.":
+        "Wi-Fi ve Bluetooth engeli yeniden başlatmada da kalır. Kamera, siz "
+        "yeniden izin verene kadar kapalı kalır.",
+    "The camera is in use by an app. Close it and try again.":
+        "Kamera bir uygulama tarafından kullanılıyor. Uygulamayı kapatıp tekrar deneyin.",
+    "USBGuard is not installed, so USB cannot be locked.":
+        "USBGuard kurulu değil, bu yüzden USB kilitlenemiyor.",
+    "Could not build the allow-list for the connected USB devices — nothing "
+    "was changed.":
+        "Takılı USB aygıtları için izin listesi oluşturulamadı — hiçbir şey "
+        "değiştirilmedi.",
+    "Refused: switches only work for the user at this machine (a member of "
+    "the 'maze' group, local session).":
+        "Reddedildi: anahtarlar yalnızca bu makinenin başındaki kullanıcı için "
+        "çalışır ('maze' grubunun üyesi, yerel oturum).",
+    "The broker rejected the request.": "Aracı servis isteği reddetti.",
+    "The change did not take effect — the device is unchanged.":
+        "Değişiklik uygulanamadı — aygıt olduğu gibi kaldı.",
+    "maze-guardd is not running. Start it with: sudo systemctl enable --now "
+    "maze-guardd":
+        "maze-guardd çalışmıyor. Başlatmak için: sudo systemctl enable --now "
+        "maze-guardd",
+    "Unexpected answer from maze-guardd: {r}":
+        "maze-guardd'den beklenmeyen yanıt: {r}",
+    "Vanilla · Stable": "Standart · Kararlı",
+    "Long-Term Support": "Uzun Süreli Destek",
+    "Performance · Desktop": "Performans · Masaüstü",
+    "Security · Mitigations": "Güvenlik · Önlemler",
     "Installing a kernel builds and signs a Secure-Boot image "
     "automatically. Keep your system updated with pacman -Syu.":
         "Bir çekirdek kurmak, Güvenli Önyükleme görüntüsünü otomatik olarak "
