@@ -1,8 +1,13 @@
 #!/bin/sh
-# maze-apply-wallpaper — force the Maze active-blur (a2n.blur) wallpaper on EVERY
-# desktop (every screen), on every login.
+# maze-apply-wallpaper — put the Maze wallpaper on EVERY desktop (every screen),
+# on every login.
 #
-# WHY: the skel sets wallpaperplugin=a2n.blur for a single desktop, but Plasma
+# Since maze-wallpaper (2026-10) the Maze desktop uses its own wallpaper plugin,
+# com.mazelinux.wallpaper: the Maze wallpaper with active blur, plus live
+# wallpapers and media mode from the Maze Wallpaper app. Systems without that
+# package fall back to Active Blur (a2n.blur), as before.
+#
+# WHY: the skel sets the wallpaper plugin for a single desktop, but Plasma
 # falls back to a plain org.kde.image desktop when the skel's screen mapping
 # doesn't match the actual hardware (a VM, different monitors than the build
 # host, or — most importantly — a monitor plugged in AFTER first login). In those
@@ -29,7 +34,16 @@ while [ "$i" -lt 30 ]; do
     i=$((i + 1)); sleep 2
 done
 
+# Maze Wallpaper when it is installed (maze-branding depends on it), else the
+# per-user Active Blur that /etc/skel has always shipped.
+if [ -f /usr/share/plasma/wallpapers/com.mazelinux.wallpaper/metadata.json ]; then
+    PLUGIN="com.mazelinux.wallpaper"
+else
+    PLUGIN="a2n.blur"
+fi
+
 SCRIPT='
+var preferred = "'"${PLUGIN}"'";
 var ds = desktops();
 for (var i = 0; i < ds.length; i++) {
     var d = ds[i];
@@ -47,6 +61,17 @@ for (var i = 0; i < ds.length; i++) {
             d.writeConfig("Image", "file:///usr/share/wallpapers/Maze/");
             d.reloadConfig();
         }
+    } else if (d.wallpaperPlugin == "com.mazelinux.wallpaper") {
+        // Already Maze Wallpaper; what it shows is the Maze Wallpaper app'"'"'s call.
+    } else if (!handled && preferred == "com.mazelinux.wallpaper") {
+        d.wallpaperPlugin = "com.mazelinux.wallpaper";
+        d.currentConfigGroup = ["Wallpaper", "com.mazelinux.wallpaper", "General"];
+        d.writeConfig("Kind", "image");
+        d.writeConfig("Source", "/usr/share/wallpapers/Maze/contents/images/3344x1882.png");
+        d.writeConfig("ActiveBlur", true);
+        d.writeConfig("BlurRadius", 32);
+        d.writeConfig("ActiveDim", 10);
+        d.reloadConfig();
     } else if (!handled) {
         d.wallpaperPlugin = "a2n.blur";
         d.currentConfigGroup = ["Wallpaper", "a2n.blur", "General"];

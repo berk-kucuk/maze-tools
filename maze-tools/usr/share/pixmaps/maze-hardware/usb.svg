@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Maze Hardware — USB trident. -->
-<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
-  <g fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M24 8v31"/>
-    <path d="M24 33 13.5 25.5V19M24 29l10.5-6.5V17"/>
+<!-- Maze Hardware — usb. White line art, 24px grid, 1.6 stroke. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <g fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 17.5V5"/>
+    <path d="m9.75 5.75 2.25-3 2.25 3z"/>
+    <path d="M12 15 7.25 12.25V10.5"/>
+    <circle cx="7.25" cy="9.25" r="1.25"/>
+    <path d="m12 13 4.75-2.75V8.75"/>
+    <rect x="15.5" y="6.25" width="2.5" height="2.5" rx=".4"/>
+    <circle cx="12" cy="19.25" r="1.75"/>
   </g>
-  <path d="M24 3.5 28 9.5h-8z" fill="#ffffff"/>
-  <circle cx="13.5" cy="17" r="3" fill="#ffffff"/>
-  <rect x="31.5" y="12.5" width="6" height="6" rx="1" fill="#ffffff"/>
-  <circle cx="24" cy="41" r="3.5" fill="#ffffff"/>
 </svg>

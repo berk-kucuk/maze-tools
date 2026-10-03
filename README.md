@@ -163,3 +163,9 @@ and the tool files can be removed from `airootfs/` — the package supplies them
   `Installation_guide`, `livecd-sound`), the Calamares launcher
   (`maze-calamares`, installer-only), and ISO/branding assets — those belong to
   their own packages in later extraction steps.
+
+## License
+
+Copyright © 2026 Berk Küçük
+
+Released under the GNU General Public License v3.0 — see [LICENSE](LICENSE).

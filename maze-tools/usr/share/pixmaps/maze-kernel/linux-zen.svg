@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Maze Kernel Switcher — linux-zen: an ensō circle around a bolt (zen + speed). -->
-<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
-  <path d="M36.6 11.6A18 18 0 1 0 41.8 22" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
-  <path d="M26.5 10.5 17.5 26h6.6l-3.1 11.5 10.5-16.2h-6.9z" fill="#ffffff" stroke="#ffffff" stroke-width="1.3" stroke-linejoin="round"/>
+<!-- Maze Kernel Switcher — linux-zen: an ensō around a bolt (zen + speed). White line art, 24px grid, 1.6 stroke
+     (same set as maze-hardware's device icons). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <g fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18.6 5.6A9.25 9.25 0 1 0 21.25 11"/>
+    <path d="M13.1 6.25 8.6 13.1h3.55l-1.1 4.65 4.85-7.1h-3.6z"/>
+  </g>
 </svg>

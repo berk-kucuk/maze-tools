@@ -1,11 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Maze Hardware — webcam. White line art. -->
-<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
-  <g fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="24" cy="20" r="14"/>
-    <circle cx="24" cy="20" r="6.5"/>
-    <path d="M17 33.5 14 42.5h20l-3-9"/>
+<!-- Maze Hardware — webcam. White line art, 24px grid, 1.6 stroke. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <g fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="10" r="7"/>
+    <circle cx="12" cy="10" r="2.75"/>
+    <path d="M8.6 16.1 7.25 20.75h9.5L15.4 16.1"/>
+    <path d="M15.6 6.4h.01"/>
   </g>
-  <circle cx="24" cy="20" r="2.4" fill="#ffffff"/>
-  <circle cx="31.5" cy="11.5" r="1.4" fill="#ffffff" fill-opacity="0.6"/>
 </svg>

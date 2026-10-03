@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-maze-kernel — Maze Linux OLED kernel switcher.
+maze-kernel — Maze Linux kernel switcher.
 
 A small, single-purpose companion to the Control Center: it shows every kernel
 Maze knows about, which one you are running, and lets you install another one,
@@ -12,6 +12,10 @@ Nothing privileged happens inside this process. Each action shells out to
 authorisation point and the actual pacman / bootctl work lives in one small,
 auditable root helper. Read-only status (installed / running / default) is
 gathered locally from /usr/lib/modules and pacman.
+
+The window is the same see-through frosted glass as Maze Hardware (maze_ui's
+glass kit): KWin blurs the desktop behind it, and while a helper run is on
+screen the kernel list behind the run's panel is blurred too.
 """
 from __future__ import annotations
 
@@ -24,32 +28,32 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 sys.path.insert(0, "/usr/local/lib/maze")
 import maze_ui as ui  # noqa: E402
-from maze_i18n import current_language, set_language, tr  # noqa: E402
+from maze_i18n import set_language, tr  # noqa: E402
 
-from PySide6.QtCore import QPoint, QPointF, QProcess, QRectF, Qt  # noqa: E402
+from PySide6.QtCore import QPoint, QPointF, QProcess, QRectF, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import (  # noqa: E402
-    QColor, QFont, QIcon, QPainter, QPen, QRadialGradient, QTextCursor,
+    QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QTextCursor,
 )
-from PySide6.QtSvg import QSvgRenderer  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QFrame,
+    QGraphicsBlurEffect,
     QHBoxLayout,
     QLabel,
-    QPushButton,
     QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-WIN_W, WIN_H = 920, 700
+WIN_W, WIN_H = 900, 856
 HELPER = "/usr/local/bin/maze-kernel-helper"
-# The app/window icon: Maze's own monochrome white CPU logo, in the same house
-# style as maze-hardware/maze-panic (see usr/share/pixmaps/maze-kernel.svg).
+# The app/window icon: a white chip with a swap arrow, in the same house style
+# as maze-hardware/maze-panic (see usr/share/pixmaps/maze-kernel.svg).
 APP_ICON = "/usr/share/pixmaps/maze-kernel.svg"
-# One white line-art icon per kernel (Tux, hourglass, ensō + bolt, shield),
-# drawn for this app; generic.svg covers any kernel outside the catalog.
+# One white line-art icon per kernel (Tux, hourglass, ensō + bolt, shield) on
+# the same 24px grid as maze-hardware's; generic.svg covers any kernel outside
+# the catalog.
 KERNEL_ICON_DIR = "/usr/share/pixmaps/maze-kernel"
 
 # The kernels Maze offers. Kept in lockstep with maze-kernel-helper's CATALOG.
@@ -175,182 +179,144 @@ def default_pkgbase() -> tuple[str | None, bool]:
 # --------------------------------------------------------------------------- #
 #  Widgets                                                                     #
 # --------------------------------------------------------------------------- #
-def _badge(text: str, color: str) -> QLabel:
-    # str.upper() maps Turkish "i" to "I" ("KURULABILIR"); dotted İ first.
-    if current_language() == "tr":
-        text = text.replace("i", "İ")
-    lab = QLabel(text.upper())
-    lab.setStyleSheet(
-        f"color: {color}; background: rgba(255,255,255,0.05);"
-        f" border: 1px solid {color}; border-radius: 8px;"
-        " padding: 2px 8px;"
-    )
-    lab.setFont(QFont("Sans Serif", 8, QFont.Bold))
-    return lab
-
-
-def _action_button(text: str, kind: str) -> QPushButton:
-    """kind: 'primary' (accent), 'ghost' (subtle) or 'danger' (red)."""
-    btn = QPushButton(text)
-    btn.setCursor(Qt.PointingHandCursor)
-    btn.setFixedHeight(34)
-    if kind == "primary":
-        btn.setStyleSheet(
-            f"""
-            QPushButton {{ color: #0a0a0c; background: {ui.ACCENT}; border: none;
-                           border-radius: 9px; padding: 0 16px;
-                           font-size: 10pt; font-weight: bold; }}
-            QPushButton:hover {{ background: {ui.ACCENT_HOVER}; }}
-            QPushButton:disabled {{ color: {ui.FAINT};
-                                    background: rgba(255,255,255,0.06); }}
-            """
-        )
-    elif kind == "danger":
-        btn.setStyleSheet(
-            f"""
-            QPushButton {{ color: {ui.BAD_RED}; background: rgba(224,102,102,0.10);
-                           border: 1px solid rgba(224,102,102,0.45);
-                           border-radius: 9px; padding: 0 16px; font-size: 10pt; }}
-            QPushButton:hover {{ color: #fff; background: rgba(224,102,102,0.30); }}
-            QPushButton:disabled {{ color: {ui.FAINT}; border-color:
-                                    rgba(255,255,255,0.10); background: transparent; }}
-            """
-        )
-    else:  # ghost
-        btn.setStyleSheet(
-            f"""
-            QPushButton {{ color: {ui.TEXT}; background: {ui.PILL_BG_HOVER};
-                           border: none; border-radius: 9px; padding: 0 16px;
-                           font-size: 10pt; }}
-            QPushButton:hover {{ background: rgba(255,255,255,0.20); }}
-            QPushButton:disabled {{ color: {ui.FAINT}; background: {ui.PILL_BG}; }}
-            """
-        )
-    return btn
-
-
 def kernel_meta(pkg: str) -> dict | None:
     return next((k for k in KERNELS if k["pkg"] == pkg), None)
 
 
-class KernelEmblem(QWidget):
-    """A round glass medallion with the kernel's own icon and a state ring.
+def kernel_icon(meta: dict | None) -> str:
+    path = os.path.join(KERNEL_ICON_DIR, meta["icon"]) if meta else ""
+    return path if path and os.path.isfile(path) else os.path.join(
+        KERNEL_ICON_DIR, "generic.svg")
 
-    ring: 'running' (green), 'default' (bright white) or '' (faint)."""
 
-    def __init__(self, icon_file: str, size: int, ring: str = "",
-                 dim: bool = False) -> None:
+class Spinner(QWidget):
+    """A small rotating arc; stop() freezes it into a status glyph."""
+
+    def __init__(self, size: int = 22) -> None:
         super().__init__()
         self.setFixedSize(size, size)
-        self._svg = QSvgRenderer(os.path.join(KERNEL_ICON_DIR, icon_file), self)
-        if not self._svg.isValid():
-            self._svg = QSvgRenderer(os.path.join(KERNEL_ICON_DIR, "generic.svg"), self)
-        self._ring = ring
-        self._dim = dim   # not installed: drawn quieter than the real choices
+        self._angle = 0
+        self._result: str | None = None   # None = spinning, 'ok', 'fail', 'idle'
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+    def _tick(self) -> None:
+        self._angle = (self._angle + 8) % 360
+        self.update()
+
+    def start(self) -> None:
+        self._result = None
+        self._timer.start()
+        self.update()
+
+    def stop(self, result: str) -> None:
+        self._result = result
+        self._timer.stop()
+        self.update()
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        if self._dim:
-            p.setOpacity(0.55)
-        r = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
-        glow = QRadialGradient(QPointF(r.center().x(), r.top() + r.height() * 0.3),
-                               r.width() * 0.75)
-        glow.setColorAt(0.0, QColor(255, 255, 255, 34))
-        glow.setColorAt(1.0, QColor(255, 255, 255, 6))
-        p.setBrush(glow)
-        ring = {"running": QColor(ui.OK_GREEN),
-                "default": QColor(255, 255, 255, 190)}.get(
-                    self._ring, QColor(255, 255, 255, 38))
-        p.setPen(QPen(ring, 1.6 if self._ring else 1.0))
-        p.drawEllipse(r)
-        if self._svg.isValid():
-            s = r.width() * 0.5
-            self._svg.render(p, QRectF(r.center().x() - s / 2, r.center().y() - s / 2, s, s))
+        r = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+        if self._result is None:
+            p.setPen(QPen(QColor(255, 255, 255, 40), 2.2))
+            p.drawEllipse(r)
+            p.setPen(QPen(QColor(ui.TEXT), 2.2, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(r, -self._angle * 16, 100 * 16)
+        else:
+            color = {"ok": QColor(ui.OK_GREEN), "fail": QColor(ui.BAD_RED)}.get(
+                self._result, QColor(ui.DIM))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(color.red(), color.green(), color.blue(), 45))
+            p.drawEllipse(r)
+            p.setPen(QPen(color, 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            c, k = r.center(), r.width() * 0.2
+            if self._result == "ok":
+                p.drawPolyline([QPointF(c.x() - k, c.y()),
+                                QPointF(c.x() - k * 0.25, c.y() + k * 0.8),
+                                QPointF(c.x() + k * 1.1, c.y() - k * 0.7)])
+            elif self._result == "fail":
+                p.drawLine(QPointF(c.x() - k, c.y() - k), QPointF(c.x() + k, c.y() + k))
+                p.drawLine(QPointF(c.x() + k, c.y() - k), QPointF(c.x() - k, c.y() + k))
+            else:
+                p.drawLine(QPointF(c.x() - k, c.y()), QPointF(c.x() + k, c.y()))
         p.end()
 
 
-class KernelCard(QFrame):
-    """One kernel: icon, name, live badges, description and its actions."""
+class FlowArrow(QWidget):
+    """The faint → between 'running now' and 'boots next' in the summary."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFixedSize(44, 32)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        y = self.height() / 2
+        p.setPen(QPen(QColor(255, 255, 255, 70), 1.6, Qt.SolidLine, Qt.RoundCap,
+                      Qt.RoundJoin))
+        p.drawLine(QPointF(6, y), QPointF(self.width() - 7, y))
+        p.drawPolyline([QPointF(self.width() - 12, y - 5),
+                        QPointF(self.width() - 7, y),
+                        QPointF(self.width() - 12, y + 5)])
+        p.end()
+
+
+class KernelCard(ui.GlassCard):
+    """One kernel: icon, name, live chips, tagline, description and actions."""
 
     def __init__(self, meta: dict, running: str,
                  installed: dict[str, str], default: str | None,
                  pinned: bool, on_action) -> None:
-        super().__init__()
-        self._pkg = meta["pkg"]
-        self._on_action = on_action
+        super().__init__(radius=22)
         pkg = meta["pkg"]
         is_installed = pkg in installed
         is_running = pkg == running
         is_default = default is not None and pkg == default
+        # The kernel that boots next gets a brighter glass edge so it stands
+        # out in the list at a glance.
+        self.set_emphasis(is_default)
 
-        # The boot default gets a brighter glass edge so the one kernel that
-        # will come up next stands out in the list at a glance.
-        if is_default:
-            bg, border = "rgba(255,255,255,0.075)", "rgba(255,255,255,0.30)"
-        elif is_installed:
-            bg, border = "rgba(255,255,255,0.045)", "rgba(255,255,255,0.09)"
-        else:
-            bg, border = "rgba(255,255,255,0.025)", "rgba(255,255,255,0.05)"
-        self.setStyleSheet(
-            f"QFrame#card {{ background: {bg}; border: 1px solid {border};"
-            "               border-radius: 18px; }"
-        )
-        self.setObjectName("card")
         row = QHBoxLayout(self)
-        row.setContentsMargins(18, 16, 20, 16)
+        row.setContentsMargins(18, 14, 20, 14)
         row.setSpacing(18)
 
-        # -- icon medallion --------------------------------------------------
-        ring = "running" if is_running else ("default" if is_default else "")
-        emblem = KernelEmblem(meta["icon"], 68, ring, dim=not is_installed)
-        row.addWidget(emblem, 0, Qt.AlignVCenter)
+        tile = ui.IconTile(kernel_icon(meta), 60)
+        tile.set_state(dim=not is_installed,
+                       dot=QColor(ui.OK_GREEN) if is_running else None)
+        row.addWidget(tile, 0, Qt.AlignVCenter)
 
         # -- text column -----------------------------------------------------
         col = QVBoxLayout()
-        col.setSpacing(4)
-
+        col.setSpacing(3)
         title = QHBoxLayout()
-        title.setSpacing(9)
-        name = QLabel(meta["name"])
-        name.setStyleSheet(f"color: {ui.TEXT}; background: transparent;")
-        name.setFont(QFont("Sans Serif", 14, QFont.Bold))
-        title.addWidget(name)
+        title.setSpacing(8)
+        title.addWidget(ui.label(meta["name"], 13.5,
+                                 ui.TEXT if is_installed else ui.DIM, QFont.DemiBold))
+        title.addSpacing(2)
         if is_running:
-            title.addWidget(_badge(tr("Running"), ui.OK_GREEN))
+            title.addWidget(ui.chip(tr("Running"), ui.OK_GREEN), 0, Qt.AlignVCenter)
         if is_default:
-            title.addWidget(_badge(
-                tr("Default") if pinned else tr("Default · auto"),
-                ui.ACCENT_HOVER))
-        if is_installed and not is_running:
-            title.addWidget(_badge(tr("Installed"), ui.DIM))
+            title.addWidget(ui.chip(tr("Default") if pinned else tr("Default · auto"),
+                                    "#ffffff"), 0, Qt.AlignVCenter)
+        if is_installed and not is_running and not is_default:
+            title.addWidget(ui.chip(tr("Installed"), ui.DIM, dot=False), 0, Qt.AlignVCenter)
         if not is_installed:
-            title.addWidget(_badge(tr("Available"), ui.FAINT))
+            title.addWidget(ui.chip(tr("Available"), ui.FAINT, dot=False), 0, Qt.AlignVCenter)
         title.addStretch(1)
         col.addLayout(title)
-
-        tagline = QLabel(tr(meta["tag"]))
-        tagline.setStyleSheet(
-            f"color: {ui.TEXT}; background: rgba(255,255,255,0.07);"
-            " border-radius: 7px; padding: 2px 9px;")
-        tagline.setFont(QFont("Sans Serif", 8, QFont.Bold))
-        tag_row = QHBoxLayout()
-        tag_row.setSpacing(0)
-        tag_row.addWidget(tagline)
-        tag_row.addStretch(1)
-        col.addLayout(tag_row)
-
-        desc = QLabel(tr(meta["desc"]))
+        col.addWidget(ui.label(ui.caps(tr(meta["tag"])), 7.5, ui.FAINT, QFont.Bold, 1.1))
+        col.addSpacing(3)
+        desc = ui.label(tr(meta["desc"]), 9.5, ui.DIM)
         desc.setWordWrap(True)
-        desc.setStyleSheet(f"color: {ui.DIM}; background: transparent;")
-        desc.setFont(QFont("Sans Serif", 9))
         col.addWidget(desc)
-
-        pkgline = QLabel(
-            f"{pkg}" + (f"  ·  {installed[pkg]}" if is_installed else "")
-        )
+        pkgline = QLabel(pkg + (f"  ·  {installed[pkg]}" if is_installed else ""))
         pkgline.setStyleSheet(f"color: {ui.FAINT}; background: transparent;")
         pkgline.setFont(QFont(ui.MONO, 8))
+        pkgline.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        col.addSpacing(2)
         col.addWidget(pkgline)
         row.addLayout(col, 1)
 
@@ -359,73 +325,103 @@ class KernelCard(QFrame):
         acts.setSpacing(8)
         acts.addStretch(1)
         if not is_installed:
-            b = _action_button(tr("Install"), "primary")
-            b.clicked.connect(lambda: self._on_action("install", pkg))
+            b = ui.pill_button(tr("Install"), "primary")
+            b.clicked.connect(lambda: on_action("install", pkg))
             acts.addWidget(b)
         else:
             # The running kernel is not necessarily the boot default (it may
             # have been picked from the firmware's recovery entry), so it can
             # be made the default like any other.
             if not is_default or not pinned:
-                b = _action_button(tr("Set as default"), "primary")
-                b.clicked.connect(lambda: self._on_action("set-default", pkg))
+                b = ui.pill_button(tr("Set as default"), "primary")
+                b.clicked.connect(lambda: on_action("set-default", pkg))
                 acts.addWidget(b)
-            rm = _action_button(tr("Remove"), "danger")
+            rm = ui.pill_button(tr("Remove"), "danger")
             can_remove = not is_running and pkg != "linux"
             rm.setEnabled(can_remove)
             if can_remove:
-                rm.clicked.connect(lambda: self._on_action("remove", pkg))
+                rm.clicked.connect(lambda: on_action("remove", pkg))
             acts.addWidget(rm)
         acts.addStretch(1)
         row.addLayout(acts, 0)
 
 
-class RunPanel(QFrame):
-    """Overlay that streams a privileged helper run's live output."""
+class RunPanel(QWidget):
+    """Overlay that streams a privileged helper run's live output.
 
-    def __init__(self, parent: QWidget, on_finished) -> None:
+    While it is up, the window behind it is blurred (a real in-app blur of the
+    kernel list, on top of KWin's blur of the desktop) and dimmed, and the
+    run sits on a glass sheet in front.
+    """
+
+    def __init__(self, parent: QWidget, backdrop: QWidget, on_finished) -> None:
         super().__init__(parent)
+        self._backdrop = backdrop
         self._on_finished = on_finished
         self._proc: QProcess | None = None
-        self.setStyleSheet("QFrame { background: rgba(0,0,0,0.72); }")
         self.hide()
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(60, 60, 60, 60)
-
-        panel = ui.Glass(None)
+        outer.setContentsMargins(70, 70, 70, 70)
+        panel = ui.GlassCard(radius=24)
+        panel.set_emphasis(True)
         outer.addWidget(panel)
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(26, 24, 26, 22)
-        lay.setSpacing(12)
+        lay.setSpacing(14)
 
-        self._title = ui.heading(tr("Working…"), 16)
-        lay.addWidget(self._title)
+        top = QHBoxLayout()
+        top.setSpacing(14)
+        self._spinner = Spinner(26)
+        top.addWidget(self._spinner, 0, Qt.AlignVCenter)
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        self._title = ui.label(tr("Working…"), 15, ui.TEXT, QFont.Bold)
+        self._status = ui.label("", 9.5, ui.DIM)
+        titles.addWidget(self._title)
+        titles.addWidget(self._status)
+        top.addLayout(titles, 1)
+        lay.addLayout(top)
 
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setFont(QFont(ui.MONO, 9))
         self._log.setStyleSheet(
-            f"QTextEdit {{ color: {ui.DIM}; background: rgba(0,0,0,0.55);"
-            " border: 1px solid rgba(255,255,255,0.08); border-radius: 12px;"
-            " padding: 10px; }"
-        )
+            f"QTextEdit {{ color: {ui.DIM}; background: rgba(0,0,0,0.45);"
+            " border: 1px solid rgba(255,255,255,0.08); border-radius: 14px;"
+            " padding: 12px; }"
+            "QScrollBar:vertical { background: transparent; width: 8px; margin: 4px; }"
+            "QScrollBar::handle:vertical { background: rgba(255,255,255,0.18);"
+            " border-radius: 4px; min-height: 32px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical"
+            " { background: transparent; }")
         lay.addWidget(self._log, 1)
 
         bar = QHBoxLayout()
-        self._status = QLabel("")
-        self._status.setStyleSheet(f"color: {ui.DIM}; background: transparent;")
-        self._status.setFont(QFont("Sans Serif", 10))
-        bar.addWidget(self._status)
         bar.addStretch(1)
-        self._close = _action_button(tr("Close"), "ghost")
+        self._close = ui.pill_button(tr("Close"), "ghost")
+        self._close.setMinimumWidth(110)
         self._close.setEnabled(False)
         self._close.clicked.connect(self._dismiss)
         bar.addWidget(self._close)
         lay.addLayout(bar)
 
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), ui.GLASS_RADIUS, ui.GLASS_RADIUS)
+        p.fillPath(path, QColor(0, 0, 0, 120))
+        p.end()
+
+    def _set_status(self, text: str, color: str) -> None:
+        self._status.setText(text)
+        self._status.setStyleSheet(f"color: {color}; background: transparent;")
+
     def _dismiss(self) -> None:
         self.hide()
+        self._backdrop.setGraphicsEffect(None)
         self._on_finished()
 
     def start(self, verb: str, pkg: str) -> None:
@@ -436,11 +432,14 @@ class RunPanel(QFrame):
             "clear-default": tr("Switching to the newest kernel…"),
         }
         self._title.setText(titles.get(verb, tr("Working…")).format(pkg=pkg))
-        self._status.setText(tr("Authorising…"))
-        self._status.setStyleSheet(f"color: {ui.DIM}; background: transparent;")
+        self._set_status(tr("Authorising…"), ui.DIM)
+        self._spinner.start()
         self._log.clear()
-        self._close.setText(tr("Close"))
         self._close.setEnabled(False)
+        blur = QGraphicsBlurEffect(self._backdrop)
+        blur.setBlurRadius(22)
+        blur.setBlurHints(QGraphicsBlurEffect.QualityHint)
+        self._backdrop.setGraphicsEffect(blur)
         self.resize(self.parent().size())
         self.show()
         self.raise_()
@@ -462,7 +461,7 @@ class RunPanel(QFrame):
         data = bytes(self._proc.readAll()).decode("utf-8", "replace")
         if not data:
             return
-        self._status.setText(tr("Running…"))
+        self._set_status(tr("Running…"), ui.DIM)
         self._log.moveCursor(QTextCursor.End)
         self._log.insertPlainText(data)
         self._log.moveCursor(QTextCursor.End)
@@ -481,17 +480,16 @@ class RunPanel(QFrame):
             # pkexec: 126 = dialog dismissed, 127 = not authorised. Nothing ran.
             self._log.append("\n" + tr("Authorisation was cancelled or denied — "
                                        "nothing was changed."))
-            self._status.setText(tr("Cancelled."))
-            self._status.setStyleSheet(f"color: {ui.DIM}; background: transparent;")
+            self._set_status(tr("Cancelled."), ui.DIM)
+            self._spinner.stop("idle")
         elif code == 0:
-            self._status.setText("✓  " + tr("Completed successfully."))
-            self._status.setStyleSheet(
-                f"color: {ui.OK_GREEN}; background: transparent;")
+            self._set_status(tr("Completed successfully."), ui.OK_GREEN)
+            self._spinner.stop("ok")
         else:
-            self._status.setText("✕  " + tr("Finished with errors."))
-            self._status.setStyleSheet(
-                f"color: {ui.BAD_RED}; background: transparent;")
+            self._set_status(tr("Finished with errors."), ui.BAD_RED)
+            self._spinner.stop("fail")
         self._close.setEnabled(True)
+        self._close.setFocus()
 
 
 class KernelSwitcher(QWidget):
@@ -504,31 +502,33 @@ class KernelSwitcher(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedSize(WIN_W, WIN_H)
 
-        self._root = ui.Glass(ui.make_watermark(), self)
+        self._root = ui.GlassWindow(self)
         self._root.setGeometry(0, 0, WIN_W, WIN_H)
         self._outer = QVBoxLayout(self._root)
-        self._outer.setContentsMargins(34, 24, 34, 26)
+        self._outer.setContentsMargins(28, 22, 28, 22)
         self._outer.setSpacing(0)
         self._build()
 
-        self._runner = RunPanel(self, self._refresh)
+        self._runner = RunPanel(self, self._root, self._refresh)
 
     # -- build / rebuild ------------------------------------------------------
     def _build(self) -> None:
-        while self._outer.count():
-            item = self._outer.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
-            elif item.layout() is not None:
-                self._clear_layout(item.layout())
-        self._outer.addLayout(self._header())
+        self._clear_layout(self._outer)
+        running = running_pkgbase()
+        installed = installed_versions()
+        default, pinned = default_pkgbase()
+        self._outer.addLayout(ui.app_header(
+            APP_ICON, "MAZE KERNEL", tr("Kernel Switcher"),
+            self._set_language, self.close, self.devicePixelRatioF()))
+        self._outer.addSpacing(20)
+        self._outer.addWidget(self._summary(running, default, pinned))
+        self._outer.addSpacing(22)
+        count = ui.label(tr("{n} installed").format(n=len(installed)), 8, ui.FAINT,
+                         QFont.DemiBold, 0.6)
+        self._outer.addLayout(ui.section_label(tr("Kernels"), count))
+        self._outer.addSpacing(10)
+        self._outer.addWidget(self._list(running, installed, default, pinned), 1)
         self._outer.addSpacing(14)
-        self._outer.addWidget(self._banner())
-        self._outer.addSpacing(12)
-        self._outer.addWidget(self._list(), 1)
-        self._outer.addSpacing(12)
         self._outer.addLayout(self._footer())
 
     @classmethod
@@ -546,105 +546,57 @@ class KernelSwitcher(QWidget):
                 cls._clear_layout(it.layout())
                 it.layout().deleteLater()
 
-    def _header(self) -> QHBoxLayout:
-        bar = QHBoxLayout()
-        logo = QLabel()
-        logo.setStyleSheet("background: transparent;")
-        pm = ui.logo_pixmap()
-        if not pm.isNull():
-            logo.setPixmap(
-                pm.scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        bar.addWidget(logo, 0, Qt.AlignVCenter)
-        bar.addSpacing(12)
-
-        titles = QVBoxLayout()
-        titles.setSpacing(1)
-        t = QLabel(tr("Kernel Switcher"))
-        t.setStyleSheet(f"color: {ui.TEXT}; background: transparent;")
-        t.setFont(QFont("Sans Serif", 17, QFont.Bold))
-        s = QLabel(tr("Install, remove and choose which kernel boots."))
-        s.setStyleSheet(f"color: {ui.DIM}; background: transparent;")
-        s.setFont(QFont("Sans Serif", 10))
-        titles.addWidget(t)
-        titles.addWidget(s)
-        bar.addLayout(titles)
-        bar.addStretch(1)
-
-        bar.addWidget(ui.language_toggle(self._set_language), 0, Qt.AlignTop)
-        bar.addSpacing(8)
-        close = QPushButton("✕")
-        close.setCursor(Qt.PointingHandCursor)
-        close.setFixedSize(30, 30)
-        close.setStyleSheet(
-            f"""
-            QPushButton {{ color: {ui.DIM}; background: transparent; border: none;
-                           font-size: 16px; border-radius: 15px; }}
-            QPushButton:hover {{ color: white; background: rgba(224,68,68,0.25); }}
-            """
-        )
-        close.clicked.connect(self.close)
-        bar.addWidget(close, 0, Qt.AlignTop)
-        return bar
-
     @staticmethod
-    def _banner_half(caption: str, pkg: str | None, detail: str,
-                     ring: str) -> QHBoxLayout:
+    def _summary_half(caption: str, color: str, pkg: str | None, detail: str,
+                      running: bool) -> QHBoxLayout:
         meta = kernel_meta(pkg or "")
         lay = QHBoxLayout()
-        lay.setSpacing(14)
-        lay.addWidget(KernelEmblem(meta["icon"] if meta else "generic.svg", 50, ring))
+        lay.setSpacing(16)
+        tile = ui.IconTile(kernel_icon(meta), 60)
+        tile.set_state(dot=QColor(ui.OK_GREEN) if running else None)
+        lay.addWidget(tile, 0, Qt.AlignVCenter)
         col = QVBoxLayout()
-        col.setSpacing(1)
-        lbl = QLabel(caption.upper())
-        lbl.setStyleSheet(f"color: {ui.FAINT}; background: transparent;")
-        lbl.setFont(QFont("Sans Serif", 8, QFont.Bold))
-        name = QLabel(meta["name"] if meta else (pkg or tr("unknown")))
-        name.setStyleSheet(f"color: {ui.TEXT}; background: transparent;")
-        name.setFont(QFont("Sans Serif", 14, QFont.Bold))
-        det = QLabel(detail)
-        det.setStyleSheet(f"color: {ui.DIM}; background: transparent;")
-        det.setFont(QFont(ui.MONO, 8))
+        col.setSpacing(4)
         col.addStretch(1)
-        col.addWidget(lbl)
-        col.addWidget(name)
+        chip_row = QHBoxLayout()
+        chip_row.addWidget(ui.chip(ui.caps(caption), color))
+        chip_row.addStretch(1)
+        col.addLayout(chip_row)
+        col.addWidget(ui.label(meta["name"] if meta else (pkg or tr("unknown")),
+                               15, ui.TEXT, QFont.Bold))
+        det = QLabel(detail)
+        det.setStyleSheet(f"color: {ui.FAINT}; background: transparent;")
+        det.setFont(QFont(ui.MONO, 8))
         col.addWidget(det)
         col.addStretch(1)
         lay.addLayout(col, 1)
         return lay
 
-    def _banner(self) -> QWidget:
+    def _summary(self, running: str, default: str | None, pinned: bool) -> QWidget:
         """Two halves: what runs now, and what the next boot will run."""
-        running = running_pkgbase()
-        default, pinned = default_pkgbase()
-        frame = QFrame()
-        frame.setObjectName("banner")
-        frame.setStyleSheet(
-            "QFrame#banner { background: rgba(255,255,255,0.05);"
-            " border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; }")
-        lay = QHBoxLayout(frame)
-        lay.setContentsMargins(18, 14, 18, 14)
-        lay.setSpacing(18)
-        lay.addLayout(self._banner_half(
-            tr("Currently running"), running, os.uname().release, "running"), 1)
-
-        sep = QFrame()
-        sep.setFixedWidth(1)
-        sep.setStyleSheet("background: rgba(255,255,255,0.10); border: none;")
-        lay.addWidget(sep)
-
+        card = ui.GlassCard(radius=24)
+        lay = QHBoxLayout(card)
+        lay.setContentsMargins(20, 18, 22, 18)
+        lay.setSpacing(12)
+        lay.addLayout(self._summary_half(
+            tr("Currently running"), ui.OK_GREEN, running, os.uname().release,
+            True), 1)
+        lay.addWidget(FlowArrow(), 0, Qt.AlignVCenter)
+        lay.addSpacing(6)
         mode = tr("pinned by you") if pinned else tr("automatic: newest installed")
-        lay.addLayout(self._banner_half(
-            tr("Boots next"), default, mode, "default"), 1)
+        lay.addLayout(self._summary_half(
+            tr("Boots next"), "#ffffff", default, mode, default == running), 1)
         if pinned:
-            auto = _action_button(tr("Use newest"), "ghost")
+            auto = ui.pill_button(tr("Use newest"), "ghost")
             auto.setToolTip(tr("Clear the pinned default ({pkg}); the newest "
                                "installed kernel will boot from now on."
                                ).format(pkg=default))
             auto.clicked.connect(lambda: self._action("clear-default", ""))
             lay.addWidget(auto, 0, Qt.AlignVCenter)
-        return frame
+        return card
 
-    def _list(self) -> QWidget:
+    def _list(self, running: str, installed: dict[str, str],
+              default: str | None, pinned: bool) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -652,6 +604,7 @@ class KernelSwitcher(QWidget):
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setStyleSheet("""
             QScrollArea { background: transparent; border: none; }
+            QScrollArea > QWidget > QWidget { background: transparent; }
             QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
             QScrollBar::handle:vertical { background: rgba(255,255,255,0.18);
                                           border-radius: 4px; min-height: 32px; }
@@ -662,12 +615,8 @@ class KernelSwitcher(QWidget):
         inner = QWidget()
         inner.setStyleSheet("background: transparent;")
         col = QVBoxLayout(inner)
-        col.setContentsMargins(0, 0, 8, 0)
+        col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(10)
-
-        running = running_pkgbase()
-        installed = installed_versions()
-        default, pinned = default_pkgbase()
         for meta in KERNELS:
             col.addWidget(KernelCard(meta, running, installed, default,
                                      pinned, self._action))
@@ -677,18 +626,19 @@ class KernelSwitcher(QWidget):
 
     def _footer(self) -> QHBoxLayout:
         f = QHBoxLayout()
-        hint = QLabel(tr(
+        f.setContentsMargins(6, 0, 0, 0)
+        f.setSpacing(10)
+        f.addWidget(ui.label("ⓘ", 11, ui.FAINT, QFont.Bold), 0, Qt.AlignTop)
+        hint = ui.label(tr(
             "Installing a kernel builds and signs a Secure-Boot image "
-            "automatically. Keep your system updated with pacman -Syu."))
+            "automatically. Keep your system updated with pacman -Syu."), 9, ui.FAINT)
         hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {ui.FAINT}; background: transparent;")
-        hint.setFont(QFont("Sans Serif", 9))
         f.addWidget(hint, 1)
-        f.addSpacing(14)
-        refresh = _action_button(f"⟳  {tr('Refresh')}", "ghost")
-        refresh.setFixedHeight(38)
+        f.addSpacing(12)
+        refresh = ui.pill_button(tr("Refresh"), "ghost",
+                                 ui.themed_pixmap(("view-refresh",), 16))
         refresh.clicked.connect(self._refresh)
-        f.addWidget(refresh, 0, Qt.AlignBottom)
+        f.addWidget(refresh, 0, Qt.AlignVCenter)
         return f
 
     # -- actions --------------------------------------------------------------
@@ -709,7 +659,8 @@ class KernelSwitcher(QWidget):
         geo.moveCenter(screen.center())
         self.move(geo.topLeft())
         self.show()
-        ui.enable_kde_blur(int(self.winId()))
+        ui.enable_kde_blur(int(self.winId()),
+                           ui.blur_region(WIN_W, WIN_H, self.devicePixelRatioF()))
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         if getattr(self, "_runner", None) is not None and self._runner.isVisible():
@@ -717,7 +668,7 @@ class KernelSwitcher(QWidget):
         super().resizeEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.LeftButton and event.position().y() < 70:
+        if event.button() == Qt.LeftButton and event.position().y() < 80:
             self._drag_offset = event.globalPosition().toPoint() - self.pos()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802

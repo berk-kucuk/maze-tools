@@ -2,7 +2,9 @@
 
 Used by maze-control-center (and available to other Maze apps). Provides the
 OLED palette, the frosted Glass panel, sidebar nav buttons, status rows and a
-copy-command row. Apps add /usr/local/lib/maze to sys.path and `import maze_ui`.
+copy-command row — plus the see-through glass kit (GlassWindow, GlassCard,
+IconTile, Chip, pill buttons) that maze-hardware and maze-kernel are built
+on. Apps add /usr/local/lib/maze to sys.path and `import maze_ui`.
 """
 from __future__ import annotations
 
@@ -12,18 +14,21 @@ import os
 import maze_i18n
 from maze_i18n import tr
 
-from PySide6.QtCore import QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
     QIcon,
     QImage,
+    QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
     QRadialGradient,
+    QRegion,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -64,8 +69,13 @@ UNK_GRAY = "#6b7079"
 MONO = "monospace"
 
 
-def enable_kde_blur(winid: int) -> None:
-    """Ask KWin to blur the desktop behind this (translucent) window."""
+def enable_kde_blur(winid: int, rects: list[tuple[int, int, int, int]] | None = None) -> None:
+    """Ask KWin to blur the desktop behind this (translucent) window.
+
+    `rects` (x, y, w, h in device pixels) limits the blur to that region — a
+    rounded window passes its shape so the blur does not show as a square
+    behind the transparent corners. None blurs the whole window.
+    """
     try:
         x11 = ctypes.CDLL("libX11.so.6")
         x11.XOpenDisplay.restype = ctypes.c_void_p
@@ -76,9 +86,12 @@ def enable_kde_blur(winid: int) -> None:
         atom = x11.XInternAtom(
             ctypes.c_void_p(dpy), b"_KDE_NET_WM_BLUR_BEHIND_REGION", False
         )
+        flat = [int(v) for r in (rects or ()) for v in r]
+        # Format-32 X properties are arrays of C longs, whatever the arch.
+        data = (ctypes.c_long * len(flat))(*flat) if flat else None
         x11.XChangeProperty(
             ctypes.c_void_p(dpy), ctypes.c_ulong(int(winid)), ctypes.c_ulong(atom),
-            ctypes.c_ulong(6), 32, 0, None, 0,
+            ctypes.c_ulong(6), 32, 0, data, len(flat),
         )
         x11.XFlush(ctypes.c_void_p(dpy))
         x11.XCloseDisplay(ctypes.c_void_p(dpy))
@@ -480,3 +493,397 @@ class CommandRow(QFrame):
         QApplication.clipboard().setText(self._command)
         self._btn.setText(f"✓  {tr('Copied')}")
         QTimer.singleShot(1600, lambda: self._btn.setText(f"⧉  {tr('Copy')}"))
+
+
+# --------------------------------------------------------------------------- #
+#  Frosted-glass kit (maze-hardware, maze-kernel)                              #
+#                                                                              #
+#  A translucent window over KWin's blur, glass cards with light-catching      #
+#  rims, status chips and pill buttons. Unlike Glass above (near-opaque), the  #
+#  window here is see-through on purpose — pass its blur_region() to           #
+#  enable_kde_blur so the desktop behind it is frosted, not just dimmed.       #
+# --------------------------------------------------------------------------- #
+GLASS_RADIUS = 26
+_RED = QColor(BAD_RED)
+_GREEN = QColor(OK_GREEN)
+
+
+def font(size: float, weight: QFont.Weight = QFont.Normal,
+         spacing: float = 0.0) -> QFont:
+    """Inter when it is installed (Maze ships it), the system sans otherwise."""
+    f = QFont()
+    f.setFamilies(["Inter", "Noto Sans", "Sans Serif"])
+    f.setPointSizeF(size)
+    f.setWeight(weight)
+    if spacing:
+        f.setLetterSpacing(QFont.AbsoluteSpacing, spacing)
+    return f
+
+
+def label(text: str, size: float, color: str,
+          weight: QFont.Weight = QFont.Normal, spacing: float = 0.0) -> QLabel:
+    lab = QLabel(text)
+    lab.setFont(font(size, weight, spacing))
+    lab.setStyleSheet(f"color: {color}; background: transparent;")
+    return lab
+
+
+def caps(text: str) -> str:
+    # str.upper() maps Turkish "i" to "I" ("GIZLILIK"); dotted İ first.
+    if maze_i18n.current_language() == "tr":
+        text = text.replace("i", "İ")
+    return text.upper()
+
+
+def svg_pixmap(path: str, px: int, dpr: float, color: QColor | None = None) -> QPixmap:
+    """Render an SVG crisply at the screen's scale, optionally recoloured."""
+    pm = QPixmap(int(px * dpr), int(px * dpr))
+    pm.fill(Qt.transparent)
+    r = QSvgRenderer(path)
+    if r.isValid():
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        r.render(p, QRectF(0, 0, pm.width(), pm.height()))
+        if color is not None:
+            p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+            p.fillRect(pm.rect(), color)
+        p.end()
+    pm.setDevicePixelRatio(dpr)
+    return pm
+
+
+def blur_region(w: int, h: int, dpr: float,
+                radius: float = GLASS_RADIUS) -> list[tuple[int, int, int, int]]:
+    """A rounded window's shape as X11 rects (device pixels) for enable_kde_blur."""
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, w * dpr, h * dpr), radius * dpr, radius * dpr)
+    region = QRegion(path.toFillPolygon().toPolygon())
+    return [(r.x(), r.y(), r.width(), r.height()) for r in region]
+
+
+def mix(a: QColor, b: QColor, t: float) -> QColor:
+    """Linear blend of two colours (alpha included); t=0 is a, t=1 is b."""
+    return QColor(int(a.red() + (b.red() - a.red()) * t),
+                  int(a.green() + (b.green() - a.green()) * t),
+                  int(a.blue() + (b.blue() - a.blue()) * t),
+                  int(a.alpha() + (b.alpha() - a.alpha()) * t))
+
+
+class GlassWindow(QWidget):
+    """The window surface: a translucent smoked-glass sheet over KWin's blur.
+
+    Two big soft glow orbs sit behind the cards — set_glow() tints the lower
+    one (e.g. red while something is blocked) — and the rim is a
+    light-catching gradient, brighter along the top edge.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._glow: QColor | None = None
+
+    def set_glow(self, color: QColor | None) -> None:
+        if color != self._glow:
+            self._glow = color
+            self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect())
+        path = QPainterPath()
+        path.addRoundedRect(r, GLASS_RADIUS, GLASS_RADIUS)
+        p.setClipPath(path)
+        # Smoked glass: dark enough to read on any wallpaper, light enough
+        # that KWin's blur of the desktop shows through.
+        p.fillPath(path, QColor(8, 8, 11, 150))
+        top = QRadialGradient(r.width() * 0.22, -40, r.width() * 0.75)
+        top.setColorAt(0.0, QColor(255, 255, 255, 34))
+        top.setColorAt(0.55, QColor(255, 255, 255, 8))
+        top.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillPath(path, top)
+        c = self._glow or QColor(255, 255, 255)
+        low = QRadialGradient(r.width() * 0.92, r.height() * 0.78, r.width() * 0.6)
+        low.setColorAt(0.0, QColor(c.red(), c.green(), c.blue(),
+                                   42 if self._glow is not None else 16))
+        low.setColorAt(1.0, QColor(c.red(), c.green(), c.blue(), 0))
+        p.fillPath(path, low)
+        p.setClipping(False)
+        rim = QLinearGradient(0, 0, 0, r.height())
+        rim.setColorAt(0.0, QColor(255, 255, 255, 70))
+        rim.setColorAt(0.25, QColor(255, 255, 255, 26))
+        rim.setColorAt(1.0, QColor(255, 255, 255, 14))
+        p.setPen(QPen(rim, 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), GLASS_RADIUS, GLASS_RADIUS)
+        p.end()
+
+
+class GlassCard(QFrame):
+    """A frosted card: faint white fill, a top sheen and a gradient rim.
+
+    set_tint() washes the card's left edge and rim in a colour (red for a
+    blocked device); set_emphasis() brightens it (the kernel that boots next).
+    """
+
+    def __init__(self, radius: int = 20) -> None:
+        super().__init__()
+        self._radius = radius
+        self._tint: QColor | None = None
+        self._emph = False
+        self._hover = False
+        self.setAttribute(Qt.WA_Hover)
+
+    def set_tint(self, color: QColor | None) -> None:
+        self._tint = color
+        self.update()
+
+    def set_emphasis(self, on: bool) -> None:
+        self._emph = on
+        self.update()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, self._radius, self._radius)
+        fill = QLinearGradient(0, 0, 0, r.height())
+        base = (16 if self._hover else 11) + (6 if self._emph else 0)
+        fill.setColorAt(0.0, QColor(255, 255, 255, base + 7))
+        fill.setColorAt(1.0, QColor(255, 255, 255, base - 4))
+        p.fillPath(path, fill)
+        tc = self._tint
+        if tc is not None:
+            t = QLinearGradient(0, 0, r.width(), 0)
+            t.setColorAt(0.0, QColor(tc.red(), tc.green(), tc.blue(), 30))
+            t.setColorAt(0.6, QColor(tc.red(), tc.green(), tc.blue(), 0))
+            p.fillPath(path, t)
+        rim = QLinearGradient(0, 0, 0, r.height())
+        if tc is not None:
+            rim.setColorAt(0.0, QColor(tc.red(), tc.green(), tc.blue(), 110))
+            rim.setColorAt(1.0, QColor(tc.red(), tc.green(), tc.blue(), 40))
+        else:
+            hi = (60 if self._hover else 42) + (50 if self._emph else 0)
+            rim.setColorAt(0.0, QColor(255, 255, 255, hi))
+            rim.setColorAt(1.0, QColor(255, 255, 255, 30 if self._emph else 12))
+        p.setPen(QPen(rim, 1))
+        p.drawPath(path)
+        p.end()
+
+
+class IconTile(QWidget):
+    """A rounded glass tile holding one white line-art icon.
+
+    tint: colours the glass (red = blocked); dim: quieter (absent / not
+    installed); slash: a red line cut cleanly through the icon (the icon is
+    erased under it, so it reads on any background); dot: a small status
+    dot on the tile's corner (green = running).
+    """
+
+    def __init__(self, icon_path: str, size: int) -> None:
+        super().__init__()
+        self.setFixedSize(size, size)
+        self._path = icon_path
+        self._tint: QColor | None = None
+        self._dim = False
+        self._slash = False
+        self._dot: QColor | None = None
+
+    def set_state(self, tint: QColor | None = None, dim: bool = False,
+                  slash: bool = False, dot: QColor | None = None) -> None:
+        new = (tint, dim, slash, dot)
+        if new != (self._tint, self._dim, self._slash, self._dot):
+            self._tint, self._dim, self._slash, self._dot = new
+            self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        inset = 3.0 if self._dot is not None else 0.5
+        r = QRectF(self.rect()).adjusted(0.5, inset, -inset, -0.5)
+        rad = r.width() * 0.3
+        path = QPainterPath()
+        path.addRoundedRect(r, rad, rad)
+        g = QLinearGradient(0, 0, 0, r.height())
+        tc = self._tint
+        if tc is not None:
+            g.setColorAt(0.0, QColor(tc.red(), tc.green(), tc.blue(), 70))
+            g.setColorAt(1.0, QColor(tc.red(), tc.green(), tc.blue(), 26))
+            rim = QColor(tc.red(), tc.green(), tc.blue(), 150)
+        else:
+            g.setColorAt(0.0, QColor(255, 255, 255, 18 if self._dim else 38))
+            g.setColorAt(1.0, QColor(255, 255, 255, 6 if self._dim else 12))
+            rim = QColor(255, 255, 255, 26 if self._dim else 60)
+        p.fillPath(path, g)
+        p.setPen(QPen(rim, 1))
+        p.drawPath(path)
+
+        dpr = self.devicePixelRatioF()
+        s = int(r.width() * 0.5)
+        color = (QColor(255, 235, 235) if tc is not None
+                 else QColor(255, 255, 255, 110 if self._dim else 255))
+        icon = svg_pixmap(self._path, s, dpr, color)
+        if self._slash:
+            q = QPainter(icon)
+            q.setRenderHint(QPainter.Antialiasing)
+            q.setCompositionMode(QPainter.CompositionMode_Clear)
+            q.setPen(QPen(Qt.transparent, 5.5, Qt.SolidLine, Qt.RoundCap))
+            q.drawLine(QPointF(0, 0), QPointF(s, s))
+            q.end()
+        x = r.center().x() - s / 2
+        y = r.center().y() - s / 2
+        p.drawPixmap(QPointF(x, y), icon)
+        if self._slash:
+            p.setPen(QPen(_RED.lighter(115), 2.2, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(x + 0.5, y + 0.5), QPointF(x + s - 0.5, y + s - 0.5))
+        if self._dot is not None:
+            d = 12.0
+            c = QRectF(self.width() - d - 0.5, 0.5, d, d)
+            p.setPen(QPen(QColor(10, 10, 12), 2.5))
+            p.setBrush(self._dot)
+            p.drawEllipse(c)
+        p.end()
+
+
+class Chip(QLabel):
+    """A small status pill: coloured dot + text on tinted glass.
+    dot=False gives a plain neutral tag."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFont(font(8.5, QFont.DemiBold))
+        self.setTextFormat(Qt.RichText)
+        # Qt drops border-radius above half the height — pin the height.
+        self.setFixedHeight(22)
+
+    def set(self, text: str, color: QColor, dot: bool = True) -> None:
+        c = color
+        body = (f"<span style='color:{c.name()}'>●</span>&nbsp;&nbsp;{text}"
+                if dot else text)
+        self.setText(body)
+        self.setStyleSheet(
+            f"QLabel {{ color: {c.lighter(125).name() if dot else c.name()};"
+            f" background: rgba({c.red()},{c.green()},{c.blue()},"
+            f"{0.14 if dot else 0.07});"
+            f" border: 1px solid rgba({c.red()},{c.green()},{c.blue()},"
+            f"{0.30 if dot else 0.14});"
+            " border-radius: 10px; padding: 0 10px 0 8px; }")
+
+
+def chip(text: str, color: QColor | str, dot: bool = True) -> Chip:
+    c = Chip()
+    c.set(text, QColor(color), dot)
+    return c
+
+
+class CloseButton(QPushButton):
+    """A round glass button that paints a crisp ✕ (turns red on hover)."""
+
+    def __init__(self, size: int = 32) -> None:
+        super().__init__()
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(tr("Close"))
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        hover = self.underMouse()
+        p.setBrush(QColor(_RED.red(), _RED.green(), _RED.blue(), 70) if hover
+                   else QColor(255, 255, 255, 16))
+        p.setPen(QPen(QColor(255, 255, 255, 0 if hover else 40), 1))
+        p.drawEllipse(r)
+        p.setPen(QPen(QColor(TEXT if hover else DIM), 1.6, Qt.SolidLine, Qt.RoundCap))
+        c, k = r.center(), r.width() * 0.17
+        p.drawLine(QPointF(c.x() - k, c.y() - k), QPointF(c.x() + k, c.y() + k))
+        p.drawLine(QPointF(c.x() + k, c.y() - k), QPointF(c.x() - k, c.y() + k))
+        p.end()
+
+
+def pill_button(text: str, kind: str = "ghost", icon: QPixmap | None = None) -> QPushButton:
+    """kind: 'primary' (white), 'ghost' (glass) or 'danger' (red glass)."""
+    btn = QPushButton(text)
+    btn.setCursor(Qt.PointingHandCursor)
+    btn.setFixedHeight(40 if kind == "primary" else 36)
+    btn.setFont(font(10, QFont.DemiBold if kind == "primary" else QFont.Medium))
+    if icon is not None and not icon.isNull():
+        btn.setIcon(QIcon(icon))
+        btn.setIconSize(QSize(16, 16))
+    if kind == "primary":
+        css = ("QPushButton { color: #0a0a0c; background: qlineargradient(x1:0, y1:0,"
+               " x2:0, y2:1, stop:0 #ffffff, stop:1 #dcdde2); border: none;"
+               " border-radius: 20px; padding: 0 20px; }"
+               "QPushButton:hover { background: #ffffff; }"
+               "QPushButton:pressed { background: #cfd0d5; }"
+               "QPushButton:disabled { color: rgba(255,255,255,0.35);"
+               " background: rgba(255,255,255,0.07);"
+               " border: 1px solid rgba(255,255,255,0.08); }")
+    elif kind == "danger":
+        css = (f"QPushButton {{ color: {BAD_RED}; background: rgba(224,102,102,0.10);"
+               " border: 1px solid rgba(224,102,102,0.40); border-radius: 18px;"
+               " padding: 0 16px; }"
+               "QPushButton:hover { color: #ffffff; background: rgba(224,102,102,0.32);"
+               " border-color: rgba(224,102,102,0.60); }"
+               f"QPushButton:disabled {{ color: {FAINT}; background: transparent;"
+               " border-color: rgba(255,255,255,0.08); }")
+    else:
+        css = (f"QPushButton {{ color: {TEXT}; background: rgba(255,255,255,0.07);"
+               " border: 1px solid rgba(255,255,255,0.12); border-radius: 18px;"
+               " padding: 0 16px; }"
+               "QPushButton:hover { background: rgba(255,255,255,0.14);"
+               " border-color: rgba(255,255,255,0.22); }"
+               f"QPushButton:disabled {{ color: {FAINT};"
+               " background: rgba(255,255,255,0.04); }")
+    btn.setStyleSheet(css)
+    return btn
+
+
+def app_header(icon_path: str, eyebrow: str, title: str, on_language,
+               on_close, dpr: float) -> QHBoxLayout:
+    """Glass icon tile, small-caps eyebrow + title, EN|TR toggle, close."""
+    bar = QHBoxLayout()
+    bar.setSpacing(0)
+    tile = GlassCard(radius=14)
+    tile.setFixedSize(46, 46)
+    tl = QHBoxLayout(tile)
+    tl.setContentsMargins(0, 0, 0, 0)
+    ic = QLabel()
+    ic.setStyleSheet("background: transparent;")
+    ic.setPixmap(svg_pixmap(icon_path, 24, dpr))
+    tl.addWidget(ic, 0, Qt.AlignCenter)
+    bar.addWidget(tile, 0, Qt.AlignVCenter)
+    bar.addSpacing(14)
+    titles = QVBoxLayout()
+    titles.setSpacing(2)
+    titles.addWidget(label(eyebrow, 7.5, FAINT, QFont.Bold, 1.6))
+    titles.addWidget(label(title, 17, TEXT, QFont.Bold))
+    bar.addLayout(titles)
+    bar.addStretch(1)
+    bar.addWidget(language_toggle(on_language), 0, Qt.AlignVCenter)
+    bar.addSpacing(12)
+    close = CloseButton(32)
+    close.clicked.connect(on_close)
+    bar.addWidget(close, 0, Qt.AlignVCenter)
+    return bar
+
+
+def section_label(text: str, right: QLabel | None = None) -> QHBoxLayout:
+    """A small-caps section heading, optionally with a counter on the right."""
+    sec = QHBoxLayout()
+    sec.setContentsMargins(6, 0, 6, 0)
+    sec.addWidget(label(caps(text), 8, FAINT, QFont.Bold, 1.2))
+    sec.addStretch(1)
+    if right is not None:
+        sec.addWidget(right)
+    return sec

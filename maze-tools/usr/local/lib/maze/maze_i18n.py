@@ -316,6 +316,8 @@ _TR: dict[str, str] = {
     "pinned by you": "sizin tarafınızdan sabitlendi",
     "automatic: newest installed": "otomatik: kurulu en yeni",
     "Use newest": "En yeniyi kullan",
+    "Kernels": "Çekirdekler",
+    "{n} installed": "{n} kurulu",
     # -- hardware privacy (maze-hardware) --------------------------------
     "Hardware privacy": "Donanım gizliliği",
     "Kernel-level kill switches — no physical switch needed.":
@@ -344,6 +346,7 @@ _TR: dict[str, str] = {
     "Everything is blocked": "Hepsi engellendi",
     "{n} of {total} blocked": "{total} aygıttan {n} tanesi engelli",
     "Block camera & mic": "Kamera ve mikrofonu engelle",
+    "Devices": "Aygıtlar",
     "Blocking Wi-Fi or Bluetooth survives a reboot. "
     "The camera stays off until you allow it again.":
         "Wi-Fi ve Bluetooth engeli yeniden başlatmada da kalır. Kamera, siz "
