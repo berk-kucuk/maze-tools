@@ -20,6 +20,7 @@ Verbs:  PANIC | KILL <device> <on|off> | STATUS | PING
 import grp
 import os
 import pwd
+import re
 import socket
 import struct
 import subprocess
@@ -381,10 +382,47 @@ def _mod_loaded(name):
 
 
 # --------------------------------------------------------------- server ----
-def _peer_uid(conn):
+def _peer_creds(conn):
     creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-    _pid, uid, _gid = struct.unpack("3i", creds)
-    return uid
+    pid, uid, _gid = struct.unpack("3i", creds)
+    return pid, uid
+
+
+_SESSION_SCOPE = re.compile(r"/session-([A-Za-z0-9]+)\.scope(?:/|$)")
+
+
+def _session_of_pid(pid):
+    """logind session id the process runs in, or None if it is in none.
+
+    Read from the cgroup path, which is what sd_pid_get_session() does too.
+    SSH logins, cron/at jobs and other PAM sessions live in session-N.scope;
+    processes started by the user's systemd manager (most desktop apps on a
+    systemd-booted Plasma) are in user@UID.service and belong to no session."""
+    try:
+        with open(f"/proc/{int(pid)}/cgroup", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                m = _SESSION_SCOPE.search(line.rstrip("\n"))
+                if m:
+                    return m.group(1)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _session_is_local_active(sid, uid):
+    """True if logind session `sid` belongs to `uid` and is on a local seat,
+    not remote, in the foreground, and of a user class."""
+    if not sid.isalnum():
+        return False
+    r = _run("loginctl", "show-session", sid,
+             "-p", "User", "-p", "Seat", "-p", "Remote", "-p", "Active", "-p", "Class")
+    if not r or r.returncode != 0:
+        return False
+    props = dict(line.split("=", 1) for line in (r.stdout or "").splitlines() if "=" in line)
+    return (props.get("User") == str(uid)
+            and bool(props.get("Seat")) and props.get("Remote") == "no"
+            and props.get("Active") == "yes"
+            and props.get("Class", "").startswith("user"))
 
 
 def _has_local_active_session(uid):
@@ -421,11 +459,27 @@ def _has_local_active_session(uid):
     return False
 
 
-def _authorized(uid):
-    # A real (non-root, non-nobody) user whose active session is at this
-    # machine's own seat. See _has_local_active_session for why the old
-    # /run/user/<uid> test was not enough.
-    return 1000 <= uid < 65534 and _has_local_active_session(uid)
+def _authorized(uid, pid):
+    """A real (non-root, non-nobody) user, judged by the CONNECTING PROCESS.
+
+    Checking only "does this uid have some local active session" let any other
+    process of the same user through while they sat at the console: an SSH
+    login with a stolen key, a cron job, a compromised app — exactly the
+    callers _has_local_active_session's docstring says must be refused. Now:
+
+    * the caller runs inside a logind session (SSH, cron, a TTY or the
+      graphical session itself) -> THAT session must be local, seat-attached,
+      foreground and owned by the same uid;
+    * the caller runs in no session (started by the user's systemd manager,
+      as desktop apps usually are) -> fall back to the user's local active
+      session, which is what polkit's allow_active does for such processes.
+    """
+    if not (1000 <= uid < 65534):
+        return False
+    sid = _session_of_pid(pid)
+    if sid is not None:
+        return _session_is_local_active(sid, uid)
+    return _has_local_active_session(uid)
 
 
 # Serialises the actual privileged actions (PANIC/KILL/USB policy writes), not
@@ -468,8 +522,8 @@ def _handle(conn):
         # worth never delaying. Each connection now gets its own thread, so a
         # stalled peer blocks only itself.
         conn.settimeout(5)
-        uid = _peer_uid(conn)
-        if not _authorized(uid):
+        pid, uid = _peer_creds(conn)
+        if not _authorized(uid, pid):
             conn.sendall(b"ERR unauthorized\n")
             return
         data = conn.recv(256).decode("utf-8", "replace").strip()

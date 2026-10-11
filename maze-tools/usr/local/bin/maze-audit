@@ -426,7 +426,12 @@ if has mokutil; then
 fi
 if has efibootmgr; then
     _eb="$(efibootmgr -v 2>/dev/null)"
-    show "printf '%s\n' \"${_eb//\'/}\" | grep -E '^(BootCurrent|BootOrder|Boot[0-9A-F]{4})'" 25
+    # NOT through show(): show() evals its argument, and boot entry labels are
+    # text from firmware NVRAM (any OS on this disk, or firmware setup, can
+    # write them). A label containing $(…) or a backtick would have run as
+    # root. Pipe the captured output directly instead.
+    printf '%s\n' "${_eb}" | grep -E '^(BootCurrent|BootOrder|Boot[0-9A-F]{4})' \
+        | head -n 25 | sed 's/^/         | /'
     _nm="$(grep -cE '^Boot[0-9A-F]{4}\*? +Maze Linux[[:space:]]+HD\(' <<<"${_eb}")"
     [[ "${_nm}" -ge 1 ]] && pass "firmware entry 'Maze Linux' present (${_nm})" || warn "no 'Maze Linux' NVRAM entry (removable-path fallback only)"
     [[ "${_nm}" -gt 1 ]] && warn "${_nm} 'Maze Linux' entries — duplicates from reinstalls; see maze-boot-entries"
