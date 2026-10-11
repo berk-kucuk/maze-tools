@@ -20,6 +20,40 @@ _reload_udev() {
     fi
 }
 
+# OpenSnitch left Maze in 2026-10. Machines installed before that run its daemon
+# in the passive allow-all mode Maze shipped, with a tray icon autostarted from
+# every home. Retire that ONCE: stop the daemon and drop the Maze-seeded tray
+# autostart — but only while the daemon is still in that passive mode. Anyone who
+# switched it to deny is actually using OpenSnitch, and is left alone.
+#
+# A scriptlet runs under pacman's lock and cannot uninstall a package, so the
+# opensnitch package itself stays; maze-audit points at `pacman -Rns opensnitch`.
+_OPENSNITCH_MARKER=/var/lib/maze/opensnitch-retired
+# sha256 of opensnitch_ui.desktop as every maze-plasma-config <= 1.2.1-8 seeded it.
+_OPENSNITCH_UI_SHA256=7bb732c78bcc9fbf6581dd26e6de8276780d3193f0d82726b5f6c808ecd3b58e
+
+_retire_opensnitch() {
+    [ -e "$_OPENSNITCH_MARKER" ] && return 0
+    _cfg=/etc/opensnitchd/default-config.json
+    if [ -f "$_cfg" ] && ! grep -Eq '"DefaultAction"[[:space:]]*:[[:space:]]*"allow"' "$_cfg"; then
+        echo ">> maze-tools: OpenSnitch is no longer part of Maze; yours is in active use, so it is left as is."
+    else
+        systemctl disable opensnitchd.service >/dev/null 2>&1 || true
+        if [ -d /run/systemd/system ]; then
+            systemctl stop opensnitchd.service >/dev/null 2>&1 || true
+        fi
+        for _f in /home/*/.config/autostart/opensnitch_ui.desktop; do
+            [ -f "$_f" ] || continue
+            [ "$(sha256sum "$_f" | cut -d' ' -f1)" = "$_OPENSNITCH_UI_SHA256" ] && rm -f "$_f"
+        done
+        if command -v opensnitchd >/dev/null 2>&1; then
+            echo ">> maze-tools: OpenSnitch is no longer part of Maze — its daemon is stopped and disabled."
+            echo "   Remove the package with: sudo pacman -Rns opensnitch"
+        fi
+    fi
+    mkdir -p "${_OPENSNITCH_MARKER%/*}" && : > "$_OPENSNITCH_MARKER"
+}
+
 post_install() {
     systemctl daemon-reload >/dev/null 2>&1 || true
     # Honour the shipped preset (90-maze-tools.preset) for our units.
@@ -45,6 +79,7 @@ post_upgrade() {
     if [ -d /run/systemd/system ]; then
         systemctl try-restart maze-guardd.service >/dev/null 2>&1 || true
     fi
+    _retire_opensnitch
 }
 
 post_remove() {

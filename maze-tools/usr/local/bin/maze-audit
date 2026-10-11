@@ -572,7 +572,7 @@ while IFS=: read -r u _ uid _ _ home shell; do
     else info "no plasma appletsrc yet (Plasma not started for ${u}?)"; fi
     if [[ -f "${home}/.config/mimeapps.list" ]]; then grep -qE 'x-scheme-handler/https?=firefox' "${home}/.config/mimeapps.list" && pass "default browser firefox" || info "default browser not firefox in mimeapps.list"; fi
     [[ -f "${home}/.config/autostart/maze-welcome.desktop" ]] && info "Maze Welcome autostart still armed (first login not completed yet)"
-    [[ -f "${home}/.config/autostart/opensnitch_ui.desktop" || -f /etc/xdg/autostart/opensnitch_ui.desktop ]] && pass "opensnitch UI autostart" || info "no opensnitch_ui autostart"
+    [[ -f "${home}/.config/autostart/opensnitch_ui.desktop" ]] && info "${u} still has the opensnitch_ui autostart (OpenSnitch is no longer part of Maze)"
     # kscreenlocker / powermanagement must NOT be the live "never lock/sleep" ones
     grep -qs 'Autolock=false' "${home}/.config/kscreenlockerrc" && warn "kscreenlockerrc has Autolock=false — the live-session setting leaked into ${u}'s home"
     [[ -f "${home}/.config/powermanagementprofilesrc" ]] && [[ "$(grep -vcE '^\[|^$' "${home}/.config/powermanagementprofilesrc")" -eq 0 ]] && warn "powermanagementprofilesrc is the empty live profile (no idle actions)"
@@ -699,7 +699,7 @@ if [[ -n "${SRC}" && -d "${SRC}" ]]; then
     # The build-time overlay files that stay on the target. (The rest moved into
     # packages in 2026-09 — maze-hardening, maze-branding, maze-plasma-config,
     # maze-tools, maze-secureboot — where pacman -Qkk checks them.)
-    for f in /etc/opensnitchd/default-config.json /etc/pam.d/passwd; do
+    for f in /etc/pam.d/passwd; do
         s="${SRC}/MazeLinux/airootfs${f}"
         [[ -f "$s" ]] || continue
         if [[ ! -e "$f" ]]; then warn "airootfs file missing on target: $f"; elif cmp -s "$s" "$f"; then pass "airootfs file identical: $f"; else warn "airootfs file differs from source: $f"; fi
@@ -710,7 +710,7 @@ fi
 
 # ============================================================== 9. services =
 section "9. systemd units"
-EXP_ENABLED=(apparmor auditd firewalld opensnitchd tor maze-guardd maze-cloak ollama acpid power-profiles-daemon smartd systemd-oomd
+EXP_ENABLED=(apparmor auditd firewalld tor maze-guardd maze-cloak ollama acpid power-profiles-daemon smartd systemd-oomd
              fwupd-refresh.timer reflector.timer maze-flatpak-setup maze-sentinel maze-sentinel-setup fstrim.timer bluetooth cups clamav-freshclam
              NetworkManager display-manager systemd-resolved systemd-timesyncd
              maze-sb-resign.path maze-sb-resign.service maze-boot-guard.path maze-boot-check.timer
@@ -1254,11 +1254,10 @@ for _ap in hazedrop haze; do
             || warn "${_ap}: AppArmor profile (${_mode}) blocked ${_ev} access(es) in 30 days — if ${_ap} misbehaves: sudo aa-complain /etc/apparmor.d/${_ap}"
     fi
 done
+# OpenSnitch left Maze in 2026-10. Machines installed before that still carry the
+# package (a scriptlet cannot uninstall it); it is the admin's to keep or remove.
 if has opensnitchd; then
-    _mode="$(python3 -c 'import json; print(json.load(open("/etc/opensnitchd/default-config.json"))["DefaultAction"])' 2>/dev/null)"
-    info "opensnitch DefaultAction=${_mode:-?} (deploy ships allow = passive mode; user switches to deny in the UI)"
-    _pm="$(python3 -c 'import json; print(json.load(open("/etc/opensnitchd/default-config.json"))["ProcMonitorMethod"])' 2>/dev/null)"; info "opensnitch ProcMonitorMethod=${_pm:-?}"
-    journalctl -b -u opensnitchd -q --no-pager 2>/dev/null | grep -iE 'error|fail' | grep -v 'no such' | tail -3 | sed 's/^/         | /'
+    info "opensnitch is still installed but no longer part of Maze — keep it, or remove it: sudo pacman -Rns opensnitch"
 fi
 
 section "20. Deep: ESP contents and previous boot"

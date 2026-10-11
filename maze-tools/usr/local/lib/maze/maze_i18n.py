@@ -43,7 +43,7 @@ def tr(text: str) -> str:
     return text
 
 
-# English source string → Turkish. Proper nouns (OpenSnitch, AppArmor, Tor,
+# English source string → Turkish. Proper nouns (AppArmor, Tor,
 # Ollama, firewalld, auditd, fail2ban, GPU/CPU, sysctl…) are intentionally left
 # untranslated. Strings with {placeholders} are .format()-ed by the caller.
 _TR: dict[str, str] = {
@@ -175,18 +175,16 @@ _TR: dict[str, str] = {
         "Güvenlik, gizlilik ve yapay zekâ için hazır, eksiksiz bir Arch "
         "masaüstü. Sisteminizi incelemek için soldaki sekmeleri kullanın "
         "veya daha fazlasını öğrenmek için aşağıdaki bir karta tıklayın.",
-    "OpenSnitch, AppArmor, firewalld.": "OpenSnitch, AppArmor, firewalld.",
-    "Maze ships with layered defences, on by default. OpenSnitch is an "
-    "application firewall that asks for your approval before any program "
-    "is allowed to connect to the internet. AppArmor confines apps so "
-    "they can only touch what they need, and firewalld manages your "
-    "network zones — so a compromised app can do far less harm.":
-        "Maze, varsayılan olarak açık katmanlı savunmalarla gelir. OpenSnitch, "
-        "herhangi bir programın internete bağlanmasına izin verilmeden önce "
-        "onayınızı isteyen bir uygulama güvenlik duvarıdır. AppArmor "
-        "uygulamaları yalnızca ihtiyaç duyduklarına erişecek şekilde sınırlar "
-        "ve firewalld ağ bölgelerinizi yönetir — böylece ele geçirilmiş bir "
-        "uygulama çok daha az zarar verebilir.",
+    "AppArmor, firewalld, Maze Guard.": "AppArmor, firewalld, Maze Guard.",
+    "Maze ships with layered defences, on by default. AppArmor confines "
+    "apps so they can only touch what they need, firewalld manages your "
+    "network zones, and Maze Guard watches your network for attacks — "
+    "so a compromised app can do far less harm.":
+        "Maze, varsayılan olarak açık katmanlı savunmalarla gelir. AppArmor "
+        "uygulamaları yalnızca ihtiyaç duyduklarına erişecek şekilde sınırlar, "
+        "firewalld ağ bölgelerinizi yönetir ve Maze Guard ağınızı saldırılara "
+        "karşı izler — böylece ele geçirilmiş bir uygulama çok daha az zarar "
+        "verebilir.",
     "Tor, MAC randomisation, hardened apps.":
         "Tor, MAC rastgeleleştirme, sıkılaştırılmış uygulamalar.",
     "Stay anonymous by design. The Tor Browser routes your traffic "
@@ -261,10 +259,6 @@ _TR: dict[str, str] = {
     "Visit the Maze website to learn more":
         "Daha fazlası için Maze web sitesini ziyaret edin",
     # -- Welcome: tips ----------------------------------------------------
-    "Tip: OpenSnitch asks before any app connects to the internet — "
-    "review the prompts.":
-        "İpucu: OpenSnitch, herhangi bir uygulama internete bağlanmadan önce "
-        "sorar — istemleri inceleyin.",
     "Tip: Your MAC address is randomised on every network for privacy.":
         "İpucu: MAC adresiniz gizlilik için her ağda rastgeleleştirilir.",
     "Tip: Run local AI models fully offline with `ollama run <model>`.":
@@ -402,8 +396,6 @@ _TR: dict[str, str] = {
 # The original English TIPS list, exposed so the Welcome app can translate the
 # rotating tip text by index without re-declaring the strings here.
 TIPS_EN: tuple[str, ...] = (
-    "Tip: OpenSnitch asks before any app connects to the internet — "
-    "review the prompts.",
     "Tip: Your MAC address is randomised on every network for privacy.",
     "Tip: Run local AI models fully offline with `ollama run <model>`.",
     "Tip: Maze is a rolling release — update regularly to stay secure.",

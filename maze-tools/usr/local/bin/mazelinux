@@ -112,8 +112,7 @@ def _welcome_lines() -> list[tuple[bool | None, str]]:
 
     # Row 3 — security services. Tri-state so an unknown probe (e.g. the shared
     # library missing) reads as "unknown", never a false "inactive".
-    sec = [_active(u) for u in
-           ("apparmor.service", "firewalld.service", "opensnitchd.service")]
+    sec = [_active(u) for u in ("apparmor.service", "firewalld.service")]
     if all(v is True for v in sec):
         sec_state, sec_word = True, "active"
     elif all(v is False for v in sec):
@@ -122,7 +121,7 @@ def _welcome_lines() -> list[tuple[bool | None, str]]:
         sec_state, sec_word = None, "partly active"
     else:
         sec_state, sec_word = None, "unknown"
-    security = f'AppArmor{_dot()}firewalld{_dot()}OpenSnitch {_paint(sec_word, C.DIM)}'
+    security = f'AppArmor{_dot()}firewalld {_paint(sec_word, C.DIM)}'
 
     # Row 4 — anonymity. mac_randomization_enabled() is a definite bool when the
     # library is present, None only when it is not.

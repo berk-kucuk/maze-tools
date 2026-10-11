@@ -52,7 +52,6 @@ def service_enabled(unit: str) -> bool | None:
 SECURITY_SERVICES: list[tuple[str, str]] = [
     ("AppArmor", "apparmor.service"),
     ("firewalld", "firewalld.service"),
-    ("OpenSnitch", "opensnitchd.service"),
     ("auditd", "auditd.service"),
 ]
 

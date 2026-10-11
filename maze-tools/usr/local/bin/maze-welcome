@@ -94,7 +94,6 @@ CARD_GLASS = "rgba(255, 255, 255, 0.045)"
 CARD_GLASS_HOVER = "rgba(255, 255, 255, 0.11)"
 
 TIPS = [
-    "Tip: OpenSnitch asks before any app connects to the internet — review the prompts.",
     "Tip: Your MAC address is randomised on every network for privacy.",
     "Tip: Run local AI models fully offline with `ollama run <model>`.",
     "Tip: Maze is a rolling release — update regularly to stay secure.",
@@ -390,12 +389,11 @@ class Welcome(QWidget):
         grid = QGridLayout()
         grid.setSpacing(14)
         cards = [
-            ("security-high", "Security", "OpenSnitch, AppArmor, firewalld.",
-             "Maze ships with layered defences, on by default. OpenSnitch is an "
-             "application firewall that asks for your approval before any program "
-             "is allowed to connect to the internet. AppArmor confines apps so "
-             "they can only touch what they need, and firewalld manages your "
-             "network zones — so a compromised app can do far less harm."),
+            ("security-high", "Security", "AppArmor, firewalld, Maze Guard.",
+             "Maze ships with layered defences, on by default. AppArmor confines "
+             "apps so they can only touch what they need, firewalld manages your "
+             "network zones, and Maze Guard watches your network for attacks — "
+             "so a compromised app can do far less harm."),
             ("network-vpn", "Privacy", "Tor, MAC randomisation, hardened apps.",
              "Stay anonymous by design. The Tor Browser routes your traffic "
              "through the Tor network, MAC address randomisation hides your "
