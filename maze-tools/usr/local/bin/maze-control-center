@@ -26,7 +26,7 @@ import maze_ui as ui  # noqa: E402
 from maze_i18n import set_language, tr  # noqa: E402
 
 from PySide6.QtCore import QPoint, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QFont, QIcon, QPixmap  # noqa: E402
+from PySide6.QtGui import QFont  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QButtonGroup,
@@ -516,7 +516,10 @@ class ControlCenter(QWidget):
         geo.moveCenter(screen.center())
         self.move(geo.topLeft())
         self.show()
-        ui.enable_kde_blur(int(self.winId()))
+        # Limited to the rounded shape: a whole-window blur showed as a square
+        # behind the transparent corners.
+        ui.enable_kde_blur(int(self.winId()), ui.blur_region(
+            WIN_W, WIN_H, self.devicePixelRatioF()))
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton and event.position().y() < 70:

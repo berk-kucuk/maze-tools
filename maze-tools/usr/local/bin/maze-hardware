@@ -12,11 +12,11 @@ state shown is only ever what the broker reported — when it cannot be reached,
 the switches say "unknown" instead of the old default of showing every device
 as "On", which for a privacy tool is the one wrong answer that matters.
 
-The window is a translucent frosted-glass panel: KWin blurs the desktop behind
-its rounded shape, and soft glow orbs inside (tinted red while anything is
-blocked) give the glass cards something to sit on. The widgets are built once
-and updated in place, so a poll never makes the window flicker and the
-switches can animate to the state the broker reports.
+The window is the same true-black OLED panel as the Control Center and
+Welcome (maze_ui's OLED kit): black surface, faint white cards, the logo
+watermark, and a faint red glow in the corner while anything is blocked. The
+widgets are built once and updated in place, so a poll never makes the window
+flicker and the switches can animate to the state the broker reports.
 """
 from __future__ import annotations
 
@@ -38,7 +38,9 @@ from PySide6.QtGui import (  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractButton,
     QApplication,
+    QFrame,
     QHBoxLayout,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -48,7 +50,7 @@ APP_ICON = "/usr/share/pixmaps/maze-hardware.svg"
 # White line-art device icons drawn for this app (same 24px set as the kernel
 # switcher's); a blocked device gets a red slash cut through it.
 ICON_DIR = "/usr/share/pixmaps/maze-hardware"
-WIN_W, WIN_H = 760, 812
+WIN_W, WIN_H = 760, 840
 POLL_MS = 5000   # the phone (Maze Connect) can flip a switch too — stay current
 
 DEVICES = (
@@ -162,7 +164,7 @@ class Switch(QAbstractButton):
         track.addRoundedRect(r, r.height() / 2, r.height() / 2)
         hover = self.underMouse() and self.isEnabled()
         t = self._pos if known else 0.5
-        # Track fades from red glass (blocked) to solid white (allowed).
+        # Track fades from faint red (blocked) to solid white (allowed).
         red = QColor(RED.red(), RED.green(), RED.blue(), 70 if hover else 52)
         white = QColor(255, 255, 255, 255 if hover else 238)
         if not known:
@@ -206,7 +208,7 @@ class DeviceRow(ui.GlassCard):
     """One device: tile, name, live state chip, description, and its switch."""
 
     def __init__(self, dev: str, title: str, icon: str, desc: str, on_toggle) -> None:
-        super().__init__(radius=20)
+        super().__init__(radius=14)
         self._dev = dev
         self._state = "unknown"
         self.setFixedHeight(84)
@@ -331,10 +333,12 @@ class Hardware(QWidget):
         self.setWindowIcon(QIcon(APP_ICON))
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(WIN_W, WIN_H)
+        # The device list scrolls, so on a short screen (1366x768) the window
+        # shrinks to fit instead of pushing its footer off the bottom edge.
+        self.setFixedSize(WIN_W, ui.fit_height(WIN_H))
 
-        self._root = ui.GlassWindow(self)
-        self._root.setGeometry(0, 0, WIN_W, WIN_H)
+        self._root = ui.GlassWindow(self, ui.make_watermark())
+        self._root.setGeometry(0, 0, self.width(), self.height())
         self._outer = QVBoxLayout(self._root)
         self._outer.setContentsMargins(28, 22, 28, 22)
         self._outer.setSpacing(0)
@@ -446,13 +450,8 @@ class Hardware(QWidget):
         self._count = ui.label("", 8, ui.FAINT, QFont.DemiBold, 0.6)
         self._outer.addLayout(ui.section_label(tr("Devices"), self._count))
         self._outer.addSpacing(10)
-        for dev, title, icon, desc in DEVICES:
-            row = DeviceRow(dev, title, icon, desc, self._toggle)
-            self._rows[dev] = row
-            self._outer.addWidget(row)
-            self._outer.addSpacing(8)
-        self._outer.addStretch(1)
-        self._outer.addSpacing(6)
+        self._outer.addWidget(self._device_list(), 1)
+        self._outer.addSpacing(14)
         self._outer.addLayout(self._footer())
         self._sync()
 
@@ -460,7 +459,7 @@ class Hardware(QWidget):
         """Push the current state into the widgets (no rebuild)."""
         states = [self._state.get(d, "unknown") if self._reachable else "unknown"
                   for d, *_ in DEVICES]
-        for (dev, *_), st in zip(DEVICES, states):
+        for (dev, *_), st in zip(DEVICES, states, strict=True):
             self._rows[dev].set_state(st, dev == self._applying, self._busy)
         self._ring.set_states(states)
 
@@ -504,7 +503,7 @@ class Hardware(QWidget):
 
     def _hero(self) -> QWidget:
         """Everything at a glance, plus the one action people reach for most."""
-        card = ui.GlassCard(radius=24)
+        card = ui.GlassCard(radius=14)
         lay = QHBoxLayout(card)
         lay.setContentsMargins(20, 18, 24, 18)
         lay.setSpacing(22)
@@ -539,6 +538,35 @@ class Hardware(QWidget):
         lay.addLayout(col, 1)
         return card
 
+    def _device_list(self) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollArea > QWidget > QWidget { background: transparent; }
+            QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
+            QScrollBar::handle:vertical { background: rgba(255,255,255,0.18);
+                                          border-radius: 4px; min-height: 32px; }
+            QScrollBar::handle:vertical:hover { background: rgba(255,255,255,0.32); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+        inner = QWidget()
+        inner.setStyleSheet("background: transparent;")
+        col = QVBoxLayout(inner)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(8)
+        for dev, title, icon, desc in DEVICES:
+            row = DeviceRow(dev, title, icon, desc, self._toggle)
+            self._rows[dev] = row
+            col.addWidget(row)
+        col.addStretch(1)
+        scroll.setWidget(inner)
+        return scroll
+
     def _footer(self) -> QHBoxLayout:
         f = QHBoxLayout()
         f.setContentsMargins(6, 0, 0, 0)
@@ -567,8 +595,8 @@ class Hardware(QWidget):
         geo.moveCenter(screen.center())
         self.move(geo.topLeft())
         self.show()
-        ui.enable_kde_blur(int(self.winId()),
-                           ui.blur_region(WIN_W, WIN_H, self.devicePixelRatioF()))
+        ui.enable_kde_blur(int(self.winId()), ui.blur_region(
+            self.width(), self.height(), self.devicePixelRatioF()))
 
     def closeEvent(self, event) -> None:  # noqa: N802
         # Let an in-flight switch finish: killing maze-killswitch mid-request

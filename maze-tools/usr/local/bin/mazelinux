@@ -185,7 +185,7 @@ def cmd_security() -> int:
     if not ms:
         _row("status", "unavailable")
         return 0
-    for label, unit, state in ms.security_status():
+    for label, _unit, state in ms.security_status():
         _row(label, "running" if state else ("stopped" if state is False else "n/a"), state)
     sb = ms.secure_boot_status()
     if sb is not None:

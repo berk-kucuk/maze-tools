@@ -36,7 +36,6 @@ from maze_ui import (  # noqa: E402  re-export shared names for local f-strings
     ACCENT_HOVER,
     DIM,
     FAINT,
-    LOGO_PATH,
     OK_GREEN,
     PANEL_BLACK,
     PILL_BG,
@@ -59,6 +58,7 @@ from PySide6.QtCore import (  # noqa: E402
     QEasingCurve,
     QPoint,
     QPropertyAnimation,
+    QRectF,
     Qt,
     QTimer,
     QUrl,
@@ -67,9 +67,8 @@ from PySide6.QtGui import (  # noqa: E402
     QColor,
     QDesktopServices,
     QFont,
-    QIcon,
     QPainter,
-    QPixmap,
+    QPainterPath,
 )
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
@@ -226,8 +225,14 @@ class InfoOverlay(QFrame):
         lay.addLayout(row)
 
     def paintEvent(self, event) -> None:  # noqa: N802
+        # Rounded like the window: a plain fillRect painted the transparent
+        # corners black, so the overlay showed square corners.
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(0, 0, 0, 205))
+        p.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), ui.GLASS_RADIUS, ui.GLASS_RADIUS)
+        p.fillPath(path, QColor(0, 0, 0, 205))
+        p.end()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if not self._card.geometry().contains(event.position().toPoint()):
@@ -647,7 +652,9 @@ class Welcome(QWidget):
 
         self.setWindowOpacity(0.0)
         self.show()
-        enable_kde_blur(int(self.winId()))
+        # Limited to the rounded shape (see maze-control-center).
+        enable_kde_blur(int(self.winId()), ui.blur_region(
+            WIN_W, WIN_H, self.devicePixelRatioF()))
 
         self._fade = QPropertyAnimation(self, b"windowOpacity")
         self._fade.setDuration(320)

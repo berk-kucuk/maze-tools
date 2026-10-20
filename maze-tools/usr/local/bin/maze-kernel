@@ -13,9 +13,10 @@ authorisation point and the actual pacman / bootctl work lives in one small,
 auditable root helper. Read-only status (installed / running / default) is
 gathered locally from /usr/lib/modules and pacman.
 
-The window is the same see-through frosted glass as Maze Hardware (maze_ui's
-glass kit): KWin blurs the desktop behind it, and while a helper run is on
-screen the kernel list behind the run's panel is blurred too.
+The window is the same true-black OLED panel as the Control Center and
+Welcome (maze_ui's OLED kit): black surface, faint white cards, the logo
+watermark. While a helper run is on screen the kernel list is dimmed behind
+a black panel, as Welcome does for its info cards.
 """
 from __future__ import annotations
 
@@ -37,7 +38,6 @@ from PySide6.QtGui import (  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QFrame,
-    QGraphicsBlurEffect,
     QHBoxLayout,
     QLabel,
     QScrollArea,
@@ -270,12 +270,12 @@ class KernelCard(ui.GlassCard):
     def __init__(self, meta: dict, running: str,
                  installed: dict[str, str], default: str | None,
                  pinned: bool, on_action) -> None:
-        super().__init__(radius=22)
+        super().__init__(radius=14)
         pkg = meta["pkg"]
         is_installed = pkg in installed
         is_running = pkg == running
         is_default = default is not None and pkg == default
-        # The kernel that boots next gets a brighter glass edge so it stands
+        # The kernel that boots next gets a brighter rim so it stands
         # out in the list at a glance.
         self.set_emphasis(is_default)
 
@@ -349,22 +349,23 @@ class KernelCard(ui.GlassCard):
 class RunPanel(QWidget):
     """Overlay that streams a privileged helper run's live output.
 
-    While it is up, the window behind it is blurred (a real in-app blur of the
-    kernel list, on top of KWin's blur of the desktop) and dimmed, and the
-    run sits on a glass sheet in front.
+    While it is up, the window behind it is dimmed to near-black and the run
+    sits on a solid black panel in front — Welcome's info-card overlay.
     """
 
-    def __init__(self, parent: QWidget, backdrop: QWidget, on_finished) -> None:
+    def __init__(self, parent: QWidget, on_finished) -> None:
         super().__init__(parent)
-        self._backdrop = backdrop
         self._on_finished = on_finished
         self._proc: QProcess | None = None
         self.hide()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(70, 70, 70, 70)
-        panel = ui.GlassCard(radius=24)
-        panel.set_emphasis(True)
+        panel = QFrame()
+        panel.setObjectName("runpanel")
+        panel.setStyleSheet(
+            f"QFrame#runpanel {{ background: {ui.PANEL_BLACK}; border-radius: 18px;"
+            " border: 1px solid rgba(255,255,255,0.14); }")
         outer.addWidget(panel)
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(26, 24, 26, 22)
@@ -387,8 +388,8 @@ class RunPanel(QWidget):
         self._log.setReadOnly(True)
         self._log.setFont(QFont(ui.MONO, 9))
         self._log.setStyleSheet(
-            f"QTextEdit {{ color: {ui.DIM}; background: rgba(0,0,0,0.45);"
-            " border: 1px solid rgba(255,255,255,0.08); border-radius: 14px;"
+            f"QTextEdit {{ color: {ui.DIM}; background: rgba(255,255,255,0.03);"
+            " border: 1px solid rgba(255,255,255,0.07); border-radius: 12px;"
             " padding: 12px; }"
             "QScrollBar:vertical { background: transparent; width: 8px; margin: 4px; }"
             "QScrollBar::handle:vertical { background: rgba(255,255,255,0.18);"
@@ -412,7 +413,7 @@ class RunPanel(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         path = QPainterPath()
         path.addRoundedRect(QRectF(self.rect()), ui.GLASS_RADIUS, ui.GLASS_RADIUS)
-        p.fillPath(path, QColor(0, 0, 0, 120))
+        p.fillPath(path, QColor(0, 0, 0, 205))
         p.end()
 
     def _set_status(self, text: str, color: str) -> None:
@@ -421,7 +422,6 @@ class RunPanel(QWidget):
 
     def _dismiss(self) -> None:
         self.hide()
-        self._backdrop.setGraphicsEffect(None)
         self._on_finished()
 
     def start(self, verb: str, pkg: str) -> None:
@@ -436,10 +436,6 @@ class RunPanel(QWidget):
         self._spinner.start()
         self._log.clear()
         self._close.setEnabled(False)
-        blur = QGraphicsBlurEffect(self._backdrop)
-        blur.setBlurRadius(22)
-        blur.setBlurHints(QGraphicsBlurEffect.QualityHint)
-        self._backdrop.setGraphicsEffect(blur)
         self.resize(self.parent().size())
         self.show()
         self.raise_()
@@ -500,16 +496,18 @@ class KernelSwitcher(QWidget):
         self.setWindowIcon(QIcon(APP_ICON))
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(WIN_W, WIN_H)
+        # The kernel list scrolls, so on a short screen (1366x768) the window
+        # shrinks to fit instead of pushing its footer off the bottom edge.
+        self.setFixedSize(WIN_W, ui.fit_height(WIN_H))
 
-        self._root = ui.GlassWindow(self)
-        self._root.setGeometry(0, 0, WIN_W, WIN_H)
+        self._root = ui.GlassWindow(self, ui.make_watermark())
+        self._root.setGeometry(0, 0, self.width(), self.height())
         self._outer = QVBoxLayout(self._root)
         self._outer.setContentsMargins(28, 22, 28, 22)
         self._outer.setSpacing(0)
         self._build()
 
-        self._runner = RunPanel(self, self._root, self._refresh)
+        self._runner = RunPanel(self, self._refresh)
 
     # -- build / rebuild ------------------------------------------------------
     def _build(self) -> None:
@@ -574,7 +572,7 @@ class KernelSwitcher(QWidget):
 
     def _summary(self, running: str, default: str | None, pinned: bool) -> QWidget:
         """Two halves: what runs now, and what the next boot will run."""
-        card = ui.GlassCard(radius=24)
+        card = ui.GlassCard(radius=14)
         lay = QHBoxLayout(card)
         lay.setContentsMargins(20, 18, 22, 18)
         lay.setSpacing(12)
@@ -659,8 +657,8 @@ class KernelSwitcher(QWidget):
         geo.moveCenter(screen.center())
         self.move(geo.topLeft())
         self.show()
-        ui.enable_kde_blur(int(self.winId()),
-                           ui.blur_region(WIN_W, WIN_H, self.devicePixelRatioF()))
+        ui.enable_kde_blur(int(self.winId()), ui.blur_region(
+            self.width(), self.height(), self.devicePixelRatioF()))
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         if getattr(self, "_runner", None) is not None and self._runner.isVisible():

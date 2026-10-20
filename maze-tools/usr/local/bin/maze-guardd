@@ -4,7 +4,7 @@
 WHY A DAEMON (not passwordless pkexec): a passwordless polkit rule on a root
 script is a broad privilege-escalation surface — it leans on setuid pkexec (the
 PwnKit class of bugs) and lets anything in the session run the helper. This
-daemon instead exposes a NARROW, FIXED api over a wheel-only Unix socket:
+daemon instead exposes a NARROW, FIXED api over a root:maze 0660 Unix socket:
 
   * The daemon runs as root; its code is root-owned and not user-writable, so it
     cannot be tampered with (no code injection into the privileged path).
@@ -15,7 +15,7 @@ daemon instead exposes a NARROW, FIXED api over a wheel-only Unix socket:
     ACTIVE session on a LOCAL seat per logind (mirrors polkit allow_active) —
     not root, not remote/SSH, not a background/lingering user.
 
-Verbs:  PANIC | KILL <device> <on|off> | STATUS | PING
+Verbs:  PANIC | RESTORE | KILL <device> <on|off> | STATUS | PING
 """
 import grp
 import os
@@ -104,7 +104,7 @@ def do_panic():
     _run("journalctl", "--rotate")
     _run("journalctl", "--vacuum-time=1s")
     for d in ("/var/log/journal", "/run/log/journal"):
-        for root, dirs, files in os.walk(d, topdown=False):
+        for root, _dirs, files in os.walk(d, topdown=False):
             for f in files:
                 try:
                     os.remove(os.path.join(root, f))
@@ -475,6 +475,15 @@ def _authorized(uid, pid):
       session, which is what polkit's allow_active does for such processes.
     """
     if not (1000 <= uid < 65534):
+        return False
+    # SO_PEERCRED's pid is a snapshot from connect(). A caller that exits
+    # right away frees that pid, and whatever process gets it next would be
+    # the one judged below. Refuse unless /proc/<pid> still belongs to the
+    # connecting uid (a recycled pid owned by someone else, or none, fails).
+    try:
+        if pid <= 0 or os.stat(f"/proc/{int(pid)}").st_uid != uid:
+            return False
+    except OSError:
         return False
     sid = _session_of_pid(pid)
     if sid is not None:

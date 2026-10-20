@@ -664,12 +664,20 @@ ACTION==\"add\", SUBSYSTEM==\"pci\", KERNEL==\"$NVIDIA_PCI\", \\
             if echo "$PARENT_CMD" | grep -q 'ksystemstats'; then
                 log "  KDE ksystemstats detected - disabling its nvidia plugin"
                 # User config (usually ~/.config/ksystemstatsrc)
-                USER_CONFIG="$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)/.config/ksystemstatsrc"
+                USER_CONFIG="$(getent passwd "${SUDO_USER:-${USER:-root}}" | cut -d: -f6)/.config/ksystemstatsrc"
                 # System-wide
                 SYSTEM_CONFIG="/etc/xdg/ksystemstatsrc"
 
                 for cfg in "$USER_CONFIG" "$SYSTEM_CONFIG"; do
                     cfg_dir="$(dirname "$cfg")"
+                    # This runs as root over a path in the user's home: a
+                    # symlink there would have root append to (or sed) any
+                    # file on the system. Only ever touch a regular file in a
+                    # real directory.
+                    if [[ -L "$cfg" || -L "$cfg_dir" ]] || { [[ -e "$cfg" ]] && [[ ! -f "$cfg" ]]; }; then
+                        warn "  $cfg is not a regular file - skipped"
+                        continue
+                    fi
                     mkdir -p "$cfg_dir" 2>/dev/null
                     # Idempotent: is nvidia=false already in the [plugins] section?
                     if [[ -f "$cfg" ]] && grep -A1 '^\[plugins\]' "$cfg" 2>/dev/null | grep -q 'nvidia=false'; then
@@ -692,7 +700,7 @@ ACTION==\"add\", SUBSYSTEM==\"pci\", KERNEL==\"$NVIDIA_PCI\", \\
                 done
 
                 # Restart ksystemstats (nvidia-smi stops on its own)
-                if [[ -n "$SUDO_USER" ]]; then
+                if [[ -n "${SUDO_USER:-}" ]]; then
                     log "  Restarting ksystemstats (user: $SUDO_USER)..."
                     if command -v systemctl >/dev/null 2>&1; then
                         sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \

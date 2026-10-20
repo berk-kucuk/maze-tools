@@ -8,3 +8,5 @@ Icon=/usr/share/pixmaps/maze-hardware.svg
 Terminal=false
 Categories=System;Settings;Security;
 Keywords=privacy;killswitch;webcam;microphone;bluetooth;wifi;usb;hardware;
+StartupNotify=true
+StartupWMClass=maze-hardware

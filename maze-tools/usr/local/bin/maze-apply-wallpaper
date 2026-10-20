@@ -67,7 +67,7 @@ for (var i = 0; i < ds.length; i++) {
         d.wallpaperPlugin = "com.mazelinux.wallpaper";
         d.currentConfigGroup = ["Wallpaper", "com.mazelinux.wallpaper", "General"];
         d.writeConfig("Kind", "image");
-        d.writeConfig("Source", "/usr/share/wallpapers/Maze/contents/images/3344x1882.png");
+        d.writeConfig("Source", "/usr/share/wallpapers/Maze-Dust/contents/images/2560x1440.png");
         d.writeConfig("ActiveBlur", true);
         d.writeConfig("BlurRadius", 32);
         d.writeConfig("ActiveDim", 10);
@@ -76,7 +76,7 @@ for (var i = 0; i < ds.length; i++) {
         d.wallpaperPlugin = "a2n.blur";
         d.currentConfigGroup = ["Wallpaper", "a2n.blur", "General"];
         d.writeConfig("ActiveBlur", true);
-        d.writeConfig("Image", "file:///usr/share/wallpapers/Maze/");
+        d.writeConfig("Image", "file:///usr/share/wallpapers/Maze-Dust/");
         d.writeConfig("BlurRadius", 50);
         d.writeConfig("AnimationDuration", 250);
         d.writeConfig("SlidePaths", "/usr/share/wallpapers/");

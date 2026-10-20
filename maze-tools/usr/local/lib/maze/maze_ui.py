@@ -1,10 +1,11 @@
 """maze_ui — shared true-black OLED widget toolkit for Maze GUI apps.
 
-Used by maze-control-center (and available to other Maze apps). Provides the
-OLED palette, the frosted Glass panel, sidebar nav buttons, status rows and a
-copy-command row — plus the see-through glass kit (GlassWindow, GlassCard,
-IconTile, Chip, pill buttons) that maze-hardware and maze-kernel are built
-on. Apps add /usr/local/lib/maze to sys.path and `import maze_ui`.
+Used by maze-control-center and maze-welcome. Provides the OLED palette, the
+true-black Glass panel, sidebar nav buttons, status rows and a copy-command
+row — plus the OLED kit (GlassWindow, GlassCard, IconTile, Chip, pill
+buttons) that maze-hardware and maze-kernel are built on, drawn in the same
+black / faint-white language. Apps add /usr/local/lib/maze to sys.path and
+`import maze_ui`.
 """
 from __future__ import annotations
 
@@ -324,6 +325,7 @@ class Glass(QFrame):
         p.setPen(pen)
         p.setClipping(False)
         p.drawRoundedRect(QRectF(r).adjusted(0.5, 0.5, -0.5, -0.5), 22, 22)
+        p.end()
 
 
 class NavButton(QPushButton):
@@ -496,14 +498,15 @@ class CommandRow(QFrame):
 
 
 # --------------------------------------------------------------------------- #
-#  Frosted-glass kit (maze-hardware, maze-kernel)                              #
+#  OLED kit (maze-hardware, maze-kernel)                                       #
 #                                                                              #
-#  A translucent window over KWin's blur, glass cards with light-catching      #
-#  rims, status chips and pill buttons. Unlike Glass above (near-opaque), the  #
-#  window here is see-through on purpose — pass its blur_region() to           #
-#  enable_kde_blur so the desktop behind it is frosted, not just dimmed.       #
+#  The same true-black surface as Glass above — near-opaque black, a faint     #
+#  top glow, the blurred logo watermark and a thin white rim — plus flat       #
+#  cards, icon tiles, status chips and buttons that match the Control Center   #
+#  and Welcome. Nothing here is see-through: on an OLED panel the black is     #
+#  real black, and the window reads the same on any wallpaper.                 #
 # --------------------------------------------------------------------------- #
-GLASS_RADIUS = 26
+GLASS_RADIUS = 22
 _RED = QColor(BAD_RED)
 _GREEN = QColor(OK_GREEN)
 
@@ -561,6 +564,14 @@ def blur_region(w: int, h: int, dpr: float,
     return [(r.x(), r.y(), r.width(), r.height()) for r in region]
 
 
+def fit_height(want: int, margin: int = 24) -> int:
+    """`want`, or the primary screen's usable height when that is smaller."""
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        return want
+    return max(360, min(want, screen.availableGeometry().height() - margin))
+
+
 def mix(a: QColor, b: QColor, t: float) -> QColor:
     """Linear blend of two colours (alpha included); t=0 is a, t=1 is b."""
     return QColor(int(a.red() + (b.red() - a.red()) * t),
@@ -569,16 +580,16 @@ def mix(a: QColor, b: QColor, t: float) -> QColor:
                   int(a.alpha() + (b.alpha() - a.alpha()) * t))
 
 
-class GlassWindow(QWidget):
-    """The window surface: a translucent smoked-glass sheet over KWin's blur.
+class GlassWindow(Glass):
+    """The window surface: Glass's true-black panel, with an optional glow.
 
-    Two big soft glow orbs sit behind the cards — set_glow() tints the lower
-    one (e.g. red while something is blocked) — and the rim is a
-    light-catching gradient, brighter along the top edge.
+    set_glow() washes the lower-right corner in a colour (red while something
+    is blocked) — faint, so the surface stays black.
     """
 
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+    def __init__(self, parent: QWidget | None = None,
+                 watermark: QPixmap | None = None) -> None:
+        super().__init__(watermark, parent)
         self._glow: QColor | None = None
 
     def set_glow(self, color: QColor | None) -> None:
@@ -586,46 +597,33 @@ class GlassWindow(QWidget):
             self._glow = color
             self.update()
 
-    def paintEvent(self, _event) -> None:  # noqa: N802
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if self._glow is None:
+            return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(self.rect())
         path = QPainterPath()
         path.addRoundedRect(r, GLASS_RADIUS, GLASS_RADIUS)
-        p.setClipPath(path)
-        # Smoked glass: dark enough to read on any wallpaper, light enough
-        # that KWin's blur of the desktop shows through.
-        p.fillPath(path, QColor(8, 8, 11, 150))
-        top = QRadialGradient(r.width() * 0.22, -40, r.width() * 0.75)
-        top.setColorAt(0.0, QColor(255, 255, 255, 34))
-        top.setColorAt(0.55, QColor(255, 255, 255, 8))
-        top.setColorAt(1.0, QColor(255, 255, 255, 0))
-        p.fillPath(path, top)
-        c = self._glow or QColor(255, 255, 255)
-        low = QRadialGradient(r.width() * 0.92, r.height() * 0.78, r.width() * 0.6)
-        low.setColorAt(0.0, QColor(c.red(), c.green(), c.blue(),
-                                   42 if self._glow is not None else 16))
+        c = self._glow
+        low = QRadialGradient(r.width() * 0.92, r.height() * 0.85, r.width() * 0.55)
+        low.setColorAt(0.0, QColor(c.red(), c.green(), c.blue(), 26))
         low.setColorAt(1.0, QColor(c.red(), c.green(), c.blue(), 0))
         p.fillPath(path, low)
-        p.setClipping(False)
-        rim = QLinearGradient(0, 0, 0, r.height())
-        rim.setColorAt(0.0, QColor(255, 255, 255, 70))
-        rim.setColorAt(0.25, QColor(255, 255, 255, 26))
-        rim.setColorAt(1.0, QColor(255, 255, 255, 14))
-        p.setPen(QPen(rim, 1))
-        p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), GLASS_RADIUS, GLASS_RADIUS)
         p.end()
 
 
 class GlassCard(QFrame):
-    """A frosted card: faint white fill, a top sheen and a gradient rim.
+    """A flat OLED card: the faint white fill of the Control Center's pills,
+    with a thin rim.
 
     set_tint() washes the card's left edge and rim in a colour (red for a
-    blocked device); set_emphasis() brightens it (the kernel that boots next).
+    blocked device); set_emphasis() brightens the rim (the kernel that boots
+    next).
     """
 
-    def __init__(self, radius: int = 20) -> None:
+    def __init__(self, radius: int = 14) -> None:
         super().__init__()
         self._radius = radius
         self._tint: QColor | None = None
@@ -634,12 +632,14 @@ class GlassCard(QFrame):
         self.setAttribute(Qt.WA_Hover)
 
     def set_tint(self, color: QColor | None) -> None:
-        self._tint = color
-        self.update()
+        if color != self._tint:
+            self._tint = color
+            self.update()
 
     def set_emphasis(self, on: bool) -> None:
-        self._emph = on
-        self.update()
+        if on != self._emph:
+            self._emph = on
+            self.update()
 
     def enterEvent(self, event) -> None:  # noqa: N802
         self._hover = True
@@ -657,34 +657,30 @@ class GlassCard(QFrame):
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         path = QPainterPath()
         path.addRoundedRect(r, self._radius, self._radius)
-        fill = QLinearGradient(0, 0, 0, r.height())
-        base = (16 if self._hover else 11) + (6 if self._emph else 0)
-        fill.setColorAt(0.0, QColor(255, 255, 255, base + 7))
-        fill.setColorAt(1.0, QColor(255, 255, 255, base - 4))
-        p.fillPath(path, fill)
+        # PILL_BG (0.06) at rest, PILL_BG_HOVER-ish on hover — same as the
+        # Control Center's rows, so the two apps read as one family.
+        p.fillPath(path, QColor(255, 255, 255, (24 if self._hover else 15)
+                                + (5 if self._emph else 0)))
         tc = self._tint
         if tc is not None:
             t = QLinearGradient(0, 0, r.width(), 0)
-            t.setColorAt(0.0, QColor(tc.red(), tc.green(), tc.blue(), 30))
+            t.setColorAt(0.0, QColor(tc.red(), tc.green(), tc.blue(), 34))
             t.setColorAt(0.6, QColor(tc.red(), tc.green(), tc.blue(), 0))
             p.fillPath(path, t)
-        rim = QLinearGradient(0, 0, 0, r.height())
-        if tc is not None:
-            rim.setColorAt(0.0, QColor(tc.red(), tc.green(), tc.blue(), 110))
-            rim.setColorAt(1.0, QColor(tc.red(), tc.green(), tc.blue(), 40))
+            rim = QColor(tc.red(), tc.green(), tc.blue(), 105)
+        elif self._emph:
+            rim = QColor(255, 255, 255, 115)
         else:
-            hi = (60 if self._hover else 42) + (50 if self._emph else 0)
-            rim.setColorAt(0.0, QColor(255, 255, 255, hi))
-            rim.setColorAt(1.0, QColor(255, 255, 255, 30 if self._emph else 12))
+            rim = QColor(255, 255, 255, 34 if self._hover else 20)
         p.setPen(QPen(rim, 1))
         p.drawPath(path)
         p.end()
 
 
 class IconTile(QWidget):
-    """A rounded glass tile holding one white line-art icon.
+    """A rounded tile holding one white line-art icon.
 
-    tint: colours the glass (red = blocked); dim: quieter (absent / not
+    tint: colours the tile (red = blocked); dim: quieter (absent / not
     installed); slash: a red line cut cleanly through the icon (the icon is
     erased under it, so it reads on any background); dot: a small status
     dot on the tile's corner (green = running).
@@ -711,20 +707,17 @@ class IconTile(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         inset = 3.0 if self._dot is not None else 0.5
         r = QRectF(self.rect()).adjusted(0.5, inset, -inset, -0.5)
-        rad = r.width() * 0.3
+        rad = r.width() * 0.28
         path = QPainterPath()
         path.addRoundedRect(r, rad, rad)
-        g = QLinearGradient(0, 0, 0, r.height())
         tc = self._tint
         if tc is not None:
-            g.setColorAt(0.0, QColor(tc.red(), tc.green(), tc.blue(), 70))
-            g.setColorAt(1.0, QColor(tc.red(), tc.green(), tc.blue(), 26))
-            rim = QColor(tc.red(), tc.green(), tc.blue(), 150)
+            fill = QColor(tc.red(), tc.green(), tc.blue(), 42)
+            rim = QColor(tc.red(), tc.green(), tc.blue(), 130)
         else:
-            g.setColorAt(0.0, QColor(255, 255, 255, 18 if self._dim else 38))
-            g.setColorAt(1.0, QColor(255, 255, 255, 6 if self._dim else 12))
-            rim = QColor(255, 255, 255, 26 if self._dim else 60)
-        p.fillPath(path, g)
+            fill = QColor(255, 255, 255, 9 if self._dim else 18)
+            rim = QColor(255, 255, 255, 16 if self._dim else 34)
+        p.fillPath(path, fill)
         p.setPen(QPen(rim, 1))
         p.drawPath(path)
 
@@ -749,14 +742,14 @@ class IconTile(QWidget):
         if self._dot is not None:
             d = 12.0
             c = QRectF(self.width() - d - 0.5, 0.5, d, d)
-            p.setPen(QPen(QColor(10, 10, 12), 2.5))
+            p.setPen(QPen(QColor(0, 0, 0), 2.5))   # cut out of the black surface
             p.setBrush(self._dot)
             p.drawEllipse(c)
         p.end()
 
 
 class Chip(QLabel):
-    """A small status pill: coloured dot + text on tinted glass.
+    """A small status pill: coloured dot + text on a tinted pill.
     dot=False gives a plain neutral tag."""
 
     def __init__(self) -> None:
@@ -787,9 +780,10 @@ def chip(text: str, color: QColor | str, dot: bool = True) -> Chip:
 
 
 class CloseButton(QPushButton):
-    """A round glass button that paints a crisp ✕ (turns red on hover)."""
+    """The ✕ of the Control Center and Welcome: bare until hovered, then a
+    red disc."""
 
-    def __init__(self, size: int = 32) -> None:
+    def __init__(self, size: int = 30) -> None:
         super().__init__()
         self.setFixedSize(size, size)
         self.setCursor(Qt.PointingHandCursor)
@@ -800,10 +794,10 @@ class CloseButton(QPushButton):
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         hover = self.underMouse()
-        p.setBrush(QColor(_RED.red(), _RED.green(), _RED.blue(), 70) if hover
-                   else QColor(255, 255, 255, 16))
-        p.setPen(QPen(QColor(255, 255, 255, 0 if hover else 40), 1))
-        p.drawEllipse(r)
+        if hover:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(224, 68, 68, 64))
+            p.drawEllipse(r)
         p.setPen(QPen(QColor(TEXT if hover else DIM), 1.6, Qt.SolidLine, Qt.RoundCap))
         c, k = r.center(), r.width() * 0.17
         p.drawLine(QPointF(c.x() - k, c.y() - k), QPointF(c.x() + k, c.y() + k))
@@ -812,49 +806,41 @@ class CloseButton(QPushButton):
 
 
 def pill_button(text: str, kind: str = "ghost", icon: QPixmap | None = None) -> QPushButton:
-    """kind: 'primary' (white), 'ghost' (glass) or 'danger' (red glass)."""
+    """The Control Center's buttons: 'primary' (solid white), 'ghost' (faint
+    white) or 'danger' (red)."""
     btn = QPushButton(text)
     btn.setCursor(Qt.PointingHandCursor)
     btn.setFixedHeight(40 if kind == "primary" else 36)
-    btn.setFont(font(10, QFont.DemiBold if kind == "primary" else QFont.Medium))
+    btn.setFont(font(10, QFont.Bold if kind == "primary" else QFont.Medium))
     if icon is not None and not icon.isNull():
         btn.setIcon(QIcon(icon))
         btn.setIconSize(QSize(16, 16))
     if kind == "primary":
-        css = ("QPushButton { color: #0a0a0c; background: qlineargradient(x1:0, y1:0,"
-               " x2:0, y2:1, stop:0 #ffffff, stop:1 #dcdde2); border: none;"
-               " border-radius: 20px; padding: 0 20px; }"
-               "QPushButton:hover { background: #ffffff; }"
-               "QPushButton:pressed { background: #cfd0d5; }"
-               "QPushButton:disabled { color: rgba(255,255,255,0.35);"
-               " background: rgba(255,255,255,0.07);"
-               " border: 1px solid rgba(255,255,255,0.08); }")
+        css = (f"QPushButton {{ color: #0a0a0c; background: {ACCENT}; border: none;"
+               " border-radius: 12px; padding: 0 20px; }"
+               f"QPushButton:hover {{ background: {ACCENT_HOVER}; }}"
+               "QPushButton:pressed { background: #d6d7dc; }"
+               f"QPushButton:disabled {{ color: {FAINT}; background: {PILL_BG}; }}")
     elif kind == "danger":
         css = (f"QPushButton {{ color: {BAD_RED}; background: rgba(224,102,102,0.10);"
-               " border: 1px solid rgba(224,102,102,0.40); border-radius: 18px;"
-               " padding: 0 16px; }"
-               "QPushButton:hover { color: #ffffff; background: rgba(224,102,102,0.32);"
-               " border-color: rgba(224,102,102,0.60); }"
-               f"QPushButton:disabled {{ color: {FAINT}; background: transparent;"
-               " border-color: rgba(255,255,255,0.08); }")
+               " border: none; border-radius: 12px; padding: 0 16px; }"
+               "QPushButton:hover { color: #ffffff; background: rgba(224,68,68,0.30); }"
+               f"QPushButton:disabled {{ color: {UNK_GRAY}; background: rgba(255,255,255,0.03); }}")
     else:
-        css = (f"QPushButton {{ color: {TEXT}; background: rgba(255,255,255,0.07);"
-               " border: 1px solid rgba(255,255,255,0.12); border-radius: 18px;"
-               " padding: 0 16px; }"
-               "QPushButton:hover { background: rgba(255,255,255,0.14);"
-               " border-color: rgba(255,255,255,0.22); }"
-               f"QPushButton:disabled {{ color: {FAINT};"
-               " background: rgba(255,255,255,0.04); }")
+        css = (f"QPushButton {{ color: {TEXT}; background: rgba(255,255,255,0.08);"
+               " border: none; border-radius: 12px; padding: 0 16px; }"
+               "QPushButton:hover { background: rgba(255,255,255,0.16); }"
+               f"QPushButton:disabled {{ color: {FAINT}; background: rgba(255,255,255,0.04); }}")
     btn.setStyleSheet(css)
     return btn
 
 
 def app_header(icon_path: str, eyebrow: str, title: str, on_language,
                on_close, dpr: float) -> QHBoxLayout:
-    """Glass icon tile, small-caps eyebrow + title, EN|TR toggle, close."""
+    """Icon tile, small-caps eyebrow + title, EN|TR toggle, close."""
     bar = QHBoxLayout()
     bar.setSpacing(0)
-    tile = GlassCard(radius=14)
+    tile = GlassCard(radius=13)
     tile.setFixedSize(46, 46)
     tl = QHBoxLayout(tile)
     tl.setContentsMargins(0, 0, 0, 0)
@@ -872,7 +858,7 @@ def app_header(icon_path: str, eyebrow: str, title: str, on_language,
     bar.addStretch(1)
     bar.addWidget(language_toggle(on_language), 0, Qt.AlignVCenter)
     bar.addSpacing(12)
-    close = CloseButton(32)
+    close = CloseButton(30)
     close.clicked.connect(on_close)
     bar.addWidget(close, 0, Qt.AlignVCenter)
     return bar

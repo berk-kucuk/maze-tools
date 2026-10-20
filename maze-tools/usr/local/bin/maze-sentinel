@@ -50,6 +50,12 @@ log() {
 notify_all() {
     local title="$1" body="$2" urgency="${3:-normal}"
     [[ "${NOTIFY}" = "1" ]] || return 0
+    # The body carries names an attacker picks (the writing program, a file
+    # path, an account name) and Plasma renders notification bodies as rich
+    # text — a crafted name could show a fake link in a root-sent security
+    # alert. Escape the markup characters so it is always shown as text.
+    # (Quoted replacements: bash >= 5.2 expands a bare & to the match.)
+    body="${body//&/"&amp;"}"; body="${body//</"&lt;"}"; body="${body//>/"&gt;"}"
     local d uid user addr
     for d in /run/user/*; do
         [[ -S "${d}/bus" ]] || continue

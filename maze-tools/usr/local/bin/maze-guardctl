@@ -11,6 +11,7 @@ Sends ONE fixed verb to /run/maze/guard.sock and prints the reply. Holds no
 privilege itself; all it can do is ask the daemon to run one of its whitelisted
 actions. Usage:
     maze-guardctl panic
+    maze-guardctl restore
     maze-guardctl kill <camera|microphone|bluetooth|wifi|usb> <on|off>
     maze-guardctl status
 Exit code 0 on an "OK ..." reply, 1 otherwise.
@@ -23,7 +24,7 @@ SOCK = "/run/maze/guard.sock"
 
 def main(argv):
     if not argv:
-        sys.stderr.write("usage: maze-guardctl <panic|kill <dev> <on|off>|status>\n")
+        sys.stderr.write("usage: maze-guardctl <panic|restore|kill <dev> <on|off>|status>\n")
         return 2
     msg = " ".join(argv)
     try:
@@ -34,7 +35,7 @@ def main(argv):
         reply = s.recv(512).decode("utf-8", "replace").strip()
         s.close()
     except Exception as exc:
-        sys.stderr.write(f"maze-guard: cannot reach maze-guardd ({exc})\n")
+        sys.stderr.write(f"maze-guardctl: cannot reach maze-guardd ({exc})\n")
         return 1
     print(reply)
     return 0 if reply.startswith("OK") else 1

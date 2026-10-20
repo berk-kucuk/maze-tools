@@ -36,7 +36,8 @@ SystemCallErrorNumber=EPERM
 # daemon (it writes /run/maze/sentinel-triggered there), and RuntimeDirectory would
 # wipe that dir on every guardd restart. The daemon creates /run/maze itself.
 # Runs as root (it must rfkill/modprobe/wipe logs), but the ONLY way in is the
-# wheel-only socket with a fixed, non-eval verb whitelist.
+# root:maze 0660 socket with a fixed, non-eval verb whitelist, and only for a
+# caller in a local, active, seat-attached logind session.
 
 [Install]
 WantedBy=multi-user.target

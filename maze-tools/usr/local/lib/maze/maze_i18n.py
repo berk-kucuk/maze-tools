@@ -122,7 +122,6 @@ _TR: dict[str, str] = {
     "Tor routes traffic anonymously.":
         "Anonimlik denetimleri. MAC rastgeleleştirme donanım kimliğinizi "
         "gizler; Tor trafiği anonim olarak yönlendirir.",
-    "MAC randomisation": "MAC rastgeleleştirme",
     "Tor service": "Tor servisi",
     "Randomise your MAC address now": "MAC adresinizi şimdi rastgeleleştirin",
     "View MAC change logs": "MAC değişim günlüklerini görüntüle",
@@ -276,7 +275,6 @@ _TR: dict[str, str] = {
     "Install, remove and choose which kernel boots.":
         "Çekirdek kurun, kaldırın ve hangisinin açılacağını seçin.",
     "Currently running": "Şu an çalışan",
-    "Running": "Çalışıyor",
     "Default": "Varsayılan",
     "Installed": "Kurulu",
     "Available": "Kurulabilir",

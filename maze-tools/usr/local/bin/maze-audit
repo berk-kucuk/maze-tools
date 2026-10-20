@@ -88,6 +88,14 @@ N_PASS=0; N_WARN=0; N_FAIL=0; N_INFO=0
 FAILS=""; WARNS=""
 CUR_SECTION=""
 
+# The report holds journal excerpts, unit states and paths from root-only
+# places: 0600, and created fresh (noclobber) — the path is predictable and
+# /var/tmp is world-writable, so a file or symlink planted there beforehand
+# must not be appended to.
+if ! ( umask 077; set -C; : > "${OUT}" ) 2>/dev/null; then
+    echo "maze-audit: cannot create the report ${OUT} (it already exists?)" >&2
+    exit 2
+fi
 exec > >(tee -a "${OUT}") 2>&1
 
 section() {
@@ -779,7 +787,7 @@ while IFS= read -r l; do warn "dangling unit symlink: $l"; done < <(find /etc/sy
 # firewalld services
 if systemctl is-active firewalld >/dev/null 2>&1 && has firewall-cmd; then
     _fs="$(firewall-cmd --list-services 2>/dev/null)"; info "firewalld default zone: $(firewall-cmd --get-default-zone 2>/dev/null) services: ${_fs}"
-    for s in kdeconnect maze-connect; do grep -qw "$s" <<<"${_fs}" && pass "firewalld allows $s" || warn "firewalld does not allow $s"; done
+    for s in maze-connect; do grep -qw "$s" <<<"${_fs}" && pass "firewalld allows $s" || warn "firewalld does not allow $s"; done
     grep -qw ssh <<<"${_fs}" && info "firewalld allows ssh (deploy adds it, sshd is disabled)"
 fi
 
@@ -806,11 +814,9 @@ if has fail2ban-client && systemctl is-active fail2ban >/dev/null 2>&1; then _j=
 _prl="$(cat /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config 2>/dev/null | awk '/^[[:space:]]*PermitRootLogin/{print $2; exit}')"
 [[ "${_prl}" == "no" ]] && pass "sshd config: PermitRootLogin no (first match)" || warn "sshd PermitRootLogin=${_prl:-<default: prohibit-password>}"
 # Loopback of any kind, NetworkManager/dhcp client sockets, browsers' ephemeral
-# UDP (QUIC/WebRTC) and kdeconnect (a deliberate LAN feature, firewalled by
-# service name) are not findings; anything else bound to a non-loopback address is.
-_ls="$(ss -ltnupH 2>/dev/null | grep -vE '127\.[0-9.]+:|\[::1\]:|%lo:' | grep -vE 'kdeconnectd|NetworkManager|dhcpcd|firefox|chromium|brave|torbrowser' | awk '!($1=="udp" && $5 ~ /:[3-6][0-9][0-9][0-9][0-9]$/)')"
-[[ -n "${_ls}" ]] && { warn "services listening on non-loopback addresses (kdeconnect/NM/browsers excluded):"; sed 's/^/         | /' <<<"${_ls}" | head -10; } || pass "nothing unexpected listens on non-loopback addresses"
-ss -lunpH 2>/dev/null | grep -q ':5353.*kdeconnectd' && info "kdeconnectd answers mDNS on udp/5353 (KDE Connect device discovery — a deliberate LAN feature; disable KDE Connect to silence it)"
+# UDP (QUIC/WebRTC) are not findings; anything else bound to a non-loopback address is.
+_ls="$(ss -ltnupH 2>/dev/null | grep -vE '127\.[0-9.]+:|\[::1\]:|%lo:' | grep -vE 'NetworkManager|dhcpcd|firefox|chromium|brave|torbrowser' | awk '!($1=="udp" && $5 ~ /:[3-6][0-9][0-9][0-9][0-9]$/)')"
+[[ -n "${_ls}" ]] && { warn "services listening on non-loopback addresses (NM/browsers excluded):"; sed 's/^/         | /' <<<"${_ls}" | head -10; } || pass "nothing unexpected listens on non-loopback addresses"
 # LAN presence broadcasting — a privacy desktop should not announce its hostname.
 systemctl is-active avahi-daemon >/dev/null 2>&1 && warn "avahi-daemon is running (mDNS hostname broadcast on the LAN)" "socket-activated: $(systemctl show -p TriggeredBy --value avahi-daemon); pulled by $(pacman -Qi avahi 2>/dev/null | sed -n 's/^Required By *: //p'). Nothing in deploy/enable-services masks it."
 systemctl is-active passim >/dev/null 2>&1 && warn "passim is running (fwupd's LAN firmware-cache sharing daemon, advertises via mDNS/avahi)" "static unit pulled in by fwupd; disable with: sudo systemctl mask passim avahi-daemon.socket avahi-daemon.service"
@@ -895,7 +901,7 @@ for d in /usr/share/plasma/look-and-feel/com.mazelinux.oled /usr/share/plasma/lo
 done
 _wc="$(ls -d /usr/share/wallpapers/Maze* 2>/dev/null | wc -l)"; info "Maze wallpaper packages: ${_wc}"
 grep -q '<default>Maze</default>' /usr/share/plasma/wallpapers/org.kde.image/contents/config/main.xml 2>/dev/null && pass "org.kde.image default wallpaper = Maze" || warn "org.kde.image default wallpaper not patched to Maze"
-grep -qsE '^Image=Maze' /usr/share/plasma/look-and-feel/org.kde.breeze.desktop/contents/defaults && pass "breeze L&F defaults Image=Maze" || info "breeze look-and-feel defaults not patched"
+grep -qsE '^Image=Maze-Dust$' /usr/share/plasma/look-and-feel/org.kde.breeze.desktop/contents/defaults && pass "breeze L&F defaults Image=Maze-Dust" || info "breeze look-and-feel defaults not patched"
 for b in maze-doctor maze-control-center maze-hardware maze-killswitch maze-guardd maze-guardctl maze-panic maze-panic-restore maze-kernel maze-kernel-helper maze-sentinel maze-welcome maze-gpu-driver maze-flatpak-setup maze-enable-blackarch maze-install-vmware maze-power-saver maze-primary-screen maze-apply-wallpaper mazelinux; do
     [[ -x "/usr/local/bin/$b" ]] || fail "/usr/local/bin/$b missing or not executable"
 done

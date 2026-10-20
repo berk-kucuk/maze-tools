@@ -62,18 +62,24 @@ def security_status() -> list[tuple[str, str, bool | None]]:
 
 
 def mac_randomization_enabled() -> bool:
-    """Detect NetworkManager MAC randomization in /etc/NetworkManager/conf.d."""
-    needles = (
-        "wifi.scan-rand-mac-address",
-        "cloned-mac-address=random",
-        "cloned-mac-address=stable",
-        "mac-address=random",
-    )
+    """Detect NetworkManager MAC randomization in /etc/NetworkManager/conf.d.
+
+    Parsed as key=value, not searched as text: a substring match on the key
+    name reported "on" for `wifi.scan-rand-mac-address=no` — the setting that
+    turns it OFF — and for commented-out lines.
+    """
     try:
         for f in Path("/etc/NetworkManager/conf.d").glob("*.conf"):
-            text = f.read_text(errors="ignore")
-            if any(n in text for n in needles):
-                return True
+            for line in f.read_text(errors="ignore").splitlines():
+                line = line.strip()
+                if not line or line[0] in "#;[" or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key, val = key.strip().lower(), val.strip().lower()
+                if key.endswith("cloned-mac-address") and val in ("random", "stable"):
+                    return True
+                if key.endswith("scan-rand-mac-address") and val in ("yes", "true", "1"):
+                    return True
     except Exception:  # noqa: BLE001
         pass
     return False
@@ -138,7 +144,13 @@ def secure_boot_chain_signed() -> bool | None:
                 break
     if not esp:
         return None
-    grub = os.path.join(esp, "EFI", "BOOT", "grubx64.efi")
+    boot_dir = os.path.join(esp, "EFI", "BOOT")
+    # The ESP is usually mounted root-only (fmask/dmask=0077). Unreadable is
+    # "cannot tell", not "unsigned": reporting False here put a FAILED boot
+    # chain in every unprivileged view (Welcome, Control Center, mazelinux).
+    if not os.access(boot_dir, os.R_OK | os.X_OK):
+        return None
+    grub = os.path.join(boot_dir, "grubx64.efi")
     if not os.path.exists(grub):
         return False
     r = _run(["sbverify", "--cert", str(keydir / "MOK.crt"), grub])

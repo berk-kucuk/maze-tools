@@ -52,6 +52,14 @@ done
 [[ "$(id -u)" -eq 0 ]] || { echo "run as root (sudo)" >&2; exit 2; }
 
 OUT="/var/tmp/maze-exercise-$(date +%Y%m%d-%H%M%S).txt"
+# The report holds journal excerpts, unit states and paths from root-only
+# places: 0600, and created fresh (noclobber) — the path is predictable and
+# /var/tmp is world-writable, so a file or symlink planted there beforehand
+# must not be appended to.
+if ! ( umask 077; set -C; : > "${OUT}" ) 2>/dev/null; then
+    echo "maze-exercise: cannot create the report ${OUT} (it already exists?)" >&2
+    exit 2
+fi
 exec > >(tee -a "${OUT}") 2>&1
 
 if [[ "${COLOR}" -eq 1 ]]; then C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[34m'; C_C=$'\e[36m'; C_0=$'\e[0m'; C_BOLD=$'\e[1m'; else C_R=; C_G=; C_Y=; C_B=; C_C=; C_0=; C_BOLD=; fi

@@ -353,7 +353,9 @@ revert_to_open() {
     # Back on nouveau: if it owns the panel, `kms` is the only thing that puts
     # the splash on the real GPU again (the install path removed it).
     panel_is_nvidia && restore_kms_hook
-    rebuild_ukis
+    # Under set -e a bare call ended the script right here on any failed
+    # kernel-install — before re-signing and before the closing message.
+    rebuild_ukis || warn "some boot images were not rebuilt (see above) — run: sudo maze-boot-check --repair"
     # command -v, not a hardcoded path: the packaged binary lives at
     # /usr/bin/maze-sb-sign (maze-secureboot). /usr/local/bin/maze-sb-sign is
     # only a compat shim the package's .install scriptlet creates when
@@ -577,7 +579,9 @@ fi
 log "Rebuilding the boot images (UKI) for every installed kernel"
 # kernel-install builds the initramfs itself; a separate `mkinitcpio -P` does
 # nothing on Maze (empty presets) except print two misleading warnings.
-rebuild_ukis
+# Not fatal by itself (set -e would stop here, before re-signing): a stale UKI
+# is exactly what verify_boot_chain below reports as "DO NOT REBOOT".
+rebuild_ukis || warn "some boot images were not rebuilt — the boot chain check below decides"
 
 # What the signature check below actually established. Three states, because
 # "could not look" must never be reported as "signed" — the final message at

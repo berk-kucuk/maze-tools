@@ -14,9 +14,12 @@
 set -u
 
 # Only one run at a time — a double press must not interleave two wipes.
-LOCK="${XDG_RUNTIME_DIR:-/tmp}/maze-panic.lock"
-if command -v flock >/dev/null 2>&1; then
-    exec 9>"$LOCK" && flock -n 9 || exit 0
+# Per user: a shared /tmp lock that another account created (or never
+# released) used to make `exec 9>` fail and the panic button silently do
+# nothing. A lock that cannot be opened now just means "run without one".
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/maze-panic-$(id -u).lock"
+if command -v flock >/dev/null 2>&1 && { command exec 9>"$LOCK"; } 2>/dev/null; then
+    flock -n 9 || exit 0
 fi
 
 # --- 1) Cut the network from the user side --------------------------------
