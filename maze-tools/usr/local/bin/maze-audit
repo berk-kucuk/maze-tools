@@ -900,7 +900,8 @@ for d in /usr/share/plasma/look-and-feel/com.mazelinux.oled /usr/share/plasma/lo
     [[ -e "$d" ]] && pass "$(basename "$d")" || warn "missing: $d"
 done
 _wc="$(ls -d /usr/share/wallpapers/Maze* 2>/dev/null | wc -l)"; info "Maze wallpaper packages: ${_wc}"
-grep -q '<default>Maze</default>' /usr/share/plasma/wallpapers/org.kde.image/contents/config/main.xml 2>/dev/null && pass "org.kde.image default wallpaper = Maze" || warn "org.kde.image default wallpaper not patched to Maze"
+_dw="$(grep -oE '<default>Maze(-[A-Za-z0-9]+)?</default>' /usr/share/plasma/wallpapers/org.kde.image/contents/config/main.xml 2>/dev/null | head -1 | sed -E 's#</?default>##g')"
+[[ -n "${_dw}" ]] && pass "org.kde.image default wallpaper = ${_dw}" || warn "org.kde.image default wallpaper not patched to Maze"
 grep -qsE '^Image=Maze-Dust$' /usr/share/plasma/look-and-feel/org.kde.breeze.desktop/contents/defaults && pass "breeze L&F defaults Image=Maze-Dust" || info "breeze look-and-feel defaults not patched"
 for b in maze-doctor maze-control-center maze-hardware maze-killswitch maze-guardd maze-guardctl maze-panic maze-panic-restore maze-kernel maze-kernel-helper maze-sentinel maze-welcome maze-gpu-driver maze-flatpak-setup maze-enable-blackarch maze-install-vmware maze-power-saver maze-primary-screen maze-apply-wallpaper mazelinux; do
     [[ -x "/usr/local/bin/$b" ]] || fail "/usr/local/bin/$b missing or not executable"
