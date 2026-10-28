@@ -3,7 +3,7 @@
 
 One window with kernel/hardware-level kill switches for the camera, microphone,
 Bluetooth, Wi-Fi and USB. Reads/flips state with the unprivileged maze-killswitch,
-which forwards to the maze-guardd broker over its maze-group socket — no pkexec /
+which forwards to the maze-switchd broker over its maze-group socket — no pkexec /
 setuid in the path.
 
 Every call runs asynchronously (QProcess): a USB policy change or a slow
@@ -66,7 +66,7 @@ DEVICES = (
      "USBGuard blocks NEW devices (current ones keep working)."),
 )
 
-# maze-guardd error codes -> what the user should read.
+# maze-switchd error codes -> what the user should read.
 ERRORS = {
     "camera-in-use": "The camera is in use by an app. Close it and try again.",
     "usb-unavailable": "USBGuard is not installed, so USB cannot be locked.",
@@ -88,9 +88,9 @@ def _explain(reply: str) -> str:
     if code.endswith("-not-applied"):
         return tr("The change did not take effect — the device is unchanged.")
     if not reply:
-        return tr("maze-guardd is not running. Start it with: "
-                  "sudo systemctl enable --now maze-guardd")
-    return tr("Unexpected answer from maze-guardd: {r}").format(r=reply)
+        return tr("maze-switchd is not running. Start it with: "
+                  "sudo systemctl enable --now maze-switchd")
+    return tr("Unexpected answer from maze-switchd: {r}").format(r=reply)
 
 
 def _state_of(state: str) -> tuple[str, QColor]:
@@ -466,7 +466,7 @@ class Hardware(QWidget):
         present = [s for s in states if s in ("on", "off")]
         blocked = [s for s in present if s == "off"]
         if not self._reachable:
-            head, dot = tr("Unknown — maze-guardd is not answering"), QColor(ui.UNK_GRAY)
+            head, dot = tr("Unknown — maze-switchd is not answering"), QColor(ui.UNK_GRAY)
         elif not blocked:
             head, dot = tr("Everything is allowed"), GREEN
         elif len(blocked) == len(present):

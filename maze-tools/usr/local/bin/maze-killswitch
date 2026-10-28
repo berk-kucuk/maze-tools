@@ -1,7 +1,7 @@
 #!/bin/sh
 # maze-killswitch — UNPRIVILEGED front-end for the hardware kill switches.
 #
-# All the privileged work now lives in maze-guardd (root daemon, fixed API, no
+# All the privileged work now lives in maze-switchd (root daemon, fixed API, no
 # setuid/pkexec). This is a thin translator kept under the familiar name so the
 # Maze Hardware GUI and the CLI are unchanged:
 #     maze-killswitch status                       -> guard STATUS
@@ -11,13 +11,13 @@ set -u
 
 case "${1:-status}" in
     status)
-        exec maze-guardctl status
+        exec maze-switchctl status
         ;;
     camera|microphone|mic|bluetooth|wifi|usb)
         dev="$1"; [ "$dev" = "mic" ] && dev="microphone"
         act="${2:-status}"
         case "${act}" in
-            on|off) exec maze-guardctl kill "${dev}" "${act}" ;;
+            on|off) exec maze-switchctl kill "${dev}" "${act}" ;;
             *) echo "usage: maze-killswitch ${dev} <on|off>" >&2; exit 2 ;;
         esac
         ;;

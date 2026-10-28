@@ -2,7 +2,7 @@
  * Maze Panic — Plasma 6 system-tray widget.
  *
  * This is a Plasma plasmoid (a widget hosted by plasmashell), NOT a standalone
- * Qt app. All privileged work is done by the maze-guardd daemon; this widget
+ * Qt app. All privileged work is done by the maze-switchd daemon; this widget
  * only launches the unprivileged front-end scripts:
  *   * maze-panic          — wipe traces, cut network, lock
  *   * maze-panic-restore  — bring the network back (undo the reversible part)
@@ -30,7 +30,7 @@ PlasmoidItem {
     toolTipMainText: i18n("Maze Panic")
     toolTipSubText: i18n("Wipe traces, cut network and lock — or restore the network")
 
-    // Run the unprivileged front-end scripts (they talk to maze-guardd).
+    // Run the unprivileged front-end scripts (they talk to maze-switchd).
     Plasma5Support.DataSource {
         id: executable
         engine: "executable"

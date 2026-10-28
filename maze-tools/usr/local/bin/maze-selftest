@@ -404,21 +404,21 @@ if need maze-tools 1.1.0-43; then
     file_has "${B}/maze-gpu-driver" "kernel-default" "GPU driver check respects a pinned default kernel"
     if [[ -r "${B}/maze-audit" ]] && ! grep -q 'said360' "${B}/maze-audit"; then pass "maze-audit no longer expects said360"
     else fail "maze-audit still lists said360"; fi
-    # maze-guardd: the panic/kill-switch socket must only obey a user sitting
+    # maze-switchd: the panic/kill-switch socket must only obey a user sitting
     # at this machine — not an SSH login or a background process.
-    GUARDD="${B}/maze-guardd"
-    if [[ -r "${GUARDD}" ]]; then
-        py_check "${SYS_PY}" GUARDD="${GUARDD}" REAL_UID="${REAL_UID}" <<'PY'
+    SWITCHD="${B}/maze-switchd"
+    if [[ -r "${SWITCHD}" ]]; then
+        py_check "${SYS_PY}" SWITCHD="${SWITCHD}" REAL_UID="${REAL_UID}" <<'PY'
 import importlib.machinery, importlib.util, os
-path = os.environ["GUARDD"]
-loader = importlib.machinery.SourceFileLoader("maze_guardd", path)
-spec = importlib.util.spec_from_loader("maze_guardd", loader)
+path = os.environ["SWITCHD"]
+loader = importlib.machinery.SourceFileLoader("maze_switchd", path)
+spec = importlib.util.spec_from_loader("maze_switchd", loader)
 m = importlib.util.module_from_spec(spec)
 loader.exec_module(m)          # definitions only; the daemon starts under __main__
 if not hasattr(m, "_has_local_active_session"):
-    print("FAIL maze-guardd has no local-session check")
+    print("FAIL maze-switchd has no local-session check")
 else:
-    print("OK maze-guardd requires a local, active session")
+    print("OK maze-switchd requires a local, active session")
     print(("OK" if not m._authorized(0) else "FAIL") + " root (uid 0) is refused by the guard socket")
     print(("OK" if not m._authorized(65534) else "FAIL") + " nobody (uid 65534) is refused by the guard socket")
     uid = int(os.environ["REAL_UID"])
@@ -428,7 +428,7 @@ else:
         print(f"INFO user uid {uid}: {where} -> panic button {'works' if ok else 'refused'}")
 PY
     else
-        fail "${GUARDD} is missing"
+        fail "${SWITCHD} is missing"
     fi
 fi
 

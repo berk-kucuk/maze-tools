@@ -513,7 +513,7 @@ section "Maze tooling"
 
 missing_tools=""
 for t in mazelinux maze-welcome maze-control-center maze-kernel maze-kernel-helper \
-         maze-hardware maze-gpu-driver maze-guardctl maze-guardd maze-sentinel \
+         maze-hardware maze-gpu-driver maze-switchctl maze-switchd maze-sentinel \
          maze-panic maze-killswitch maze-flatpak-setup maze-apply-wallpaper \
          maze-audit maze-exercise; do
     [ -x "/usr/local/bin/$t" ] || missing_tools="$missing_tools $t"
@@ -797,7 +797,7 @@ state="$(systemctl is-system-running 2>/dev/null)"
 [ "$state" = "running" ] && ok "systemd state: running" || warn "systemd state: $state"
 
 for u in maze-sb-resign.path maze-boot-guard.path maze-boot-check.timer \
-         snapper-cleanup.timer maze-guardd.service; do
+         snapper-cleanup.timer maze-switchd.service; do
     systemctl list-unit-files "$u" >/dev/null 2>&1 || continue
     en="$(systemctl is-enabled "$u" 2>/dev/null)"
     ac="$(systemctl is-active "$u" 2>/dev/null)"

@@ -2,7 +2,7 @@
 # maze-panic — Maze Panic mode (user-facing trigger).
 #
 # Bound to Ctrl+Alt+P and to the panic tray icon. Cuts networking, locks the
-# session, asks the maze-guardd broker (via the unprivileged maze-guardctl
+# session, asks the maze-switchd broker (via the unprivileged maze-switchctl
 # client — no pkexec/setuid) to do the system-level wipe, then clears the
 # CURRENT user's traces. NON-DESTRUCTIVE: it clears history/traces and cuts the
 # net — it does NOT delete user data or break the system. maze-panic-restore
@@ -33,10 +33,10 @@ loginctl lock-session 2>/dev/null \
     || true
 
 # --- 3) System-level wipe (radios, journal, logs, caches) -----------------
-# Ask the privileged broker (maze-guardd) to do the root-only part. NO pkexec /
-# setuid in the path: maze-guardctl is unprivileged and can only send the fixed
+# Ask the privileged broker (maze-switchd) to do the root-only part. NO pkexec /
+# setuid in the path: maze-switchctl is unprivileged and can only send the fixed
 # "panic" verb to the maze-group daemon socket.
-maze-guardctl panic >/dev/null 2>&1
+maze-switchctl panic >/dev/null 2>&1
 sys_ok=$?
 
 # --- 4) This user's shell / tool history files ----------------------------
@@ -62,7 +62,7 @@ qdbus6 org.kde.klipper /klipper clearClipboardHistory >/dev/null 2>&1 \
 command -v wl-copy >/dev/null 2>&1 && wl-copy --clear >/dev/null 2>&1
 
 # --- 6) Tell the user what ACTUALLY happened --------------------------------
-# This used to announce "logs wiped" unconditionally, even when maze-guardd was
+# This used to announce "logs wiped" unconditionally, even when maze-switchd was
 # down or refused the request and nothing system-side had been touched.
 if [ "$sys_ok" -eq 0 ] && [ "$net_ok" -eq 0 ]; then
     notify-send -a "Maze Panic" -u critical -i security-high \
@@ -72,7 +72,7 @@ if [ "$sys_ok" -eq 0 ] && [ "$net_ok" -eq 0 ]; then
 else
     msg=""
     [ "$net_ok" -ne 0 ] && msg="NetworkManager did not turn networking off. "
-    [ "$sys_ok" -ne 0 ] && msg="${msg}maze-guardd did not respond: Wi-Fi was NOT blocked and system logs were NOT wiped. "
+    [ "$sys_ok" -ne 0 ] && msg="${msg}maze-switchd did not respond: Wi-Fi was NOT blocked and system logs were NOT wiped. "
     notify-send -a "Maze Panic" -u critical -i dialog-warning \
         "Panic mode only partly ran" \
         "${msg}Your history and clipboard were cleared and the session is locked." \

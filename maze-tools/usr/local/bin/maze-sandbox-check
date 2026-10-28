@@ -3,7 +3,7 @@
 # maze-sandbox-check — prove that the sandboxed Maze services can still do
 # their jobs.
 #
-# Maze's root daemons (maze-guard, maze-cloak, maze-guardd, maze-sentinel,
+# Maze's root daemons (maze-guard, maze-cloak, maze-switchd, maze-sentinel,
 # entropy-shield) run under systemd sandboxing: no module loading where it is
 # not needed, a syscall allow-list, no new namespaces, private /tmp, and so on.
 # A directive that is one step too strict does not crash anything — it makes
@@ -130,7 +130,7 @@ if unit maze-cloak.service; then
     probe "manage a systemd unit over D-Bus (signal 0, no effect)" "${MANAGE_UNIT[@]}"
 fi
 
-if unit maze-guardd.service; then
+if unit maze-switchd.service; then
     probe "radio kill switches (rfkill)" rfkill list
     probe "microphone mixer (ALSA)" amixer -c 0 scontrols
     probe "write /etc/modprobe.d (camera kill switch)" bash -c 'f=/etc/modprobe.d/.maze-sandbox-probe; : > "$f" && rm -f "$f"'

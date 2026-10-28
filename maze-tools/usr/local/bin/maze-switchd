@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""maze-guardd — Maze Linux privileged-action broker (root daemon).
+"""maze-switchd — Maze Linux privileged-action broker (root daemon).
 
 WHY A DAEMON (not passwordless pkexec): a passwordless polkit rule on a root
 script is a broad privilege-escalation surface — it leans on setuid pkexec (the
@@ -16,6 +16,10 @@ daemon instead exposes a NARROW, FIXED api over a root:maze 0660 Unix socket:
     not root, not remote/SSH, not a background/lingering user.
 
 Verbs:  PANIC | RESTORE | KILL <device> <on|off> | STATUS | PING
+
+Named maze-guardd (socket /run/maze/guard.sock) until maze-tools 2.2.0. That
+read as part of Maze Guard, a separate package with its own daemon
+(maze-guard.service, /run/maze/maze.sock); the two only share /run/maze.
 """
 import grp
 import os
@@ -27,7 +31,7 @@ import subprocess
 import sys
 import threading
 
-SOCK = "/run/maze/guard.sock"
+SOCK = "/run/maze/switch.sock"
 DEVICES = ("camera", "microphone", "bluetooth", "wifi", "usb")
 CAM_BL = "/etc/modprobe.d/maze-killswitch-camera.conf"
 CAM_MODS = ("uvcvideo", "gspca_main")
@@ -550,7 +554,7 @@ def _handle(conn):
             conn.sendall(b"ERR internal\n")
         except OSError:
             pass
-        sys.stderr.write(f"maze-guardd: {exc}\n")
+        sys.stderr.write(f"maze-switchd: {exc}\n")
     finally:
         conn.close()
 
@@ -591,7 +595,7 @@ def main():
             pass
     os.chmod(SOCK, 0o660)
     srv.listen(8)
-    sys.stderr.write("maze-guardd: listening on " + SOCK + "\n")
+    sys.stderr.write("maze-switchd: listening on " + SOCK + "\n")
     while True:
         try:
             conn, _ = srv.accept()

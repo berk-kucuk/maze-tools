@@ -9,10 +9,10 @@
 # wants symlinks); `systemctl start` is guarded so it is skipped when no live
 # systemd is running (image build).
 
-_units="maze-guardd.service maze-flatpak-setup.service maze-sentinel.service maze-sentinel-setup.service"
+_units="maze-switchd.service maze-flatpak-setup.service maze-sentinel.service maze-sentinel-setup.service"
 
 # Services safe to start immediately on a live install (no network flap).
-_start_now="maze-guardd.service maze-sentinel-setup.service maze-sentinel.service"
+_start_now="maze-switchd.service maze-sentinel-setup.service maze-sentinel.service"
 
 _reload_udev() {
     if command -v udevadm >/dev/null 2>&1; then
@@ -54,6 +54,34 @@ _retire_opensnitch() {
     mkdir -p "${_OPENSNITCH_MARKER%/*}" && : > "$_OPENSNITCH_MARKER"
 }
 
+# maze-guardd became maze-switchd in 2.2.0 (the "guard" name read as part of
+# the unrelated Maze Guard package). pacman has already removed the old unit
+# file, so carry the admin's choice over by hand: the old wants/ symlink means
+# it was enabled, a drop-in directory means it was customised. The old daemon
+# keeps running from its deleted file until stopped, holding guard.sock.
+_migrate_guardd() {
+    _old=maze-guardd.service
+    _new=maze-switchd.service
+    _was_enabled=0
+    if [ -L "/etc/systemd/system/multi-user.target.wants/$_old" ]; then
+        rm -f "/etc/systemd/system/multi-user.target.wants/$_old"
+        _was_enabled=1
+    fi
+    if [ -d "/etc/systemd/system/$_old.d" ] && [ ! -e "/etc/systemd/system/$_new.d" ]; then
+        mv "/etc/systemd/system/$_old.d" "/etc/systemd/system/$_new.d"
+        echo ">> maze-tools: moved your maze-guardd drop-ins to /etc/systemd/system/$_new.d"
+    fi
+    [ "$_was_enabled" -eq 1 ] || return 0
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable "$_new" >/dev/null 2>&1 || true
+    if [ -d /run/systemd/system ]; then
+        systemctl stop "$_old" >/dev/null 2>&1 || true
+        rm -f /run/maze/guard.sock
+        systemctl start "$_new" >/dev/null 2>&1 || true
+    fi
+    echo ">> maze-tools: maze-guardd is now maze-switchd (panic + kill switches; not part of Maze Guard)."
+}
+
 post_install() {
     systemctl daemon-reload >/dev/null 2>&1 || true
     # Honour the shipped preset (90-maze-tools.preset) for our units.
@@ -72,13 +100,14 @@ post_upgrade() {
     # choices across upgrades.
     systemctl daemon-reload >/dev/null 2>&1 || true
     _reload_udev
-    # maze-guardd is a long-running Python process: without a restart it keeps
+    # maze-switchd is a long-running Python process: without a restart it keeps
     # executing the OLD code until the next reboot, so a fixed kill switch or
     # panic would not actually be fixed. try-restart leaves a disabled/stopped
     # daemon alone; the socket is recreated within a second.
     if [ -d /run/systemd/system ]; then
-        systemctl try-restart maze-guardd.service >/dev/null 2>&1 || true
+        systemctl try-restart maze-switchd.service >/dev/null 2>&1 || true
     fi
+    _migrate_guardd
     _retire_opensnitch
 }
 

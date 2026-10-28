@@ -187,7 +187,7 @@ fi
 
 # ============================================================ 2. services ===
 section "2. Service resilience — restart the Maze daemons"
-for u in maze-guardd maze-cloak maze-sentinel; do
+for u in maze-switchd maze-cloak maze-sentinel; do
     systemctl is-active --quiet "$u" || { warn "$u not active before restart"; continue; }
     _t="$(date +%s)"
     if systemctl restart "$u" 2>/dev/null; then
@@ -197,7 +197,7 @@ for u in maze-guardd maze-cloak maze-sentinel; do
     else fail "systemctl restart $u failed"; fi
 done
 sleep 1
-[[ -S /run/maze/guard.sock ]] && pass "guard.sock recreated ($(stat -c '%U:%G %a' /run/maze/guard.sock))" || fail "guard.sock missing after restart"
+[[ -S /run/maze/switch.sock ]] && pass "switch.sock recreated ($(stat -c '%U:%G %a' /run/maze/switch.sock))" || fail "switch.sock missing after restart"
 [[ -S /run/maze/maze.sock ]] && pass "maze.sock present ($(stat -c '%U:%G %a' /run/maze/maze.sock))" || info "maze.sock not present (maze-guard helper not running)"
 [[ -f /run/maze/status/maze-cloak.json ]] && { grep -q '"running": *true' /run/maze/status/maze-cloak.json && pass "maze-cloak republished its status (running)" || warn "maze-cloak status says not running"; } || warn "maze-cloak status file missing after restart"
 for i in /sys/class/net/*; do

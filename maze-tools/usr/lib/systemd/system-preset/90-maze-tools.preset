@@ -5,7 +5,7 @@
 # the box" without asking the user to enable anything.
 #
 
-enable maze-guardd.service
+enable maze-switchd.service
 enable maze-flatpak-setup.service
 enable maze-sentinel.service
 enable maze-sentinel-setup.service

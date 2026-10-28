@@ -14,9 +14,9 @@ systemd units already reference (`/usr/local/{bin,lib}`), so the package is a
 
 | Path | Contents |
 | ---- | -------- |
-| `usr/local/bin/` | CLI/GUI tools — `mazelinux`, `maze-doctor`, `maze-welcome`, `maze-control-center`, `maze-kernel`, `maze-kernel-helper`, `maze-hardware`, `maze-guard`, `maze-guardd`, `maze-sentinel`, `maze-sentinel-setup`, `maze-killswitch`, `maze-panic`, `maze-panic-restore`, `maze-gpu-driver`, `maze-flatpak-setup`, `maze-enable-blackarch`, `maze-apply-wallpaper`, `maze-primary-screen`, `maze-install-vmware`, `maze-power-saver`, `maze-audit`, `maze-exercise`, `maze-selftest`, `maze-sandbox-check` |
+| `usr/local/bin/` | CLI/GUI tools — `mazelinux`, `maze-doctor`, `maze-welcome`, `maze-control-center`, `maze-kernel`, `maze-kernel-helper`, `maze-hardware`, `maze-switchd`, `maze-switchctl`, `maze-sentinel`, `maze-sentinel-setup`, `maze-killswitch`, `maze-panic`, `maze-panic-restore`, `maze-gpu-driver`, `maze-flatpak-setup`, `maze-enable-blackarch`, `maze-apply-wallpaper`, `maze-primary-screen`, `maze-install-vmware`, `maze-power-saver`, `maze-audit`, `maze-exercise`, `maze-selftest`, `maze-sandbox-check` |
 | `usr/local/lib/maze/` | Shared Python libraries — `maze_status.py`, `maze_ui.py`, `maze_i18n.py` |
-| `usr/lib/systemd/system/` | Service units — `maze-guardd`, `maze-sentinel`, `maze-sentinel-setup`, `maze-flatpak-setup`. MAC randomisation is not handled here — it's owned exclusively by `maze-guard`/`maze-guardd`. |
+| `usr/lib/systemd/system/` | Service units — `maze-switchd`, `maze-sentinel`, `maze-sentinel-setup`, `maze-flatpak-setup`. MAC randomisation is not handled here — it's owned exclusively by the separate `maze-guard` package (not `maze-switchd`, which is only the panic/kill-switch broker). |
 | `usr/share/applications/` | Desktop launchers — control center, welcome, kernel switcher, panic, hardware, VMware setup |
 | `usr/share/pixmaps/` | Icons the tools/launchers use |
 
@@ -154,7 +154,7 @@ and the tool files can be removed from `airootfs/` — the package supplies them
 
 - **Ready out of the box.** Because a PKGBUILD may not enable services directly,
   the package ships a systemd preset (`usr/lib/systemd/system-preset/90-maze-tools.preset`)
-  and a `.install` scriptlet. On install they enable `maze-guardd`,
+  and a `.install` scriptlet. On install they enable `maze-switchd`,
   `maze-flatpak-setup`, `maze-sentinel` and `maze-sentinel-setup`,
   and reload udev rules — no user action required. The safe services
   (broker + sentinel) start immediately on a live install. Upgrades reload

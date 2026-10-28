@@ -333,7 +333,7 @@ _TR: dict[str, str] = {
     "Applying…": "Uygulanıyor…",
     "Allowed": "İzinli",
     "Privacy status": "Gizlilik durumu",
-    "Unknown — maze-guardd is not answering": "Bilinmiyor — maze-guardd yanıt vermiyor",
+    "Unknown — maze-switchd is not answering": "Bilinmiyor — maze-switchd yanıt vermiyor",
     "Everything is allowed": "Hepsine izin verildi",
     "Everything is blocked": "Hepsi engellendi",
     "{n} of {total} blocked": "{total} aygıttan {n} tanesi engelli",
@@ -358,12 +358,12 @@ _TR: dict[str, str] = {
     "The broker rejected the request.": "Aracı servis isteği reddetti.",
     "The change did not take effect — the device is unchanged.":
         "Değişiklik uygulanamadı — aygıt olduğu gibi kaldı.",
-    "maze-guardd is not running. Start it with: sudo systemctl enable --now "
-    "maze-guardd":
-        "maze-guardd çalışmıyor. Başlatmak için: sudo systemctl enable --now "
-        "maze-guardd",
-    "Unexpected answer from maze-guardd: {r}":
-        "maze-guardd'den beklenmeyen yanıt: {r}",
+    "maze-switchd is not running. Start it with: sudo systemctl enable --now "
+    "maze-switchd":
+        "maze-switchd çalışmıyor. Başlatmak için: sudo systemctl enable --now "
+        "maze-switchd",
+    "Unexpected answer from maze-switchd: {r}":
+        "maze-switchd'den beklenmeyen yanıt: {r}",
     "Vanilla · Stable": "Standart · Kararlı",
     "Long-Term Support": "Uzun Süreli Destek",
     "Performance · Desktop": "Performans · Masaüstü",

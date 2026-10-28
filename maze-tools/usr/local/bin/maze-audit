@@ -718,7 +718,7 @@ fi
 
 # ============================================================== 9. services =
 section "9. systemd units"
-EXP_ENABLED=(apparmor auditd firewalld tor maze-guardd maze-cloak ollama acpid power-profiles-daemon smartd systemd-oomd
+EXP_ENABLED=(apparmor auditd firewalld tor maze-switchd maze-cloak ollama acpid power-profiles-daemon smartd systemd-oomd
              fwupd-refresh.timer reflector.timer maze-flatpak-setup maze-sentinel maze-sentinel-setup fstrim.timer bluetooth cups clamav-freshclam
              NetworkManager display-manager systemd-resolved systemd-timesyncd
              maze-sb-resign.path maze-sb-resign.service maze-boot-guard.path maze-boot-check.timer
@@ -903,7 +903,7 @@ _wc="$(ls -d /usr/share/wallpapers/Maze* 2>/dev/null | wc -l)"; info "Maze wallp
 _dw="$(grep -oE '<default>Maze(-[A-Za-z0-9]+)?</default>' /usr/share/plasma/wallpapers/org.kde.image/contents/config/main.xml 2>/dev/null | head -1 | sed -E 's#</?default>##g')"
 [[ -n "${_dw}" ]] && pass "org.kde.image default wallpaper = ${_dw}" || warn "org.kde.image default wallpaper not patched to Maze"
 grep -qsE '^Image=Maze-Dust$' /usr/share/plasma/look-and-feel/org.kde.breeze.desktop/contents/defaults && pass "breeze L&F defaults Image=Maze-Dust" || info "breeze look-and-feel defaults not patched"
-for b in maze-doctor maze-control-center maze-hardware maze-killswitch maze-guardd maze-guardctl maze-panic maze-panic-restore maze-kernel maze-kernel-helper maze-sentinel maze-welcome maze-gpu-driver maze-flatpak-setup maze-enable-blackarch maze-install-vmware maze-power-saver maze-primary-screen maze-apply-wallpaper mazelinux; do
+for b in maze-doctor maze-control-center maze-hardware maze-killswitch maze-switchd maze-switchctl maze-panic maze-panic-restore maze-kernel maze-kernel-helper maze-sentinel maze-welcome maze-gpu-driver maze-flatpak-setup maze-enable-blackarch maze-install-vmware maze-power-saver maze-primary-screen maze-apply-wallpaper mazelinux; do
     [[ -x "/usr/local/bin/$b" ]] || fail "/usr/local/bin/$b missing or not executable"
 done
 [[ -x /usr/local/bin/maze-doctor ]] && pass "maze-tools binaries present"
@@ -916,7 +916,7 @@ python3 - <<'PY' 2>/dev/null && pass "python: /usr/local/lib/maze modules parse"
 import ast, glob
 for f in glob.glob('/usr/local/lib/maze/*.py'): ast.parse(open(f).read(), f)
 PY
-for s in /usr/local/bin/maze-guardd /usr/local/bin/maze-doctor /usr/bin/maze-sb-sign /usr/bin/maze-boot-check /usr/bin/maze-boot-entries /usr/bin/maze-snapshots-setup /usr/bin/maze-rollback /usr/local/bin/maze-power-saver /usr/local/bin/maze-gpu-driver /usr/local/bin/maze-kernel-helper; do
+for s in /usr/local/bin/maze-switchd /usr/local/bin/maze-doctor /usr/bin/maze-sb-sign /usr/bin/maze-boot-check /usr/bin/maze-boot-entries /usr/bin/maze-snapshots-setup /usr/bin/maze-rollback /usr/local/bin/maze-power-saver /usr/local/bin/maze-gpu-driver /usr/local/bin/maze-kernel-helper; do
     [[ -f "$s" ]] || continue
     if head -1 "$s" | grep -q python; then python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])" "$s" 2>/dev/null || warn "python syntax error in $s"
     else bash -n "$s" 2>/dev/null && : || { sh -n "$s" 2>/dev/null || warn "shell syntax error in $s"; }; fi
@@ -928,7 +928,7 @@ for app in maze-guard maze-cloak entropy-shield qlam haze hazedrop maze-ai maze-
 done
 for d in /etc/maze-cloak /etc/maze; do [[ -d "$d" ]] && info "$d: $(stat -c '%U:%G %a' "$d")"; done
 [[ -d /etc/maze-cloak ]] && { [[ "$(stat -c %G /etc/maze-cloak)" == "maze" ]] && pass "/etc/maze-cloak group maze (tmpfiles.d applied)" || warn "/etc/maze-cloak group is $(stat -c %G /etc/maze-cloak) — tmpfiles.d ownership not applied"; }
-[[ -S /run/maze/guard.sock ]] && pass "maze-guardd socket /run/maze/guard.sock" || warn "maze-guardd socket missing"
+[[ -S /run/maze/switch.sock ]] && pass "maze-switchd socket /run/maze/switch.sock" || warn "maze-switchd socket missing"
 [[ -S /run/maze/maze.sock ]] && pass "maze-guard helper socket /run/maze/maze.sock" || info "maze-guard helper socket not present (helper not running)"
 ls /run/maze/status/*.json >/dev/null 2>&1 && info "suite status files: $(ls /run/maze/status/ | tr '\n' ' ')" || info "no /run/maze/status/*.json published"
 [[ -d /etc/NetworkManager/conf.d ]] && show "ls /etc/NetworkManager/conf.d/" 6
@@ -1220,9 +1220,9 @@ if pkg_installed usbguard; then
     _rules="$(grep -cvE '^\s*(#|$)' /etc/usbguard/rules.conf 2>/dev/null || echo 0)"
     _ipt="$(grep -E '^ImplicitPolicyTarget' /etc/usbguard/usbguard-daemon.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ')"
     info "usbguard: ${_ue:-absent}, rules.conf lines: ${_rules}, ImplicitPolicyTarget=${_ipt:-?}"
-    if [[ "${_ue}" == "enabled" && "${_rules}" -eq 0 && "${_ipt}" == "block" ]]; then fail "usbguard is enabled with an EMPTY policy and ImplicitPolicyTarget=block — every USB device (keyboard included) gets blocked at next boot" "maze-guardd writes rules.conf from generate-policy before enabling; something enabled it without that. Fix: sudo usbguard generate-policy > /etc/usbguard/rules.conf"
+    if [[ "${_ue}" == "enabled" && "${_rules}" -eq 0 && "${_ipt}" == "block" ]]; then fail "usbguard is enabled with an EMPTY policy and ImplicitPolicyTarget=block — every USB device (keyboard included) gets blocked at next boot" "maze-switchd writes rules.conf from generate-policy before enabling; something enabled it without that. Fix: sudo usbguard generate-policy > /etc/usbguard/rules.conf"
     elif [[ "${_ue}" == "enabled" ]]; then pass "usbguard enabled with ${_rules} rules (kill switch active)"
-    else pass "usbguard off (kill switch not engaged) — policy generated on demand by maze-guardd"; fi
+    else pass "usbguard off (kill switch not engaged) — policy generated on demand by maze-switchd"; fi
 fi
 if pkg_installed firejail; then
     _fc="$(find /usr/local/bin -maxdepth 1 -lname '*firejail*' 2>/dev/null | wc -l)"

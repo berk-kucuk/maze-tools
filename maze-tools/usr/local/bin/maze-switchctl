@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""maze-switchctl — unprivileged client for the maze-switchd privileged broker.
+
+Formerly `maze-guard` (until maze-tools 1.1.0-35, where it shadowed the Maze
+Guard app's /usr/bin/maze-guard in PATH) and then `maze-guardctl` (until 2.2.0).
+Renamed with its daemon (maze-guardd -> maze-switchd) because the "guard" name
+kept suggesting a part of Maze Guard, which is an unrelated package with its own
+daemon (maze-guard.service, /run/maze/maze.sock).
+
+Sends ONE fixed verb to /run/maze/switch.sock and prints the reply. Holds no
+privilege itself; all it can do is ask the daemon to run one of its whitelisted
+actions. Usage:
+    maze-switchctl panic
+    maze-switchctl restore
+    maze-switchctl kill <camera|microphone|bluetooth|wifi|usb> <on|off>
+    maze-switchctl status
+Exit code 0 on an "OK ..." reply, 1 otherwise.
+"""
+import socket
+import sys
+
+SOCK = "/run/maze/switch.sock"
+
+
+def main(argv):
+    if not argv:
+        sys.stderr.write("usage: maze-switchctl <panic|restore|kill <dev> <on|off>|status>\n")
+        return 2
+    msg = " ".join(argv)
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(65)
+        s.connect(SOCK)
+        s.sendall((msg + "\n").encode())
+        reply = s.recv(512).decode("utf-8", "replace").strip()
+        s.close()
+    except Exception as exc:
+        sys.stderr.write(f"maze-switchctl: cannot reach maze-switchd ({exc})\n")
+        return 1
+    print(reply)
+    return 0 if reply.startswith("OK") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
