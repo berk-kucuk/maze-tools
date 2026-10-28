@@ -104,8 +104,11 @@ post_upgrade() {
     # executing the OLD code until the next reboot, so a fixed kill switch or
     # panic would not actually be fixed. try-restart leaves a disabled/stopped
     # daemon alone; the socket is recreated within a second.
+    # maze-sentinel is a long-running bash loop for the same reason: a fix to
+    # what it alerts on would otherwise wait for the next boot.
     if [ -d /run/systemd/system ]; then
         systemctl try-restart maze-switchd.service >/dev/null 2>&1 || true
+        systemctl try-restart maze-sentinel.service >/dev/null 2>&1 || true
     fi
     _migrate_guardd
     _retire_opensnitch

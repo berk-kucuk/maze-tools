@@ -21,6 +21,20 @@
 # a light periodic scan. Changes made by the package manager you ran
 # (pacman/paru/makepkg) are treated as expected and only logged, not alerted.
 #
+# What is NOT alerted, and why (2.2.1) — each of these was a real notification
+# on a real machine, and a monitor that cries wolf gets ignored:
+#   * an event whose file names are all outside the watched files. On btrfs,
+#     audit matches a watch by inode number, and every subvolume shares the
+#     superblock, so Firefox writing in /home tripped "SSH server settings
+#     changed". The PATH records say which file it really was;
+#   * a write that did not happen because the file was not there (exit=-2):
+#     `rm -f` of a missing sudoers.d entry is not a sudo change. A write that
+#     was REFUSED (permission) is still reported, as an attempt;
+#   * account and sshd changes while pacman is installing something: package
+#     scriptlets run usermod/useradd (entropy-shield adds its group on every
+#     upgrade). sudoers and authorized_keys changes are still alerted then —
+#     a package touching those is rare and worth a look.
+#
 set -uo pipefail
 
 AUDIT_LOG="/var/log/audit/audit.log"
@@ -38,8 +52,7 @@ SUID_SCAN_DIRS="/usr/bin /usr/local/bin /usr/sbin /bin /sbin"
 # shellcheck source=/dev/null
 [[ -r "${CONF}" ]] && . "${CONF}"
 
-mkdir -p "${TRIGGER_DIR}" "${STATE_DIR}" 2>/dev/null || true
-touch "${ALERT_LOG}" 2>/dev/null || true
+PACMAN_LOCK="/var/lib/pacman/db.lck"
 
 log() {
     printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${ALERT_LOG}" 2>/dev/null || true
@@ -108,19 +121,107 @@ benign_writer() {
     pacman -Qqo "${exe}" >/dev/null 2>&1
 }
 
-# React to a file-change audit SYSCALL record for one of our watched keys.
+# pacman is in the middle of a transaction. Both, not either: the lock alone
+# can be stale after a crash, a process merely named pacman is anyone's. Only
+# root can create the lock — and root could stop this daemon outright.
+pacman_transaction() {
+    [[ -e "${PACMAN_LOCK}" ]] && pgrep -x pacman >/dev/null 2>&1
+}
+
+# Is <path> one of the files watched under <key>? Prefixes, so the temporary
+# and backup names the tools write and rename (passwd+, shadow-, .lock,
+# sudoers.d/<file>, sshd_config.d/<file>) count as the file they replace.
+path_is_watched() {
+    local key="$1" path="$2"
+    case "${key}" in
+        identity)          case "${path}" in /etc/passwd*|/etc/group*|/etc/shadow*|/etc/gshadow*) return 0 ;; esac ;;
+        sudoers)           case "${path}" in /etc/sudoers*) return 0 ;; esac ;;
+        maze_sshd)         case "${path}" in /etc/ssh/sshd_config*) return 0 ;; esac ;;
+        maze_ssh_authkeys) case "${path}" in */.ssh/authorized_keys*) return 0 ;; esac ;;
+    esac
+    return 1
+}
+
+# A quoted, hex-encoded (audit's form for names with spaces or odd bytes) or
+# absent value of field <name> in an audit record.
+audit_field() {
+    local name="$1" rec="$2" v
+    [[ "${rec}" == *" ${name}="* ]] || return 0
+    v="${rec#* "${name}"=}"
+    if [[ "${v}" == \"* ]]; then
+        v="${v#\"}"; printf '%s' "${v%%\"*}"
+    else
+        v="${v%% *}"; v="${v%%$'\x1d'*}"
+        [[ "${v}" =~ ^([0-9A-Fa-f]{2})+$ ]] || return 0
+        printf '%b' "$(sed 's/../\\x&/g' <<<"${v}")"
+    fi
+}
+
+# Which file the event was about, from its PATH records. Prints "watched",
+# "elsewhere" (names present, none of them ours) or "unknown" (no names —
+# an fd-based call): only "elsewhere" is a reason to stay quiet.
+event_target() {
+    local key="$1" cwd="$2" name seen=0
+    shift 2
+    for name in "$@"; do
+        [[ -n "${name}" ]] || continue
+        seen=1
+        [[ "${name}" == /* ]] || name="${cwd%/}/${name}"
+        if path_is_watched "${key}" "${name}"; then
+            echo watched; return
+        fi
+    done
+    (( seen )) && echo elsewhere || echo unknown
+}
+
+# React to a file-change audit event for one of our watched keys: the SYSCALL
+# record, then the working directory and file names of its CWD/PATH records.
 react_audit() {
-    local raw="$1" key="$2"
-    local exe comm uid user prog
+    local raw="$1" key="$2" cwd="${3:-}"
+    shift 3 2>/dev/null || shift $#
+    local exe comm uid user prog success code target
     exe="$(sed -n 's/.* exe="\([^"]*\)".*/\1/p'   <<<"${raw}")"
     comm="$(sed -n 's/.* comm="\([^"]*\)".*/\1/p' <<<"${raw}")"
     uid="$(sed -n 's/.* uid=\([0-9]*\).*/\1/p'    <<<"${raw}" | head -1)"
+    success="$(sed -n 's/.* success=\([a-z]*\).*/\1/p' <<<"${raw}")"
+    code="$(sed -n 's/.* exit=\(-\{0,1\}[0-9]*\).*/\1/p' <<<"${raw}")"
     user="$(id -nu "${uid}" 2>/dev/null || echo "uid ${uid:-?}")"
     prog="${exe##*/}"; [[ -n "${prog}" ]] || prog="${comm:-a program}"
+
+    # Not one of our files at all — an inode-number twin on another btrfs
+    # subvolume. Logged with the names, so the claim can be checked.
+    target="$(event_target "${key}" "${cwd}" "$@")"
+    if [[ "${target}" == elsewhere ]]; then
+        log "ignored [${key}] by ${prog} (${user}): not a watched file ($*)"
+        return 0
+    fi
 
     # Expected admin tooling (you ran it)? Log, do not alert.
     if benign_writer "${exe}" "${comm}"; then
         log "expected change [${key}] by ${exe} (${user}) — no alert"
+        return 0
+    fi
+
+    # Nothing was there to change.
+    if [[ "${success}" == no && "${code}" == -2 ]]; then
+        log "no change [${key}] by ${prog} (${user}): file did not exist"
+        return 0
+    fi
+
+    # A package scriptlet adding its group or user.
+    if [[ "${key}" == identity || "${key}" == maze_sshd ]] && pacman_transaction; then
+        log "package transaction [${key}] by ${prog} (${user}) — no alert"
+        return 0
+    fi
+
+    # Refused by the kernel: nothing changed, but something tried.
+    if [[ "${success}" == no ]]; then
+        debounced "${key}-refused" && return 0
+        log "REFUSED [${key}] by ${prog} (uid ${uid:-?}/${user}) exit=${code} :: ${raw}"
+        record_trigger "${key}-refused" "${prog}/${user}"
+        notify_all "Maze Sentinel: a protected file could not be changed" \
+            "“${prog}”, running as ${user}, tried to change a protected system file (${key}) and was refused. Nothing was changed. If you do not recognise that program, investigate: sudo tail /var/log/maze-sentinel.log" \
+            "normal"
         return 0
     fi
 
@@ -211,25 +312,85 @@ baseline_loop() {
     done
 }
 
-# Wait for the audit log to appear (auditd may start just after us).
-for _ in $(seq 1 30); do [[ -e "${AUDIT_LOG}" ]] && break; sleep 2; done
+# ---- assembling one audit event from its records ---------------------------
+# An event is a SYSCALL record (exe, uid, key), then CWD and PATH records with
+# the same msg=audit(<time>:<serial>) id, ending with PROCTITLE. Other events'
+# records can interleave; they are skipped. The event is judged when it ends —
+# or when the next keyed SYSCALL arrives, too many foreign lines go by, or the
+# log goes quiet — so a record lost along the way never loses the alert.
+EV_ID="" EV_KEY="" EV_RAW="" EV_CWD="" EV_SKIP=0
+EV_PATHS=()
 
-# Start the periodic SUID/account scanner in the background.
-baseline_loop &
+event_id() {
+    local id="${1#*msg=audit(}"
+    printf '%s' "${id%%)*}"
+}
 
-log "Maze Sentinel started (account/sudo/ssh change watch + SUID/root-account scan)"
-[[ -e "${AUDIT_LOG}" ]] || echo "maze-sentinel: no audit log; is auditd running?" >&2
+finish_event() {
+    [[ -n "${EV_ID}" ]] || return 0
+    react_audit "${EV_RAW}" "${EV_KEY}" "${EV_CWD}" "${EV_PATHS[@]}"
+    EV_ID="" EV_KEY="" EV_RAW="" EV_CWD="" EV_SKIP=0
+    EV_PATHS=()
+}
 
-# React to auditd events for our security-relevant keys. Only SYSCALL records
-# carry exe/comm/uid; classify by the audit key (the watched file's category).
-tail -Fn0 "${AUDIT_LOG}" 2>/dev/null | while IFS= read -r line; do
+handle_line() {
+    local line="$1" key=""
+    if [[ "${line}" == type=SYSCALL* ]]; then
+        case "${line}" in
+            *'key="identity"'*)          key=identity ;;
+            *'key="sudoers"'*)           key=sudoers ;;
+            *'key="maze_ssh_authkeys"'*) key=maze_ssh_authkeys ;;
+            *'key="maze_sshd"'*)         key=maze_sshd ;;
+        esac
+        if [[ -n "${key}" ]]; then
+            finish_event
+            EV_ID="$(event_id "${line}")" EV_KEY="${key}" EV_RAW="${line}"
+            return 0
+        fi
+    fi
+    [[ -n "${EV_ID}" ]] || return 0
+    if [[ "$(event_id "${line}")" != "${EV_ID}" ]]; then
+        (( ++EV_SKIP > 200 )) && finish_event
+        return 0
+    fi
     case "${line}" in
-        *type=SYSCALL*)
-            case "${line}" in
-                *'key="identity"'*)          react_audit "${line}" identity ;;
-                *'key="sudoers"'*)           react_audit "${line}" sudoers ;;
-                *'key="maze_ssh_authkeys"'*) react_audit "${line}" maze_ssh_authkeys ;;
-                *'key="maze_sshd"'*)         react_audit "${line}" maze_sshd ;;
-            esac ;;
+        type=CWD*)                  EV_CWD="$(audit_field cwd "${line}")" ;;
+        type=PATH*)                 EV_PATHS+=("$(audit_field name "${line}")") ;;
+        type=PROCTITLE*|type=EOE*)  finish_event ;;
     esac
-done
+}
+
+main() {
+    mkdir -p "${TRIGGER_DIR}" "${STATE_DIR}" 2>/dev/null || true
+    # Root only: the log holds raw audit records — who changed what, with
+    # which program. It was created 0644 by a bare touch before 2.2.1.
+    ( umask 077; touch "${ALERT_LOG}" ) 2>/dev/null || true
+    chmod 0600 "${ALERT_LOG}" 2>/dev/null || true
+
+    # Wait for the audit log to appear (auditd may start just after us).
+    for _ in $(seq 1 30); do [[ -e "${AUDIT_LOG}" ]] && break; sleep 2; done
+
+    # Start the periodic SUID/account scanner in the background.
+    baseline_loop &
+
+    log "Maze Sentinel started (account/sudo/ssh change watch + SUID/root-account scan)"
+    [[ -e "${AUDIT_LOG}" ]] || echo "maze-sentinel: no audit log; is auditd running?" >&2
+
+    # React to auditd events for our security-relevant keys. A read timeout
+    # judges a pending event when the log goes quiet after it.
+    local line rc
+    tail -Fn0 "${AUDIT_LOG}" 2>/dev/null | while true; do
+        if IFS= read -r -t 2 line; then
+            handle_line "${line}"
+        else
+            rc=$?
+            (( rc > 128 )) || break   # EOF: tail went away
+            finish_event
+        fi
+    done
+}
+
+# Sourced (maze-selftest) -> functions only; executed -> run.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main
+fi

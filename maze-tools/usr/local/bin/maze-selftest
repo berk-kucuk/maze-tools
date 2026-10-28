@@ -396,6 +396,14 @@ if need maze-tools 1.1.0-43; then
     fi
     file_has "${B}/maze-sentinel" "benign_writer() {" "sentinel only trusts known writers that pacman owns"
     file_has "${B}/maze-sentinel" "authorized-keys.list" "sentinel watches SSH authorized_keys"
+    # btrfs inode twins: Firefox writing in /home raised "SSH server settings
+    # changed". Sourced, the sentinel defines its functions and runs nothing.
+    if [[ -r "${B}/maze-sentinel" ]]; then
+        _st="$(bash -c 'source "$1"; event_target maze_sshd /home/u /home/u/.mozilla/x; event_target identity /etc passwd; event_target maze_sshd / ""' _ "${B}/maze-sentinel" 2>/dev/null | tr '\n' ' ')"
+        if [[ "${_st}" == "elsewhere watched unknown " ]]; then pass "sentinel tells a watched file from an inode twin, and alerts when it cannot tell"
+        else fail "sentinel's file-name check is wrong (got: ${_st:-nothing})" "expected: elsewhere watched unknown"; fi
+    fi
+    file_has "${B}/maze-sentinel" "pacman_transaction()" "sentinel does not alert on account changes made by package scriptlets"
     if [[ -z "${PKGROOT}" && "${IS_ROOT}" -eq 1 ]]; then
         if [[ -f /var/lib/maze/sentinel/authorized-keys.list ]]; then pass "sentinel has an authorized_keys baseline"
         else info "no authorized_keys baseline yet (created on the sentinel's next baseline run)"; fi
