@@ -554,9 +554,25 @@ for g in ${_maze_groups}; do getent group "$g" >/dev/null && pass "group $g exis
 while IFS=: read -r u _ uid _ _ home shell; do
     [[ "${uid}" -ge 1000 && "${uid}" -lt 65000 ]] || continue
     printf '  %s-- user %s (uid %s, home %s)%s\n' "${C_BOLD}" "$u" "$uid" "$home" "${C_0}"
+    # Maze Ghost's guest account is not a desktop user: no groups, and its home
+    # is a tmpfs that exists only during a session. Between sessions the mount
+    # point stays root:root 0700 on purpose, so Ghost cannot swap it for a
+    # symlink before root mounts there (audit GH1).
+    if [[ "${u}" == "ghost" ]] && pkg_installed maze-ghost; then
+        _gr="$(id -nG "$u")"
+        grep -qw wheel <<<"${_gr}" && fail "the Ghost guest is in group wheel (it must never get sudo)" || pass "Ghost guest is not in wheel"
+        if mountpoint -q "${home}"; then
+            [[ "$(stat -c %u "${home}")" == "${uid}" ]] && pass "Ghost session active: home is its tmpfs, owned by ghost" || fail "Ghost session home not owned by ghost"
+        else
+            [[ "$(stat -c '%u:%g %a' "${home}" 2>/dev/null)" == "0:0 700" ]] \
+                && pass "no Ghost session: ${home} is the root-owned 0700 mount point" \
+                || fail "${home} between sessions is $(stat -c '%U:%G %a' "${home}" 2>/dev/null || echo missing) — expected root:root 700"
+        fi
+        continue
+    fi
     [[ "${shell}" == "/usr/bin/zsh" ]] && pass "shell zsh" || warn "shell is ${shell} (deploy sets zsh)"
     _gr="$(id -nG "$u")"
-    for g in wheel maze ${_maze_groups}; do grep -qw "$g" <<<"${_gr}" && pass "member of ${g}" || warn "not in group ${g}"; done
+    for g in $(printf '%s\n' wheel maze ${_maze_groups} | sort -u); do grep -qw "$g" <<<"${_gr}" && pass "member of ${g}" || warn "not in group ${g}"; done
     for g in libvirt kvm wireshark; do getent group "$g" >/dev/null && { grep -qw "$g" <<<"${_gr}" || info "not in optional group ${g}"; }; done
     [[ -d "${home}" ]] || { fail "home ${home} missing"; continue; }
     m="$(stat -c %a "${home}")"; [[ "$m" == "700" ]] && pass "home mode 700" || warn "home mode ${m} (deploy sets 700)"
@@ -638,15 +654,27 @@ fi
 # pacman database sanity
 _orph="$(pacman -Qdtq 2>/dev/null | tr '\n' ' ')"; [[ -n "${_orph}" ]] && info "orphans (pacman -Qdt): ${_orph}" || pass "no orphaned packages"
 _dbg="$(pacman -Qq 2>/dev/null | grep -- '-debug$' | tr '\n' ' ')"; [[ -n "${_dbg}" ]] && info "debug packages installed: ${_dbg}"
-_dk="$(pacman -Dk 2>&1 | grep -v '^$')"
-if [[ -z "${_dk}" ]]; then pass "pacman -Dk: local database consistent"
+# The exit status decides, not the output: on a clean database pacman -Dk still
+# prints "No database errors have been found!" (translated under a non-English
+# locale), which used to be reported as a problem. LC_ALL=C keeps the
+# plasma-welcome match below working on any locale.
+_dk="$(LC_ALL=C pacman -Dk 2>&1)"; _dk_rc=$?
+_dk="$(grep -v '^$' <<<"${_dk}")"
+if [[ "${_dk_rc}" -eq 0 ]]; then pass "pacman -Dk: local database consistent"
 elif [[ "$(grep -vc "plasma-welcome" <<<"${_dk}")" -eq 0 ]]; then info "pacman -Dk: only the plasma-meta -> plasma-welcome dependency is broken (deploy removes plasma-welcome with -Rdd on purpose; every 'pacman -S plasma-meta' will want it back)"
 else warn "pacman -Dk reports problems:"; sed 's/^/         | /' <<<"${_dk}" | head -10; fi
 _foreign="$(pacman -Qmq 2>/dev/null | tr '\n' ' ')"; info "foreign packages (pacman -Qm, updated only via paru): ${_foreign:-<none>}"
 # Maze package file integrity
 for p in maze-secureboot maze-snapshots maze-tools maze-branding maze-plasma-config maze-hardening maze-python maze-guard maze-cloak entropy-shield qlam haze hazedrop maze-ai maze-connect shim-signed; do
     pkg_installed "$p" || continue
-    _qk="$(pacman -Qkk "$p" 2>&1 | grep -vE ': [0-9]+ total files, 0 altered files$|^$' | grep -vE '\(Modification time|Size mismatch\)' )"
+    # LC_ALL=C: every filter below matches pacman's English wording.
+    _qk="$(LC_ALL=C pacman -Qkk "$p" 2>&1 | grep -vE ': [0-9]+ total files, 0 altered files$|^$' | grep -vE '\(Modification time|Size mismatch\)' )"
+    # Files in a package's backup=() array are configuration the user is meant
+    # to edit. pacman lists them ("backup file: …") but does not count them as
+    # altered — it reported "0 altered/missing entries" as a WARN. Shown below
+    # as information instead, never hidden.
+    _bk="$(grep '^backup file: ' <<<"${_qk}")"
+    _qk="$(grep -v '^backup file: ' <<<"${_qk}")"
     # maze-cloak ships /etc/maze-cloak{,/config.json} as 0755/0644 root:root and
     # then declares them 0775/0664 root:maze in tmpfiles.d (group-writable so any
     # maze member can save MAC settings). The package cannot carry the maze GID —
@@ -657,6 +685,10 @@ for p in maze-secureboot maze-snapshots maze-tools maze-branding maze-plasma-con
         _alt="$(grep -cE 'altered|missing|Permissions|UID|GID|Symlink' <<<"${_qk}")"
         [[ "$p" == "maze-plasma-config" ]] && info "pacman -Qkk ${p}: ${_alt} altered entries (deploy patches skel with sed — expected)" || warn "pacman -Qkk ${p}: ${_alt} altered/missing entries"
         head -8 <<<"${_qk}" | sed 's/^/         | /'
+    fi
+    if [[ -n "${_bk}" ]]; then
+        info "pacman -Qkk ${p}: $(grep -c . <<<"${_bk}") config file(s) changed locally (backup= files, meant to be edited)"
+        head -4 <<<"${_bk}" | sed 's/^/         | /'
     fi
 done
 # pacman.conf
@@ -707,7 +739,9 @@ if [[ -n "${SRC}" && -d "${SRC}" ]]; then
     # The build-time overlay files that stay on the target. (The rest moved into
     # packages in 2026-09 — maze-hardening, maze-branding, maze-plasma-config,
     # maze-tools, maze-secureboot — where pacman -Qkk checks them.)
-    for f in /etc/pam.d/passwd; do
+    # One file today; a list so the next one is a one-word change.
+    overlay_files=(/etc/pam.d/passwd)
+    for f in "${overlay_files[@]}"; do
         s="${SRC}/MazeLinux/airootfs${f}"
         [[ -f "$s" ]] || continue
         if [[ ! -e "$f" ]]; then warn "airootfs file missing on target: $f"; elif cmp -s "$s" "$f"; then pass "airootfs file identical: $f"; else warn "airootfs file differs from source: $f"; fi
@@ -787,7 +821,8 @@ while IFS= read -r l; do warn "dangling unit symlink: $l"; done < <(find /etc/sy
 # firewalld services
 if systemctl is-active firewalld >/dev/null 2>&1 && has firewall-cmd; then
     _fs="$(firewall-cmd --list-services 2>/dev/null)"; info "firewalld default zone: $(firewall-cmd --get-default-zone 2>/dev/null) services: ${_fs}"
-    for s in maze-connect; do grep -qw "$s" <<<"${_fs}" && pass "firewalld allows $s" || warn "firewalld does not allow $s"; done
+    fw_needed=(maze-connect)
+    for s in "${fw_needed[@]}"; do grep -qw "$s" <<<"${_fs}" && pass "firewalld allows $s" || warn "firewalld does not allow $s"; done
     grep -qw ssh <<<"${_fs}" && info "firewalld allows ssh (deploy adds it, sshd is disabled)"
 fi
 

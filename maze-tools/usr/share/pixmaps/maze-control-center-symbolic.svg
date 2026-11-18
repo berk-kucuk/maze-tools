@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Maze Control Center — three monochrome white slider rails with square
+     knobs. Same house style as maze-kernel / maze-hardware / maze-panic
+     (white line art on transparent, for the dark Maze panel). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+  <g fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round">
+    <path d="M3 5h3.2M10.8 5H19M3 11h8.2M15.8 11H19M3 17h1.2M8.8 17H19"/>
+  </g>
+  <g fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linejoin="round">
+    <rect x="6.2" y="3" width="4" height="4" rx="0.8"/>
+    <rect x="11.2" y="9" width="4" height="4" rx="0.8"/>
+    <rect x="4.2" y="15" width="4" height="4" rx="0.8"/>
+  </g>
+</svg>

@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Maze Control Center</title>
+  <!-- Maze Control Center: open maze frame (Maze family) holding three
+       slider rails laid out like maze corridors. The bright part of each
+       rail is its level; the middle knob is lit, like the lit element in
+       the other Maze apps. -->
+  <defs>
+    <radialGradient id="mcc-glow" cx="580" cy="512" r="320" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.34"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="mcc-lit" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#cfcfd8"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="220" fill="#000"/>
+  <circle cx="580" cy="512" r="320" fill="url(#mcc-glow)"/>
+
+  <!-- frame, open on the right like the other Maze marks -->
+  <path d="M812 300 V212 H212 V812 H812 V724" fill="none" stroke="#f2f2f4" stroke-width="44"
+        stroke-linecap="butt" stroke-linejoin="miter"/>
+
+  <!-- rails: the dim part is headroom -->
+  <g fill="none" stroke="#3c3c42" stroke-width="40" stroke-linecap="butt">
+    <path d="M420 356 H724"/>
+    <path d="M580 512 H724"/>
+    <path d="M480 668 H724"/>
+  </g>
+  <!-- rails: the bright part is the level -->
+  <g fill="none" stroke="#f2f2f4" stroke-width="40" stroke-linecap="butt">
+    <path d="M300 356 H420"/>
+    <path d="M300 512 H580"/>
+    <path d="M300 668 H480"/>
+  </g>
+
+  <!-- knobs, cut out of the rail with a black ring -->
+  <rect x="360" y="296" width="120" height="120" fill="#f2f2f4" stroke="#000" stroke-width="22"/>
+  <rect x="420" y="608" width="120" height="120" fill="#f2f2f4" stroke="#000" stroke-width="22"/>
+  <rect x="512" y="444" width="136" height="136" fill="url(#mcc-lit)" stroke="#000" stroke-width="22"/>
+</svg>

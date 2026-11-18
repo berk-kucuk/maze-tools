@@ -427,11 +427,14 @@ if not hasattr(m, "_has_local_active_session"):
     print("FAIL maze-switchd has no local-session check")
 else:
     print("OK maze-switchd requires a local, active session")
-    print(("OK" if not m._authorized(0) else "FAIL") + " root (uid 0) is refused by the guard socket")
-    print(("OK" if not m._authorized(65534) else "FAIL") + " nobody (uid 65534) is refused by the guard socket")
+    # _authorized judges the CONNECTING process (uid + its pid), not just the uid.
+    me = os.getpid()
+    print(("OK" if not m._authorized(0, me) else "FAIL") + " root (uid 0) is refused by the guard socket")
+    print(("OK" if not m._authorized(65534, me) else "FAIL") + " nobody (uid 65534) is refused by the guard socket")
     uid = int(os.environ["REAL_UID"])
-    if uid >= 1000:
-        ok = m._authorized(uid)
+    if uid >= 1000 and os.getuid() == uid:
+        print(("OK" if not m._authorized(uid, 1) else "FAIL") + " a pid that is not the caller's own is refused")
+        ok = m._authorized(uid, me)
         where = "at this machine's seat" if ok else "not in a local, active session (SSH, or screen locked/switched away)"
         print(f"INFO user uid {uid}: {where} -> panic button {'works' if ok else 'refused'}")
 PY
@@ -533,23 +536,41 @@ if need entropy-shield 4.1.3-3; then
 # module itself pulls in the app's config machinery.
 import ast, os, tempfile
 src = open(os.environ["SRC"]).read()
-fn = next((n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "_public_share_dir"), None)
-if fn is None:
+body = ast.parse(src).body
+fns = {n.name: n for n in body if isinstance(n, ast.FunctionDef)}
+if "_public_share_dir" not in fns:
     print("FAIL onion server has no Public-folder default")
     raise SystemExit
-ns = {"os": os}
-exec(compile(ast.Module([fn], []), "onion_server", "exec"), ns)
+# The helper and the pure functions it calls (e.g. _invoking_uid), nothing else.
+lift = [fns[n] for n in ("_invoking_uid", "_real_user_home", "_public_share_dir") if n in fns]
+import pwd, stat
+ns = {"os": os, "pwd": pwd, "stat": stat}
+exec(compile(ast.Module(lift, []), "onion_server", "exec"), ns)
 f = ns["_public_share_dir"]
+# The helper trusts user-dirs.dirs only when it belongs to the user who asked
+# (SUDO_UID/PKEXEC_UID). Under `sudo maze-selftest` that is the sudo user, and
+# the temp file below is root's — so pin the invoking uid to the file's owner
+# for the "honoured" case, then prove a file owned by someone else is refused.
+for var in ("SUDO_UID", "PKEXEC_UID"):
+    os.environ.pop(var, None)
 with tempfile.TemporaryDirectory() as home:
     print(("OK" if f(home) == os.path.join(home, "Public") else "FAIL") + " default share folder is ~/Public, not the home directory")
     os.makedirs(os.path.join(home, ".config"))
-    with open(os.path.join(home, ".config", "user-dirs.dirs"), "w") as fh:
+    dirs = os.path.join(home, ".config", "user-dirs.dirs")
+    with open(dirs, "w") as fh:
         fh.write('XDG_PUBLICSHARE_DIR="$HOME/Genel"\n')
+    os.environ["SUDO_UID"] = str(os.stat(dirs).st_uid)
     print(("OK" if f(home) == os.path.join(home, "Genel") else "FAIL") + " a localised Public folder (e.g. ~/Genel) is honoured")
+    os.environ["SUDO_UID"] = str(os.stat(dirs).st_uid + 1)
+    print(("OK" if f(home) == os.path.join(home, "Public") else "FAIL") + " a user-dirs.dirs owned by someone else is not trusted")
+    os.environ.pop("SUDO_UID", None)
 print(("OK" if "Refusing to publish" in src else "FAIL") + " publishing the home directory (or anything above it) is refused")
 PY
-    file_has "${ES}/daemon.py" 'if firewall_backend() == "iptables":' \
-        "panic only flushes iptables when Entropy Shield itself uses iptables (Docker/VPN rules survive)"
+    file_has "${ES}/daemon.py" 'purge_iptables_chains()' \
+        "panic removes only Entropy Shield's own iptables chains (Docker/VPN rules survive)"
+    if [[ -r "${ES}/daemon.py" ]] && grep -vE '^[[:space:]]*#' "${ES}/daemon.py" | grep -qE '"iptables", *"-F"|iptables -F'; then
+        fail "Entropy Shield still flushes every iptables rule on panic"
+    fi
     if [[ -z "${PKGROOT}" ]]; then
         cfgf="${REAL_HOME}/.config/entropy-shield/config.json"
         if [[ -r "${cfgf}" ]]; then
@@ -628,20 +649,31 @@ fi
 # =============================================================== 13. haze =====
 section "13. Haze — nickname collisions"
 if need haze 2.12.0-2; then
-    file_has "${P}/opt/haze/haze/network/server.py" "while nick in self._clients or nick == self._host_nick:" \
+    # claim_nick() renames until unique; _used_nicks starts with the host's nick.
+    file_has "${P}/opt/haze/haze/network/server.py" "while nick in self._used_nicks or nick in self._clients:" \
         "a duplicate nickname is renamed until it is unique (no identity takeover)"
+    file_has "${P}/opt/haze/haze/network/server.py" "self._used_nicks: set[str] = {host_nick}" \
+        "nobody can take the host's nickname"
 fi
 
 # =============================================================== 14. Qlam =====
 section "14. Qlam — privilege prompt"
 if need qlam 1.3.0-2; then
-    f="${P}/usr/share/qlam/core/database_manager.py"
-    file_has "${f}" '"/usr/bin/pkexec" if os.access' "database update calls /usr/bin/pkexec by absolute path (no fake pkexec from PATH)"
-    if [[ -r "${f}" ]] && grep -qF 'shutil.which("pkexec")' "${f}"; then fail "Qlam still looks pkexec up in PATH"; fi
+    # Database updates moved into qlamd (qlam-update.service); the Python app
+    # must not look pkexec up in PATH anywhere.
+    q="${P}/usr/share/qlam"
+    if [[ -d "${q}" ]]; then
+        if grep -rqF --include='*.py' 'which("pkexec")' "${q}"; then fail "Qlam still looks pkexec up in PATH"
+        else pass "Qlam never looks pkexec up in PATH (no fake pkexec)"; fi
+    else
+        fail "${q} is missing"
+    fi
 fi
 
 # ===================================================== 15. SentinAI / Linux Chan =====
 section "15. SentinAI and Linux Chan AI — API key files"
+# "~/.config/..." below is message text for the user; the checks use ${REAL_HOME}.
+# shellcheck disable=SC2088
 if need sentinai 1.7.0-2; then
     file_has "${P}/opt/sentinai/app.py" "def _writable_env_file" "settings are written through the .env symlink (they persist)"
     if [[ -z "${PKGROOT}" ]]; then
@@ -653,6 +685,7 @@ if need sentinai 1.7.0-2; then
         fi
     fi
 fi
+# shellcheck disable=SC2088  # message text, as above
 if need linux-chan-ai 1.1.4-3; then
     file_has "${P}/usr/share/Linux-Chan-AI/linux-chan.py" "0o600" "config with the Gemini key is written 600"
     if [[ -z "${PKGROOT}" ]]; then
@@ -679,11 +712,15 @@ refuse = [
     "git remote add evil https://evil.tld/repo.git", "git remote set-url origin https://evil.tld/repo.git",
 ]
 allow = ["rg foo .", "ag foo", "git branch", "git branch -a", "git tag -l", "git remote -v", "git show HEAD", "ls -la"]
+# rg/ag read every file under the directory they run in (home by default),
+# so they rightly ask there — secrets inside. Judge them where nothing is.
+import tempfile
+empty = tempfile.mkdtemp()
 bad = [c for c in refuse if is_readonly_command(c)]
 print(("OK" if not bad else "FAIL") + f" {len(refuse) - len(bad)}/{len(refuse)} dangerous commands need your approval")
 for c in bad:
     print(f"FAIL runs without asking: {c}")
-bad = [c for c in allow if not is_readonly_command(c)]
+bad = [c for c in allow if not is_readonly_command(c, cwd=empty)]
 print(("OK" if not bad else "FAIL") + f" {len(allow) - len(bad)}/{len(allow)} ordinary read-only commands still run without a prompt")
 for c in bad:
     print(f"WARN now asks for: {c}")

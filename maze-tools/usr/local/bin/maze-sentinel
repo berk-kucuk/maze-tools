@@ -176,6 +176,7 @@ event_target() {
 
 # React to a file-change audit event for one of our watched keys: the SYSCALL
 # record, then the working directory and file names of its CWD/PATH records.
+# shellcheck disable=SC1111  # “ ” below are typographic quotes in notification text, not shell quoting
 react_audit() {
     local raw="$1" key="$2" cwd="${3:-}"
     shift 3 2>/dev/null || shift $#
