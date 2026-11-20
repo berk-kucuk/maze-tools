@@ -163,13 +163,13 @@ if confirm "Reinstall linux-lts ${LTS_KVER} now?"; then
         [[ "${_m_rec_after}" -ge "${_m_lts_before}" ]] && pass "recovery image refreshed ($(date -d @"${_m_rec_after}" +%T))" || warn "recovery image mtime not updated"
         [[ "$(uname_of "${RGRUB}")" == "${LTS_KVER}" ]] && pass "recovery image carries ${LTS_KVER}" || fail "recovery image carries $(uname_of "${RGRUB}")"
         sbverify --cert "${CRT}" "${RGRUB}" >/dev/null 2>&1 && pass "recovery image signed" || fail "recovery image NOT signed"
-        cmp -s "${ESP}/EFI/maze-recovery/BOOTX64.EFI" "${KEYDIR}/shimx64.efi" && pass "recovery shim intact" || warn "recovery shim differs from the stored shim"
+        cmp -s "${ESP}/EFI/maze-recovery/BOOTX64.EFI" "${KEYDIR}/shimx64.efi" && pass "recovery shim intact (last known good)" || warn "recovery shim differs from the last known good shim"
     else fail "recovery image missing after reinstall"; fi
     _sha_grub_after="$(sha256sum "${GRUB}" | cut -c1-16)"
     [[ "$(uname_of "${GRUB}")" == "${RUNNING}" ]] && pass "primary image still carries the running kernel ${RUNNING}" || fail "PRIMARY IMAGE CHANGED KERNEL to $(uname_of "${GRUB}")"
     sbverify --cert "${CRT}" "${GRUB}" >/dev/null 2>&1 && pass "primary image still verifies" || fail "primary image no longer verifies — DO NOT REBOOT; run: maze-sb-sign ${ESP} --force-bootloader"
     [[ "${_sha_grub_before}" == "${_sha_grub_after}" ]] && info "primary image bytes unchanged" || info "primary image re-signed (bytes changed, kernel same) — expected from zz-maze-secureboot"
-    cmp -s "${ESP}/EFI/BOOT/BOOTX64.EFI" "${KEYDIR}/shimx64.efi" && pass "primary shim intact" || fail "primary shim was replaced!"
+    { cmp -s "${ESP}/EFI/BOOT/BOOTX64.EFI" "${KEYDIR}/shimx64.efi" || cmp -s "${ESP}/EFI/BOOT/BOOTX64.EFI" /usr/share/shim-signed/shimx64.efi; } && pass "primary shim intact (last known good or packaged)" || fail "primary shim was replaced!"
     efibootmgr 2>/dev/null | grep -q 'Maze Linux (recovery kernel)' && pass "recovery NVRAM entry present" || warn "recovery NVRAM entry missing"
     _nm="$(efibootmgr -v 2>/dev/null | grep -cE '^Boot[0-9A-F]{4}\*? +Maze Linux[[:space:]]+HD\(')"; [[ "${_nm}" -eq 1 ]] && pass "exactly one 'Maze Linux' NVRAM entry" || warn "${_nm} 'Maze Linux' NVRAM entries"
     has dkms && { dkms status 2>/dev/null | grep "${LTS_KVER}" | grep -q installed && pass "DKMS modules installed for ${LTS_KVER}" || warn "DKMS status for ${LTS_KVER}: $(dkms status 2>/dev/null | grep "${LTS_KVER}" | tr '\n' ' ')"; }

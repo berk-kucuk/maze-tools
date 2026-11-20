@@ -876,17 +876,22 @@ if [ "$IS_ROOT" = 1 ] && [ -r /etc/shadow ]; then
             ;;
         "!"|"*"|"!!"|"!"*)
             ok "root account is locked (login is via sudo)"
+            # maze-secureboot >= 2.1.0: maze-sulogin-generator allows the
+            # password-less shell only where reaching it proves the LUKS
+            # passphrase was typed. Elsewhere a refusing shell is by design.
             _sul=0
-            for _d in /etc/systemd/system/emergency.service.d/*.conf \
-                      /usr/lib/systemd/system/emergency.service.d/*.conf; do
-                [ -r "$_d" ] || continue
-                grep -q 'SULOGIN_FORCE=1' "$_d" 2>/dev/null && _sul=1
-            done
+            systemctl show -p Environment emergency.service 2>/dev/null | grep -q 'SULOGIN_FORCE=1' && _sul=1
+            _sulgen=/usr/lib/systemd/system-generators/maze-sulogin-generator
+            _sulv=""
+            [ -x "$_sulgen" ] && _sulv="$("$_sulgen" --status 2>/dev/null)"
             if [ "$_sul" = 1 ]; then
-                ok "Emergency shell is reachable without a root password"
+                ok "Emergency shell is reachable without a root password${_sulv:+ (${_sulv#on })}"
+            elif [ -n "$_sulv" ] && [ "${_sulv%% *}" = off ]; then
+                ok "Emergency shell asks for the root password (${_sulv#off })"
+                detail "To allow it without a password anyway: sudo mkdir -p /etc/maze && sudo touch /etc/maze/sulogin-force"
             else
                 warn "Emergency shell would refuse to open" \
-                     "root is locked and sulogin needs a password, so a failed boot leaves no way in. Reinstall maze-secureboot."
+                     "root is locked and sulogin needs a password, so a failed boot leaves no way in. Run: sudo systemctl daemon-reload (or reinstall maze-secureboot)."
             fi
             ;;
         *)

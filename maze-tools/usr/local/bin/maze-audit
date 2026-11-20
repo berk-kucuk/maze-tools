@@ -333,7 +333,17 @@ else
     must_exist "${_grub}" "the signed UKI shim chainloads"
     must_exist "${ESP}/MOK.cer" "certificate for MokManager enrollment"
     if [[ -f /usr/share/shim-signed/shimx64.efi && -f "${_shim}" ]]; then
-        cmp -s /usr/share/shim-signed/shimx64.efi "${_shim}" && pass "BOOTX64.EFI is byte-identical to the packaged shim ($(pacman -Q shim-signed 2>/dev/null))" || warn "BOOTX64.EFI differs from /usr/share/shim-signed/shimx64.efi (older shim, or bootctl overwrote it?)"
+        # maze-secureboot >= 2.1.0 puts a new packaged shim on trial first; until it
+        # has booted, EFI/BOOT may still carry the last known good copy in KEYDIR.
+        if cmp -s /usr/share/shim-signed/shimx64.efi "${_shim}"; then
+            pass "BOOTX64.EFI is byte-identical to the packaged shim ($(pacman -Q shim-signed 2>/dev/null))"
+            [[ -f "${KEYDIR}/shim-pending" ]] && info "that shim is on trial (becomes the default after one Secure Boot boot)"
+        elif [[ -f "${KEYDIR}/shimx64.efi" ]] && cmp -s "${KEYDIR}/shimx64.efi" "${_shim}"; then
+            [[ -s "${KEYDIR}/shim-rejected" ]] && warn "BOOTX64.EFI is the last known good shim: the packaged one failed its trial boot" "sudo maze-sb-sign --retry-shim" \
+                || info "BOOTX64.EFI is the last known good shim; the packaged one was not accepted (see: sudo maze-sb-sign)"
+        else
+            warn "BOOTX64.EFI is neither the packaged nor the last known good shim (bootctl overwrote it?)" "sudo maze-sb-sign --force-bootloader"
+        fi
     fi
     if [[ -f "${_grub}" ]] && has sbverify && has objcopy; then
         if [[ -f "${KEYDIR}/MOK.crt" ]]; then
@@ -545,8 +555,23 @@ case "${_rf}" in
     '!'|'!*'|'*'|'!!'|'!'*) pass "root is locked (shadow field '${_rf:0:3}…')" ;;
     *)       info "root has a password hash set (not locked, but not empty)" ;;
 esac
-grep -q 'SULOGIN_FORCE=1' /usr/lib/systemd/system/emergency.service.d/10-maze-sulogin.conf 2>/dev/null && pass "emergency.service SULOGIN_FORCE=1 (rescue shell reachable with locked root)" || warn "no SULOGIN_FORCE drop-in for emergency.service"
-grep -q 'SULOGIN_FORCE=1' /usr/lib/systemd/system/rescue.service.d/10-maze-sulogin.conf 2>/dev/null && pass "rescue.service SULOGIN_FORCE=1" || warn "no SULOGIN_FORCE drop-in for rescue.service"
+# maze-secureboot >= 2.1.0 decides this per boot (maze-sulogin-generator): the
+# password-less shell only where reaching it proves the LUKS passphrase was typed.
+_sulgen=/usr/lib/systemd/system-generators/maze-sulogin-generator
+if [[ -x "${_sulgen}" ]]; then
+    _sulv="$("${_sulgen}" --status 2>/dev/null)"
+    for _u in emergency rescue; do
+        _has=0; systemctl show -p Environment "${_u}.service" 2>/dev/null | grep -q 'SULOGIN_FORCE=1' && _has=1
+        case "${_sulv}" in
+            on\ *)  [[ "${_has}" = 1 ]] && pass "${_u}.service opens without a root password (${_sulv#on })" \
+                                      || warn "${_u}.service should open without a root password (${_sulv#on }) but SULOGIN_FORCE is not set" "sudo systemctl daemon-reload" ;;
+            *)      [[ "${_has}" = 1 ]] && warn "${_u}.service opens WITHOUT a root password although ${_sulv#off } (an /etc drop-in?)" \
+                                      || info "${_u}.service asks for the root password (${_sulv#off }); opt in: /etc/maze/sulogin-force" ;;
+        esac
+    done
+else
+    warn "maze-sulogin-generator missing (maze-secureboot < 2.1.0?)"
+fi
 _maze_groups="$(for f in /usr/lib/sysusers.d/*.conf; do case "$f" in */maze*|*/entropy*|*/qlam*|*/haze*|*/sentin*) awk '/^g /{print $2}' "$f";; esac; done 2>/dev/null | sort -u | tr '\n' ' ')"
 info "Maze app groups declared by sysusers.d: ${_maze_groups:-<none>}"
 for g in ${_maze_groups}; do getent group "$g" >/dev/null && pass "group $g exists" || fail "group $g declared in sysusers.d but missing (systemd-sysusers did not run?)"; done
@@ -1110,8 +1135,12 @@ if has mokutil; then
         # Only clutter — say so plainly rather than alarm (a stale key with a
         # missing private half signs nothing).
         info "${_maze} Maze machine keys enrolled — earlier installs on this machine left theirs (harmless: their private keys were erased with those installs)"
-        detail "optional tidy-up: cd \$(mktemp -d) && sudo mokutil --export, find the MOK-*.der that is NOT /var/lib/maze-secureboot/MOK.cer (cmp), sudo mokutil --delete <that file>, confirm in MokManager on the next boot"
+        detail "optional tidy-up: sudo maze-sb-mok-cleanup (shows what goes), then --apply and confirm in MokManager on the next boot"
     elif [[ "${_maze}" -eq 1 ]]; then pass "exactly one Maze machine key enrolled"; fi
+    # The live-ISO key is shared by every machine that enrolled it, and the
+    # installed system never boots with it: anything signed with it boots here.
+    [[ "${_iso}" -gt 0 ]] && info "the Maze live-ISO key is still trusted (the installed system does not need it)" \
+        && detail "remove it: sudo maze-sb-mok-cleanup --apply, confirm in MokManager on the next boot (re-enroll from the USB to boot the live ISO with Secure Boot again)"
     _pending="$(mokutil --list-new 2>/dev/null | grep -c '^\[key ')"; [[ "${_pending}" -gt 0 ]] && warn "${_pending} MOK enrollment request(s) pending for next boot"
     _del="$(mokutil --list-delete 2>/dev/null | grep -c '^\[key ')"; [[ "${_del}" -gt 0 ]] && info "${_del} MOK deletion request(s) pending"
 fi

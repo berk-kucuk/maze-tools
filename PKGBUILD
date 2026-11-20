@@ -15,7 +15,7 @@
 
 pkgname=maze-tools
 pkgver=2.2.2
-pkgrel=5
+pkgrel=7
 pkgdesc="Maze Linux in-house utility suite (mazelinux, welcome, control center, kernel switcher, guard, sentinel, panic, MAC/GPU helpers, system doctor, maze-audit, maze-exercise, maze-selftest)"
 arch=('any')
 url="https://mazelinux.berkkucukk.com.tr"
