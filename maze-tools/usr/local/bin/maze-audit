@@ -641,7 +641,7 @@ for p in linux-chan-ai sentinai; do
     pkg_installed "$p" && info "$p is installed — optional (can send data to Google Gemini); installs made with maze-installer < 2.0.0-22 got it by default. Remove if unwanted: sudo pacman -Rns $p"
 done
 # curated AUR set from deploy-to-target.sh
-for p in paru onlyoffice-bin upscayl-bin session-desktop-bin joplin-bin claude-code; do
+for p in paru onlyoffice-bin upscayl-bin session-desktop-bin joplin-bin; do
     pkg_installed "$p" && pass "AUR app $(pacman -Q "$p")" || warn "curated AUR app $p not installed (install-time AUR build failed? run maze-aur-setup)"
 done
 pkg_installed paru-bin && warn "paru-bin installed alongside/instead of source-built paru (breaks after libalpm soname bumps)"
